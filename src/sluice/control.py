@@ -1,0 +1,139 @@
+"""Pure, deterministic concurrency controller — the truth path.
+
+This module is the design spine (docs/concurrency-model.md) made executable. It imports
+**nothing outside the standard library**, does **no I/O**, and reads **no clock**: the
+current time and every observation are passed in as arguments so decisions are fully
+reproducible and unit-testable without a network or a model.
+
+Enforced by tests/test_import_boundary.py.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+# ---------------------------------------------------------------------------
+# Observations (inputs)
+# ---------------------------------------------------------------------------
+
+
+class Band(str, Enum):
+    """Where observed concurrency sits on the provider's enforcement ladder."""
+
+    NORMAL = "normal"  # <= limit
+    LOW = "low"  # limit < observed <= hard_cap (priority.low territory)
+    REJECT = "reject"  # observed > hard_cap (429s)
+    BOXED = "boxed"  # account paused (boxed_until set and not yet elapsed)
+
+
+class BreakerState(str, Enum):
+    CLOSED = "closed"  # normal
+    OPEN = "open"  # backing off; gate closed
+    HALF_OPEN = "half_open"  # probing recovery
+
+
+@dataclass(frozen=True)
+class UsageReading:
+    """A parsed snapshot of the provider's usage endpoint."""
+
+    concurrent_sessions: int
+    limit: int
+    hard_cap: int
+    priority_low: bool = False
+    boxed_until_epoch: float | None = None  # seconds since epoch, or None
+    age_seconds: float = 0.0  # how stale this reading is, at decision time
+
+
+@dataclass(frozen=True)
+class ControllerConfig:
+    """Operating parameters. Defaults bias toward staying out of the box."""
+
+    target: int = 3  # aim to keep observed concurrency at/below this (one below Max's 4)
+    min_floor: int = 1  # never throttle fully closed on uncertainty alone
+    usage_fresh_ttl: float = 15.0  # readings older than this are "stale"
+    stale_penalty: int = 1  # how much to tighten when the reading is stale
+    low_penalty: int = 1  # tighten by this when already in the 'low' band
+
+
+@dataclass(frozen=True)
+class ControllerState:
+    """Everything the decision needs, assembled by the shell each tick."""
+
+    reading: UsageReading
+    local_in_flight: int
+    breaker: BreakerState = BreakerState.CLOSED
+
+
+# ---------------------------------------------------------------------------
+# Derived quantities
+# ---------------------------------------------------------------------------
+
+
+def classify_band(reading: UsageReading, *, now: float) -> Band:
+    """Map an observation onto the provider's enforcement ladder."""
+    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+        return Band.BOXED
+    obs = reading.concurrent_sessions
+    if obs > reading.hard_cap:
+        return Band.REJECT
+    if obs > reading.limit or reading.priority_low:
+        return Band.LOW
+    return Band.NORMAL
+
+
+def phantom_estimate(reading: UsageReading, local_in_flight: int) -> int:
+    """Concurrency the provider sees that sluice did not create.
+
+    The provider's count is authority; any excess over what sluice is holding is treated
+    as phantom load to be absorbed by tightening the gate.
+    """
+    return max(0, reading.concurrent_sessions - local_in_flight)
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+# ---------------------------------------------------------------------------
+# The decision
+# ---------------------------------------------------------------------------
+
+
+def effective_permits(state: ControllerState, config: ControllerConfig, *, now: float) -> int:
+    """How many permits the gate should currently allow.
+
+    Guarantees (see docs/concurrency-model.md §3):
+
+    * Fail safe — every uncertain input (box, breaker, priority.low, staleness, phantoms)
+      can only *lower* the result. Bad information never widens the gate.
+    * Phantom-absorbing — provider-observed excess shrinks the gate so phantoms age out
+      before sluice adds more load.
+    * Pure — ``now`` and the reading's ``age_seconds`` are supplied; no clock is read here.
+    """
+    reading = state.reading
+
+    # Hard stops first.
+    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+        return 0
+    if state.breaker is BreakerState.OPEN:
+        return 0
+
+    base = config.target
+
+    # Already deprioritised → drain back under target.
+    if classify_band(reading, now=now) is Band.LOW:
+        base -= config.low_penalty
+
+    # Absorb phantoms only when the reading is fresh enough to trust the number;
+    # otherwise apply a flat staleness penalty rather than assuming zero phantoms.
+    if reading.age_seconds <= config.usage_fresh_ttl:
+        base -= phantom_estimate(reading, state.local_in_flight)
+    else:
+        base = min(base, config.target - config.stale_penalty)
+
+    # A half-open breaker admits exactly one probe.
+    if state.breaker is BreakerState.HALF_OPEN:
+        base = min(base, 1)
+
+    return _clamp(base, config.min_floor if state.breaker is BreakerState.CLOSED else 1, config.target)

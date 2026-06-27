@@ -1,0 +1,46 @@
+[project]
+name = "sluice"
+version = "0.1.0"
+description = "Central concurrency-metering reverse proxy for LLM APIs, reconciled against the provider's usage endpoint."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+# The deterministic core (sluice.control) is stdlib-only and dep-free — enforced by the
+# import-boundary test. These runtime deps belong to the proxy/usage SHELL only.
+dependencies = [
+    "httpx>=0.27",      # upstream client + /v1/usage poller
+    "starlette>=0.37",  # ASGI proxy app
+    "uvicorn>=0.30",    # ASGI server
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "anyio>=4",
+]
+
+[project.scripts]
+sluice = "sluice.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sluice"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

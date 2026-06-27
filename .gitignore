@@ -1,0 +1,36 @@
+# Never commit real work-domain data or local artifacts.
+samples/
+*.db
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Secrets / local config
+.env
+*.env
+!.env.example
+config.local.*
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
