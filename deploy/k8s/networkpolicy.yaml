@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sluice
+  namespace: sluice
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Traefik (both internal and external) — all client traffic arrives via ingress.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik-internal
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: http
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik-external
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - port: http
+  egress:
+    # DNS (CoreDNS).
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # HTTPS to the upstream API (api.code.umans.ai).
+    - ports:
+        - port: 443
+          protocol: TCP

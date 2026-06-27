@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sluice
+  namespace: sluice
+spec:
+  selector:
+    app.kubernetes.io/name: sluice
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

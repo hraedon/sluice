@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sluice-external
+  namespace: sluice
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod-porkbun
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik-external
+  tls:
+    - hosts: [sluice.hraedon.com]
+      secretName: sluice-external-tls
+  rules:
+    - host: sluice.hraedon.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: sluice
+                port:
+                  name: http

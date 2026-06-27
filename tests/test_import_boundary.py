@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 CORE = Path(__file__).resolve().parent.parent / "src" / "sluice" / "control.py"
-SHELL_MODULES = {"sluice.proxy", "sluice.usage", "sluice.cli"}
+SHELL_MODULES = {"sluice.proxy", "sluice.usage", "sluice.cli", "sluice.gate", "sluice.reconcile"}
 
 
 def _imported_modules(path: Path) -> set[str]:

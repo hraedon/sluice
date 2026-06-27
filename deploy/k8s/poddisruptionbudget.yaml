@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sluice
+  namespace: sluice
+spec:
+  # sluice is a single-replica Recreate deployment by design — the concurrency
+  # invariant requires exactly one instance. This PDB documents that the
+  # voluntary disruption is intentional, not an oversight.
+  minAvailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice

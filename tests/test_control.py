@@ -6,6 +6,8 @@ import pytest
 
 from sluice.control import (
     Band,
+    BreakerConfig,
+    BreakerSnapshot,
     BreakerState,
     ControllerConfig,
     ControllerState,
@@ -13,10 +15,14 @@ from sluice.control import (
     classify_band,
     effective_permits,
     phantom_estimate,
+    breaker_on_429,
+    breaker_on_success,
+    breaker_on_tick,
 )
 
 NOW = 1_000_000.0
 CFG = ControllerConfig(target=3, min_floor=1, usage_fresh_ttl=15.0, stale_penalty=1, low_penalty=1)
+BCFG = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
 
 
 def reading(**kw) -> UsageReading:
@@ -117,3 +123,73 @@ def test_monotonicity_no_uncertain_input_raises_result():
     ]
     for s in worse_cases:
         assert effective_permits(s, CFG, now=NOW) <= baseline
+
+
+# --- breaker state machine -------------------------------------------------
+
+
+def _snap(state=BreakerState.CLOSED, opened_at=None) -> BreakerSnapshot:
+    return BreakerSnapshot(state=state, opened_at=opened_at)
+
+
+def test_breaker_closed_stays_closed_with_no_429s():
+    snap = breaker_on_tick(_snap(), [], now=NOW, config=BCFG)
+    assert snap.state is BreakerState.CLOSED
+
+
+def test_breaker_closed_trips_on_threshold():
+    four29s = [NOW - 10, NOW - 5, NOW - 1]  # 3 within window
+    snap = breaker_on_tick(_snap(), four29s, now=NOW, config=BCFG)
+    assert snap.state is BreakerState.OPEN
+    assert snap.opened_at == NOW
+
+
+def test_breaker_does_not_trip_below_threshold():
+    four29s = [NOW - 10, NOW - 5]  # only 2
+    snap = breaker_on_tick(_snap(), four29s, now=NOW, config=BCFG)
+    assert snap.state is BreakerState.CLOSED
+
+
+def test_breaker_open_to_half_open_after_cooldown():
+    snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 100)
+    result = breaker_on_tick(snap, [], now=NOW, config=BCFG)
+    assert result.state is BreakerState.HALF_OPEN
+
+
+def test_breaker_open_stays_open_before_cooldown():
+    snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 10)
+    result = breaker_on_tick(snap, [], now=NOW, config=BCFG)
+    assert result.state is BreakerState.OPEN
+
+
+def test_breaker_on_429_trips_immediately_at_threshold():
+    # 2 previous 429s + this one = 3 = threshold
+    four29s = [NOW - 10, NOW - 5, NOW]
+    snap = breaker_on_429(_snap(), four29s, now=NOW, config=BCFG)
+    assert snap.state is BreakerState.OPEN
+    assert snap.opened_at == NOW
+
+
+def test_breaker_on_429_half_open_back_to_open():
+    snap = _snap(state=BreakerState.HALF_OPEN, opened_at=NOW - 100)
+    result = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
+    assert result.state is BreakerState.OPEN
+    assert result.opened_at == NOW
+
+
+def test_breaker_on_success_half_open_to_closed():
+    snap = _snap(state=BreakerState.HALF_OPEN, opened_at=NOW - 100)
+    result = breaker_on_success(snap)
+    assert result.state is BreakerState.CLOSED
+
+
+def test_breaker_on_success_closed_stays_closed():
+    snap = _snap(state=BreakerState.CLOSED)
+    assert breaker_on_success(snap).state is BreakerState.CLOSED
+
+
+def test_breaker_old_429s_outside_window_not_counted():
+    # 3 429s but one is outside the window
+    four29s = [NOW - 400, NOW - 5, NOW - 1]  # first is >300s old
+    snap = breaker_on_tick(_snap(), four29s, now=NOW, config=BCFG)
+    assert snap.state is BreakerState.CLOSED  # only 2 within window

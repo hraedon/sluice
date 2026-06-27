@@ -10,6 +10,7 @@ Enforced by tests/test_import_boundary.py.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -137,3 +138,86 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
         base = min(base, 1)
 
     return _clamp(base, config.min_floor if state.breaker is BreakerState.CLOSED else 1, config.target)
+
+
+# ---------------------------------------------------------------------------
+# Breaker state machine (pure — time and events passed as arguments)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BreakerConfig:
+    """Circuit-breaker thresholds. Trips on sustained 429s before the box hits."""
+
+    threshold: int = 5  # this many 429s within window → open
+    window_seconds: float = 300.0  # 5-minute rolling window
+    cooldown_seconds: float = 60.0  # OPEN → HALF_OPEN after this long
+
+
+@dataclass(frozen=True)
+class BreakerSnapshot:
+    """Mutable breaker state carried across calls (the shell holds one)."""
+
+    state: BreakerState = BreakerState.CLOSED
+    opened_at: float | None = None  # monotonic timestamp of last OPEN transition
+
+
+def _count_recent(
+    timestamps: Sequence[float], *, now: float, window: float
+) -> int:
+    return sum(1 for t in timestamps if t >= now - window)
+
+
+def breaker_on_tick(
+    snap: BreakerSnapshot,
+    recent_429s: Sequence[float],
+    *,
+    now: float,
+    config: BreakerConfig,
+) -> BreakerSnapshot:
+    """Time-driven transitions, called each reconciliation tick.
+
+    * CLOSED → OPEN when ``threshold`` 429s accumulated in the window.
+    * OPEN → HALF_OPEN after ``cooldown_seconds``.
+    * HALF_OPEN is left to event-driven transitions (429 / success).
+    """
+    if snap.state is BreakerState.CLOSED:
+        if _count_recent(recent_429s, now=now, window=config.window_seconds) >= config.threshold:
+            return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now)
+        return snap
+
+    if snap.state is BreakerState.OPEN:
+        if snap.opened_at is not None and now - snap.opened_at >= config.cooldown_seconds:
+            return BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=snap.opened_at)
+        return snap
+
+    return snap  # HALF_OPEN: wait for event
+
+
+def breaker_on_429(
+    snap: BreakerSnapshot,
+    recent_429s: Sequence[float],
+    *,
+    now: float,
+    config: BreakerConfig,
+) -> BreakerSnapshot:
+    """Event: a concurrency 429 was received from the upstream.
+
+    Trips immediately if the threshold is met (don't wait for the next tick).
+    If half-open (probing), the probe failed → back to OPEN.
+    """
+    if snap.state is BreakerState.HALF_OPEN:
+        return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now)
+
+    if snap.state is BreakerState.CLOSED:
+        if _count_recent(recent_429s, now=now, window=config.window_seconds) >= config.threshold:
+            return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now)
+
+    return snap
+
+
+def breaker_on_success(snap: BreakerSnapshot) -> BreakerSnapshot:
+    """Event: an upstream request succeeded (probe succeeded if half-open)."""
+    if snap.state is BreakerState.HALF_OPEN:
+        return BreakerSnapshot(state=BreakerState.CLOSED, opened_at=snap.opened_at)
+    return snap
