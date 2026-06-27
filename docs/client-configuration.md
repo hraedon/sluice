@@ -89,21 +89,38 @@ path mismatch, not a sluice issue — sluice passes whatever umans returns throu
 
 ## hermes agent
 
-> **Needs your input to make concrete.** Confirm (a) whether the hermes agent speaks the
-> OpenAI or the Anthropic surface, and (b) where it reads its provider base URL + key
-> (config file / env var / launch flag). The general pattern is all that changes:
+Hermes (NousResearch) drives any **OpenAI-compatible** endpoint via `/v1/chat/completions`,
+so use the `/v1` base URL. Config lives in `~/.hermes/config.yaml`; secrets in
+`~/.hermes/.env`. Set a **custom** provider and point its base URL at sluice.
 
-- Find hermes' model/provider configuration (base URL + API key).
-- Point the base URL at the **matching** sluice surface:
-  - OpenAI-compatible → `http(s)://sluice.lab:8800/v1`
-  - Anthropic-compatible → `http(s)://sluice.lab:8800`
-- Leave the umans key and model names as they were.
-- If hermes authenticates Anthropic-style, it sends `x-api-key`; OpenAI-style sends
-  `Authorization: Bearer`. sluice forwards either header unchanged — no change needed on
-  sluice's side.
+**Config file** (`~/.hermes/config.yaml`):
 
-_(Once you confirm hermes' specifics, this section gets the same concrete treatment as the
-two above.)_
+```yaml
+model:
+  provider: custom            # custom OpenAI-compatible endpoint
+  default: umans-coder        # umans model name
+  base_url: http://sluice.lab:8800/v1
+  api_key: ""                 # leave blank to fall back to ~/.hermes/.env
+```
+
+Put the key in `~/.hermes/.env` (or let it read `OPENAI_API_KEY`):
+
+```
+OPENAI_API_KEY=sk-...
+```
+
+**Or set it at runtime** (secrets auto-route to `.env`, config to `config.yaml`):
+
+```bash
+hermes config set model.base_url http://sluice.lab:8800/v1
+hermes config set model.provider custom
+hermes config set OPENAI_API_KEY sk-...
+```
+
+Equivalently, the env vars `OPENAI_BASE_URL` / `OPENAI_API_KEY` set the endpoint and key
+without editing the file. Precedence is CLI flags → `config.yaml` → `.env` → defaults, so a
+stray `--model` or a leftover `OPENAI_BASE_URL` pointing at umans will silently bypass
+sluice — check those first if hermes traffic doesn't show up in the dashboard.
 
 ---
 
