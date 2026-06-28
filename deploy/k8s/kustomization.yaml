@@ -1,6 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sluice
+# ingress-external.yaml is intentionally NOT included — sluice is internal-only
+# for now. To expose externally, add it here AND gate the admin routes (see the
+# SLUICE_ADMIN_TOKEN block in deployment.yaml + deploy/README.md).
 resources:
 - namespace.yaml
 - serviceaccount.yaml
@@ -9,15 +12,12 @@ resources:
 - deployment.yaml
 - service.yaml
 - ingress-internal.yaml
-# ingress-external.yaml is intentionally NOT included — sluice is internal-only
-# for now. To expose externally, add it here AND gate the admin routes (see the
-# SLUICE_ADMIN_TOKEN block in deployment.yaml + deploy/README.md).
 - networkpolicy.yaml
 - poddisruptionbudget.yaml
-images:
-- name: ghcr.io/hraedon/sluice
-  newName: ghcr.io/hraedon/sluice
   # newTag is bumped to the immutable short-sha (or git tag) by the release
   # workflow on each push to main; ArgoCD then rolls that exact image. `latest`
   # is only the bootstrap value before the first release runs.
-  newTag: latest
+images:
+- name: ghcr.io/hraedon/sluice
+  newName: ghcr.io/hraedon/sluice
+  newTag: f312a18
