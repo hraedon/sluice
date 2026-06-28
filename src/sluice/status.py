@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sluice.reconcile import ReconciliationLoop
+from sluice.singleton import SingletonGuard
 
 
 @dataclass
@@ -68,11 +69,15 @@ class StatusSnapshot:
         }
 
 
-def snapshot(reconcile: ReconciliationLoop) -> StatusSnapshot:
+def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None) -> StatusSnapshot:
     """Build a :class:`StatusSnapshot` from the reconciliation loop's current state."""
     reading = None
     if reconcile._last_reading_cached is not None:
         reading = reconcile._last_reading_cached.reading
+
+    ready = reconcile.ready
+    if guard is not None:
+        ready = ready and guard.is_held()
 
     return StatusSnapshot(
         concurrent_sessions=reconcile.observed_concurrent_sessions,
@@ -92,8 +97,8 @@ def snapshot(reconcile: ReconciliationLoop) -> StatusSnapshot:
         target=reconcile._ctrl_cfg.target,
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
-        cooling_down=0,  # not tracked at reconcile level
-        ready=reconcile.ready,
+        cooling_down=0,
+        ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
     )
 

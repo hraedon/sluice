@@ -14,6 +14,7 @@ key of its own beyond the usage poller's.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -87,6 +88,7 @@ class ProxyApp:
         self._owns_client = upstream_client is None
         self._guard = guard
         self._admin_token = admin_token
+        self._guard_acquired = False
 
     def _check_admin_auth(self, scope: Scope) -> bool:
         """Return True if the request is authorized for admin routes."""
@@ -94,8 +96,8 @@ class ProxyApp:
             return True
         for k, v in scope.get("headers", []):
             if k == b"authorization":
-                expected = f"Bearer {self._admin_token}"
-                if v.decode("latin-1") == expected:
+                expected = f"Bearer {self._admin_token}".encode()
+                if hmac.compare_digest(v, expected):
                     return True
         return False
 
@@ -120,13 +122,15 @@ class ProxyApp:
                 await self._send_json(send, 503, {"status": "not ready"})
             return
 
+        # Dashboard is a static page — no auth needed (data comes from /status.json).
+        if path == "/":
+            await self._send_dashboard(send)
+            return
+
         # Admin routes — token-gated when admin_token is set.
-        if path in ("/", "/status.json", "/metrics"):
+        if path in ("/status.json", "/metrics"):
             if not self._check_admin_auth(scope):
                 await self._send_text(send, 401, "Unauthorized", content_type="text/plain")
-                return
-            if path == "/":
-                await self._send_dashboard(send)
                 return
             if path == "/status.json":
                 await self._send_status_json(send)
@@ -146,6 +150,7 @@ class ProxyApp:
                     if not acquired:
                         log.warning("singleton guard acquire failed — starting as non-leader")
                     else:
+                        self._guard_acquired = True
                         await self._guard.start_renewer()
                         await self._reconcile.start()
                 else:
@@ -155,7 +160,8 @@ class ProxyApp:
                 await self._reconcile.stop()
                 if self._guard is not None:
                     await self._guard.stop_renewer()
-                    await self._guard.release()
+                    if self._guard_acquired:
+                        await self._guard.release()
                 if self._owns_client:
                     await self._client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
@@ -243,11 +249,10 @@ class ProxyApp:
             async with self._client.stream(
                 method, url, headers=headers, content=body_stream()
             ) as response:
-                # Report status to the reconciliation loop.
+                # 429 is an upstream signal — record immediately so the breaker
+                # can react without waiting for the (possibly short) body.
                 if response.status_code == 429:
                     self._reconcile.record_429()
-                elif 200 <= response.status_code < 400:
-                    self._reconcile.record_success()
 
                 await send(
                     {
@@ -269,7 +274,6 @@ class ProxyApp:
                             }
                         )
                     except Exception:
-                        # send failed — client gone
                         disconnect.set()
                         break
 
@@ -277,6 +281,11 @@ class ProxyApp:
                     await send(
                         {"type": "http.response.body", "body": b"", "more_body": False}
                     )
+                    # Success only after the full stream completed without
+                    # a client disconnect — a half-open breaker probe that
+                    # disconnects mid-stream must not count as success.
+                    if 200 <= response.status_code < 400:
+                        self._reconcile.record_success()
         except httpx.RequestError as exc:
             if not disconnect.is_set():
                 log.warning("upstream error: %s: %s", type(exc).__name__, exc)
@@ -305,6 +314,8 @@ class ProxyApp:
         for k, v in scope_headers:
             name = k.decode("latin-1").lower()
             if name in _STRIP_REQUEST:
+                continue
+            if name.startswith("x-sluice-"):
                 continue
             result.append((k.decode("latin-1"), v.decode("latin-1")))
         return result
@@ -336,11 +347,11 @@ class ProxyApp:
         await send({"type": "http.response.body", "body": payload, "more_body": False})
 
     async def _send_status_json(self, send: Send) -> None:
-        snap = status_snapshot(self._reconcile)
+        snap = status_snapshot(self._reconcile, self._guard)
         await self._send_json(send, 200, snap.to_dict())
 
     async def _send_prometheus(self, send: Send) -> None:
-        snap = status_snapshot(self._reconcile)
+        snap = status_snapshot(self._reconcile, self._guard)
         text = to_prometheus(snap)
         await self._send_text(send, 200, text, content_type="text/plain; version=0.0.4; charset=utf-8")
 

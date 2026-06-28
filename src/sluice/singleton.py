@@ -265,10 +265,21 @@ class KubeLeaseGuard(SingletonGuard):
         return self._held
 
     async def release(self) -> None:
+        was_held = self._held
         self._held = False
+        if not was_held:
+            return
         if self._client is not None and not self._client.is_closed:
             try:
-                await self._client.delete(self._lease_url)
+                # Check we still hold the lease before deleting — don't nuke
+                # a new leader's lease if ours expired and was taken over.
+                resp = await self._client.get(self._lease_url)
+                if resp.status_code == 200:
+                    lease = resp.json()
+                    if lease.get("spec", {}).get("holderIdentity") == self._identity:
+                        await self._client.delete(self._lease_url)
+                    else:
+                        log.info("KubeLeaseGuard: lease held by another — not deleting")
             except Exception:
                 pass
             if self._owns_client:

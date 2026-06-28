@@ -143,9 +143,10 @@ class ReconciliationLoop:
         self._breaker = breaker
 
         # Record the (observed, local) pairing for windowed phantom estimation.
-        # Uses gate.held as sampled this tick so each observed_i is matched to the
-        # local count contemporaneous with that poll.
-        self._phantom_samples.append((reading.concurrent_sessions, self._gate.held))
+        # Only record real readings — synthetic fail-safe samples would poison
+        # the window with fabricated concurrent_sessions values.
+        if cached.ok:
+            self._phantom_samples.append((reading.concurrent_sessions, self._gate.held))
         phantom_est = phantom_estimate(self._phantom_samples)
 
         state = ControllerState(
@@ -176,7 +177,11 @@ class ReconciliationLoop:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("reconciliation tick failed")
+                log.exception("reconciliation tick failed — closing gate (fail-safe)")
+                try:
+                    await self._gate.resize(0)
+                except Exception:
+                    log.critical("failed to close gate after tick exception")
             await asyncio.sleep(self._poll_interval)
 
     async def start(self) -> None:

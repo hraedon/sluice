@@ -476,14 +476,17 @@ async def test_admin_token_authorized():
 
 
 async def test_admin_token_not_required_for_healthz():
-    """Health and readiness probes are not gated by admin_token."""
+    """Health, readiness, and dashboard are not gated by admin_token."""
     app, _, _ = _make_app()
     app._admin_token = "secret"
 
     async with _asgi_client(app) as client:
-        response = await client.get("/healthz")
+        health = await client.get("/healthz")
+        dashboard = await client.get("/")
 
-    assert response.status_code == 200
+    assert health.status_code == 200
+    assert dashboard.status_code == 200
+    assert "text/html" in dashboard.headers.get("content-type", "")
 
 
 # ---------------------------------------------------------------------------
@@ -644,13 +647,17 @@ async def test_sluice_control_headers_stripped():
             headers={
                 "x-sluice-client-label": "interactive",
                 "x-sluice-qos": "high",
+                "x-sluice-unknown-future-header": "value",
+                "X-Sluice-Mixed-Case": "test",
                 "Authorization": "Bearer secret-key",
             },
         )
 
-    # Control headers must not reach upstream.
+    # ALL x-sluice-* headers must not reach upstream (prefix match, case-insensitive).
     assert "x-sluice-client-label" not in received
     assert "x-sluice-qos" not in received
+    assert "x-sluice-unknown-future-header" not in received
+    assert "x-sluice-mixed-case" not in received
     # But auth passes through.
     assert received.get("authorization") == "Bearer secret-key"
 
