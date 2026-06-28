@@ -55,7 +55,7 @@ Pure data, all held/derived in `sluice.control`:
 | `local_in_flight` | permits currently held by sluice | the semaphore |
 | `observed` | `usage.concurrent_sessions` | last `/v1/usage` poll |
 | `usage_age` | seconds since the usage reading | shell clock |
-| `phantom_estimate` | `max(0, observed − local_in_flight)` | derived |
+| `phantom_estimate` | windowed: `max(0, min over K polls of (observed − local_in_flight))` — **sustained** excess (a transient lag spike appears in one sample and is dropped by the `min`); instantaneous `max(0, observed − local_in_flight)` is only the per-sample building block | derived |
 | `priority_low`, `boxed_until`, `resets_at` | provider priority signals | usage reading |
 | `breaker` | closed / open / half-open | 429 + error history |
 | `recent_429s_today` | rolling count of concurrency-429s | response stream |
@@ -88,9 +88,13 @@ Properties this guarantees (and that tests assert):
 
 - **Monotone-safe under uncertainty.** Every uncertain input (`priority_low`, staleness,
   breaker, box) can only *lower* the result. Never widens the gate on bad information.
-- **Phantom-absorbing.** If umans sees 6 and sluice holds 4, `phantom_estimate = 2`, so the
-  gate shrinks to `target − 2`, letting the phantoms age out of umans' window before sluice
-  adds more. As phantoms clear, `observed` falls, the gate reopens.
+- **Phantom-absorbing.** If umans sees 6 and sluice holds 4 *across the whole window*,
+  `phantom_estimate = 2`, so the gate shrinks to `target − 2`, letting the phantoms age out
+  of umans' window before sluice adds more. As phantoms clear, `observed` falls, the gate
+  reopens. The window means a single lagged sample (one just-completed request still counted
+  in `observed`) does **not** throttle — only excess that persists across K polls does
+  (Plan 003 truth-path correctness; replaced the original instantaneous estimate that
+  over-throttled under churn).
 - **Pure.** `now`, `usage_age`, and the reading are arguments. No I/O, no global clock.
 
 ## 4. Admission, release, and the two timescales

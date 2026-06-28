@@ -86,5 +86,8 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **charter**. See `docs/concurrency-model.md` for the data model and
-`plans/001-data-plane-and-reconciliation.md` for the first build.
+Status: **deployed** (internal-only, GitOps via ArgoCD) and serving on the LAN at
+`https://sluice.k8s.hraedon.com`; not yet validated against real streaming agent traffic
+(that's the current step). See `docs/concurrency-model.md` for the data model,
+`docs/client-configuration.md` to point clients at it, and `deploy/README.md` for the
+deployment and the external-exposure toggle.
