@@ -79,6 +79,12 @@ class ProxyApp:
         if path == "/healthz":
             await self._send_json(send, 200, {"status": "ok"})
             return
+        if path == "/readyz":
+            if self._reconcile.ready:
+                await self._send_json(send, 200, {"status": "ready"})
+            else:
+                await self._send_json(send, 503, {"status": "not ready"})
+            return
         if path == "/metrics":
             await self._send_metrics(send)
             return
@@ -99,13 +105,27 @@ class ProxyApp:
                 return
 
     async def _proxy_request(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Fast-fail if the gate is closed for a structural reason (boxed / breaker).
+        # Don't burn the queue timeout against a gate that cannot open.
+        reason = self._reconcile.gate_closed_reason()
+        if reason in ("boxed", "breaker"):
+            retry_after = self._reconcile.retry_after_seconds()
+            log.info("gate closed (%s) — fast-failing 503", reason)
+            await self._send_json(
+                send,
+                503,
+                {"error": reason, "reason": reason, "retry_after": retry_after},
+                retry_after=retry_after,
+            )
+            return
+
         acquired = await self._gate.acquire(timeout=self._queue_timeout)
         if not acquired:
             log.info("permit queue timeout — returning 503")
             await self._send_json(
                 send,
                 503,
-                {"error": "concurrency limit reached", "retry_after": _RETRY_AFTER_DEFAULT},
+                {"error": "concurrency limit reached", "reason": "saturated", "retry_after": _RETRY_AFTER_DEFAULT},
                 retry_after=_RETRY_AFTER_DEFAULT,
             )
             return
@@ -258,5 +278,8 @@ class ProxyApp:
             "recent_429_count": self._reconcile.recent_429_count,
             "queue_depth": self._gate.queue_depth,
             "cooling_down": self._gate.cooling_down,
+            "ready": self._reconcile.ready,
+            "phantom_estimate": self._reconcile.phantom_estimate_value,
+            "gate_closed_reason": self._reconcile.gate_closed_reason(),
         }
         await self._send_json(send, 200, body)

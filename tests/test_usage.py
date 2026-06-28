@@ -67,6 +67,38 @@ def test_parse_boxed_until():
     assert r.priority_low is False
 
 
+def test_parse_resets_at():
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 0,
+            "priority": {
+                "low": True,
+                "boxed_until": "2025-06-27T12:00:00Z",
+                "resets_at": "2025-06-27T17:00:00Z",
+                "reason": "boxed",
+            },
+        },
+    }
+    r = parse_usage(payload)
+    assert r.boxed_until_epoch is not None
+    assert r.resets_at_epoch is not None
+    assert r.resets_at_epoch > r.boxed_until_epoch
+    assert r.priority_low is True
+
+
+def test_parse_resets_at_absent():
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 1,
+            "priority": {"low": False, "boxed_until": None},
+        },
+    }
+    r = parse_usage(payload)
+    assert r.resets_at_epoch is None
+
+
 def test_parse_missing_concurrent_sessions_raises():
     payload: dict[str, object] = {
         "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},

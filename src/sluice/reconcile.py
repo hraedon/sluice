@@ -35,6 +35,7 @@ from sluice.control import (
     breaker_on_success,
     breaker_on_tick,
     effective_permits,
+    phantom_estimate,
 )
 from sluice.gate import PermitGate
 from sluice.usage import CachedReading, UsageClient
@@ -68,12 +69,18 @@ class ReconciliationLoop:
         self._recent_429s: deque[float] = deque()
         self._total_429s = 0
 
+        self._phantom_samples: deque[tuple[int, int]] = deque(
+            maxlen=controller_config.phantom_window
+        )
+        self._last_phantom_estimate = 0
+
         self._last_permits = gate.capacity
         self._last_band: Band = Band.NORMAL
         self._last_reading_cached: CachedReading | None = None
         self._last_age: float = 0.0
 
         self._task: asyncio.Task[None] | None = None
+        self._first_poll_ok = False
 
     # -- event-driven callbacks (called by the proxy) ------------------------
 
@@ -127,10 +134,17 @@ class ReconciliationLoop:
         )
         self._breaker = breaker
 
+        # Record the (observed, local) pairing for windowed phantom estimation.
+        # Uses gate.held as sampled this tick so each observed_i is matched to the
+        # local count contemporaneous with that poll.
+        self._phantom_samples.append((reading.concurrent_sessions, self._gate.held))
+        phantom_est = phantom_estimate(self._phantom_samples)
+
         state = ControllerState(
             reading=reading,
             local_in_flight=self._gate.held,
             breaker=breaker.state,
+            phantom_estimate=phantom_est,
         )
         permits = effective_permits(state, self._ctrl_cfg, now=now_wall)
 
@@ -138,9 +152,13 @@ class ReconciliationLoop:
 
         # Cache for metrics / status.
         self._last_permits = permits
+        self._last_phantom_estimate = phantom_est
         self._last_band = classify_band(reading, now=now_wall)
         self._last_reading_cached = cached
         self._last_age = age
+
+        if cached.ok:
+            self._first_poll_ok = True
 
     async def run(self) -> None:
         """Run the reconciliation loop forever (until cancelled)."""
@@ -211,3 +229,55 @@ class ReconciliationLoop:
         if self._last_reading_cached is None:
             return None
         return self._last_reading_cached.reading.concurrent_sessions
+
+    @property
+    def ready(self) -> bool:
+        """True once the first successful usage poll has completed."""
+        return self._first_poll_ok
+
+    @property
+    def phantom_estimate_value(self) -> int:
+        """Current windowed phantom estimate (sustained excess)."""
+        return self._last_phantom_estimate
+
+    def gate_closed_reason(self) -> str:
+        """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.
+
+        The proxy consults this before ``acquire`` to fast-fail immediately
+        when the gate cannot open (boxed / breaker), rather than burning the
+        full queue timeout.
+        """
+        if self._last_reading_cached is not None:
+            r = self._last_reading_cached.reading
+            if r.boxed_until_epoch is not None:
+                now_wall = self._wall()
+                if now_wall < r.boxed_until_epoch:
+                    return "boxed"
+        if self._breaker.state is BreakerState.OPEN:
+            return "breaker"
+        if self._last_permits == 0:
+            return "saturated"
+        return "open"
+
+    def retry_after_seconds(self) -> int:
+        """Honest Retry-After based on the gate-closed reason.
+
+        - **boxed:** ``ceil(resets_at - now)``, floored at 30 s.
+        - **breaker:** remaining cooldown.
+        - **saturated / open:** short default (5 s).
+        """
+        reason = self.gate_closed_reason()
+        if reason == "boxed":
+            if self._last_reading_cached is not None:
+                r = self._last_reading_cached.reading
+                if r.resets_at_epoch is not None:
+                    remaining = int(r.resets_at_epoch - self._wall())
+                    return max(30, remaining)
+            return 30  # floor when resets_at is unknown
+        if reason == "breaker":
+            if self._breaker.opened_at is not None:
+                elapsed = self._mono() - self._breaker.opened_at
+                cooldown_remaining = self._brk_cfg.cooldown_seconds - elapsed
+                return max(1, int(cooldown_remaining))
+            return 5
+        return 5  # saturated or open

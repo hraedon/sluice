@@ -358,6 +358,49 @@ async def test_healthz():
     assert response.json()["status"] == "ok"
 
 
+async def test_readyz_503_before_first_poll():
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not ready"
+
+
+async def test_readyz_200_after_successful_tick():
+    app, _, reconcile = _make_app()
+
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+async def test_readyz_stays_503_after_failed_tick():
+    """If the first poll fails (ok=False), /readyz stays 503."""
+    app, _, reconcile = _make_app()
+    reconcile._first_poll_ok = False
+
+    # Simulate a failed tick by directly setting a non-ok cached reading.
+    from sluice.usage import CachedReading
+    from sluice.control import UsageReading
+
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(concurrent_sessions=8, limit=4, hard_cap=8, priority_low=True),
+        fetched_at_monotonic=0.0,
+        ok=False,
+    )
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+
+
 async def test_metrics():
     app, gate, _ = _make_app()
 
@@ -370,3 +413,79 @@ async def test_metrics():
     assert "effective_permits" in data
     assert "band" in data
     assert "breaker" in data
+    assert "ready" in data
+    assert "phantom_estimate" in data
+    assert "gate_closed_reason" in data
+
+
+# ---------------------------------------------------------------------------
+# Fast-fail when gate is closed (Plan 003 WI-004)
+# ---------------------------------------------------------------------------
+
+
+async def test_fast_fail_on_boxed():
+    """When boxed, the proxy returns 503 immediately without waiting for queue_timeout."""
+    from sluice.control import UsageReading
+    from sluice.usage import CachedReading
+
+    app, _, reconcile = _make_app(queue_timeout=30.0)
+
+    # Simulate a boxed state.
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(
+            concurrent_sessions=0,
+            limit=4,
+            hard_cap=8,
+            boxed_until_epoch=1e18,  # far future
+            resets_at_epoch=1e18,
+        ),
+        fetched_at_monotonic=0.0,
+        ok=True,
+    )
+    reconcile._last_permits = 0
+
+    async with _asgi_client(app) as client:
+        import time
+
+        start = time.monotonic()
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        elapsed = time.monotonic() - start
+
+    assert response.status_code == 503
+    assert elapsed < 2.0, "should fast-fail, not wait for queue_timeout"
+    assert response.json()["reason"] == "boxed"
+    assert response.headers.get("retry-after") is not None
+
+
+async def test_fast_fail_on_breaker():
+    """When breaker is open, the proxy returns 503 immediately."""
+    from sluice.control import BreakerState
+    from sluice.control import BreakerSnapshot
+
+    app, _, reconcile = _make_app(queue_timeout=30.0)
+
+    # Simulate breaker open.
+    reconcile._breaker = BreakerSnapshot(state=BreakerState.OPEN, opened_at=0.0)
+    reconcile._last_permits = 0
+
+    async with _asgi_client(app) as client:
+        import time
+
+        start = time.monotonic()
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        elapsed = time.monotonic() - start
+
+    assert response.status_code == 503
+    assert elapsed < 2.0, "should fast-fail, not wait for queue_timeout"
+    assert response.json()["reason"] == "breaker"
+
+
+async def test_saturated_503_has_reason():
+    """When acquire times out (saturated), the 503 carries reason='saturated'."""
+    app, _, _ = _make_app(gate_capacity=0, queue_timeout=0.1)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "saturated"

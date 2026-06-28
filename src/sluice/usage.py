@@ -80,6 +80,7 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
             priority = {}
         priority_low = bool(priority.get("low", False))
         boxed_until_epoch = _parse_iso_to_epoch(priority.get("boxed_until"))
+        resets_at_epoch = _parse_iso_to_epoch(priority.get("resets_at"))
 
         return UsageReading(
             concurrent_sessions=concurrent_sessions,
@@ -87,6 +88,7 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
             hard_cap=hard_cap,
             priority_low=priority_low,
             boxed_until_epoch=boxed_until_epoch,
+            resets_at_epoch=resets_at_epoch,
             age_seconds=0.0,
         )
     except UsageParseError:
@@ -110,6 +112,7 @@ def fail_safe_reading(
         hard_cap=hard_cap,
         priority_low=True,
         boxed_until_epoch=None,
+        resets_at_epoch=None,
         age_seconds=0.0,
     )
 

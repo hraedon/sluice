@@ -64,10 +64,11 @@ spec:
             periodSeconds: 30
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             initialDelaySeconds: 3
             periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: 25m
