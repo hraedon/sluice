@@ -21,6 +21,7 @@ spec:
       labels:
         app.kubernetes.io/name: sluice
     spec:
+      serviceAccountName: sluice
       enableServiceLinks: false
       terminationGracePeriodSeconds: 120
       securityContext:
@@ -52,6 +53,16 @@ spec:
                 secretKeyRef:
                   name: sluice-secrets
                   key: umans-api-key
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SLUICE_SINGLETON_GUARD
+              value: kube-lease
           ports:
             - name: http
               containerPort: 8800

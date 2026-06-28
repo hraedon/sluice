@@ -26,7 +26,11 @@ from sluice.usage import CachedReading
 class FakeUsageClient:
     """Minimal usage client for proxy tests."""
 
+    def __init__(self) -> None:
+        self.fetch_count = 0
+
     async def fetch(self, *, now_monotonic: float) -> CachedReading:
+        self.fetch_count += 1
         return CachedReading(
             reading=UsageReading(concurrent_sessions=0, limit=4, hard_cap=8),
             fetched_at_monotonic=now_monotonic,
@@ -49,9 +53,9 @@ class _AsyncMockTransport(httpx.AsyncBaseTransport):
         self._handler = handler
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        # Drain the request body so the proxy's body_stream generator is consumed.
-        async for _ in request.stream:
-            pass
+        # Read the request body so the proxy's body_stream generator is consumed
+        # and the body is available for handler inspection via request.content.
+        await request.aread()
 
         response = self._handler(request)
 
@@ -405,17 +409,81 @@ async def test_metrics():
     app, gate, _ = _make_app()
 
     async with _asgi_client(app) as client:
-        response = await client.get("/metrics")
+        response = await client.get("/status.json")
 
     assert response.status_code == 200
     data = response.json()
-    assert "in_flight" in data
     assert "effective_permits" in data
     assert "band" in data
     assert "breaker" in data
     assert "ready" in data
     assert "phantom_estimate" in data
     assert "gate_closed_reason" in data
+    assert "local_in_flight" in data
+
+
+async def test_prometheus_metrics():
+    """GET /metrics returns OpenMetrics text exposition."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/metrics")
+
+    assert response.status_code == 200
+    text = response.text
+    assert "# HELP" in text
+    assert "# TYPE" in text
+    assert "sluice_in_flight" in text
+    assert "sluice_effective_permits" in text
+    assert "sluice_band" in text
+
+
+async def test_dashboard():
+    """GET / returns the dashboard HTML page."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "sluice" in response.text.lower()
+
+
+async def test_admin_token_unauthorized():
+    """Admin routes return 401 when admin_token is set and not provided."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+
+    assert response.status_code == 401
+
+
+async def test_admin_token_authorized():
+    """Admin routes return 200 when admin_token is set and correct bearer is provided."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+
+
+async def test_admin_token_not_required_for_healthz():
+    """Health and readiness probes are not gated by admin_token."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -489,3 +557,240 @@ async def test_saturated_503_has_reason():
 
     assert response.status_code == 503
     assert response.json()["reason"] == "saturated"
+
+
+# ---------------------------------------------------------------------------
+# Cache-transparency: wire-indistinguishable from a direct client (Plan 005 WI-000)
+# ---------------------------------------------------------------------------
+
+
+async def test_body_byte_identity():
+    """The bytes forwarded upstream equal the bytes the client sent — exactly.
+
+    Uses a body whose re-serialisation would differ (non-sorted keys, specific
+    spacing) so the test actually bites: if sluice parsed and re-serialised the
+    body, the upstream would receive different bytes and the cache key would change.
+    """
+    received_body = bytearray()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Capture the raw bytes the upstream received.
+        received_body.extend(request.content)
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    # Deliberately non-sorted keys with specific spacing.
+    raw_body = b'{"z": 1, "a": 2, "model": "claude-3"}'
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            content=raw_body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert bytes(received_body) == raw_body, (
+        "sluice must forward body bytes exactly as received — "
+        "re-serialisation changes the upstream's cache key"
+    )
+
+
+async def test_header_passthrough_unchanged():
+    """anthropic-*, authorization, x-api-key, content-type, arbitrary headers reach upstream."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={
+                "Authorization": "Bearer secret-key",
+                "x-api-key": "another-key",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
+                "x-custom-header": "custom-value",
+                "content-type": "application/json",
+            },
+        )
+
+    assert received.get("authorization") == "Bearer secret-key"
+    assert received.get("x-api-key") == "another-key"
+    assert received.get("anthropic-version") == "2023-06-01"
+    assert received.get("anthropic-beta") == "prompt-caching-2024-07-31"
+    assert received.get("x-custom-header") == "custom-value"
+
+
+async def test_sluice_control_headers_stripped():
+    """sluice-internal control headers are stripped before forwarding upstream."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={
+                "x-sluice-client-label": "interactive",
+                "x-sluice-qos": "high",
+                "Authorization": "Bearer secret-key",
+            },
+        )
+
+    # Control headers must not reach upstream.
+    assert "x-sluice-client-label" not in received
+    assert "x-sluice-qos" not in received
+    # But auth passes through.
+    assert received.get("authorization") == "Bearer secret-key"
+
+
+# ---------------------------------------------------------------------------
+# Singleton guard integration (Plan 004)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGuard:
+    """Test guard with controllable is_held()."""
+
+    def __init__(self, held: bool = True, acquire_result: bool = True) -> None:
+        self._held = held
+        self._acquire_result = acquire_result
+        self.acquire_called = False
+        self.release_called = False
+        self.renewer_started = False
+
+    async def acquire(self) -> bool:
+        self.acquire_called = True
+        self._held = self._acquire_result
+        return self._acquire_result
+
+    async def renew(self) -> bool:
+        return self._held
+
+    def is_held(self) -> bool:
+        return self._held
+
+    async def release(self) -> None:
+        self.release_called = True
+        self._held = False
+
+    async def start_renewer(self) -> None:
+        self.renewer_started = True
+
+    async def stop_renewer(self) -> None:
+        pass
+
+
+def _make_app_with_guard(
+    guard,
+    *,
+    gate_capacity: int = 3,
+    upstream_handler=None,
+) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
+    gate = PermitGate(initial_capacity=gate_capacity)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(
+        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        timeout=None,
+    )
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+        guard=guard,  # type: ignore[arg-type]
+    )
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+        guard=guard,  # type: ignore[arg-type]
+    )
+    return app, gate, reconcile
+
+
+async def test_non_leader_fast_fails_503():
+    """A non-leader proxy returns 503 not_leader immediately."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "not_leader"
+
+
+async def test_leader_serves_normally():
+    """A leader proxy serves requests normally."""
+    guard = _FakeGuard(held=True, acquire_result=True)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 200
+
+
+async def test_readyz_requires_guard_held():
+    """/readyz is 503 when guard is not held, even if reconcile is ready."""
+    guard = _FakeGuard(held=True, acquire_result=True)
+    app, _, reconcile = _make_app_with_guard(guard)
+
+    # Make reconcile ready.
+    await reconcile.tick()
+    assert reconcile.ready is True
+
+    # Guard held → ready.
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+    assert response.status_code == 200
+
+    # Guard lost → not ready.
+    guard._held = False
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+    assert response.status_code == 503
+
+
+async def test_healthz_unaffected_by_guard():
+    """/healthz returns 200 regardless of guard state."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+async def test_non_leader_does_not_poll_usage():
+    """A non-leader reconcile loop does not poll /v1/usage."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+        guard=guard,  # type: ignore[arg-type]
+    )
+
+    await reconcile.tick()
+
+    assert usage.fetch_count == 0
+    assert gate.capacity == 0  # gate closed

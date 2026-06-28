@@ -23,6 +23,7 @@ from sluice.control import BreakerConfig, ControllerConfig
 from sluice.gate import PermitGate
 from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
+from sluice.singleton import KubeLeaseGuard, NoopGuard, SingletonGuard
 from sluice.usage import UsageClient
 
 log = logging.getLogger("sluice.cli")
@@ -40,6 +41,7 @@ _DEFAULTS: dict[str, Any] = {
     "usage_auth_header": "authorization",
     "log_level": "INFO",
     "config": None,
+    "admin_token": None,
 }
 
 
@@ -106,10 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="logging level (default: INFO)")
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
+    serve.add_argument("--admin-token", default=None, help="bearer token for admin routes (/, /status.json, /metrics)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
     status.add_argument("--host", default="127.0.0.1:8800", help="sluice listen address to query (default: 127.0.0.1:8800)")
+    status.add_argument("--admin-token", default=None, help="bearer token for admin routes")
 
     return parser
 
@@ -139,6 +143,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     usage_key_env = _resolve("usage_key_env", args)
     usage_auth_header = _resolve("usage_auth_header", args)
     log_level = _resolve("log_level", args)
+    admin_token = _resolve("admin_token", args)
 
     logging.basicConfig(
         level=getattr(logging, log_level),
@@ -157,6 +162,21 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return 2
     port = int(port_str)
 
+    guard: SingletonGuard
+    guard_mode = os.environ.get(_ENV_PREFIX + "SINGLETON_GUARD", "noop")
+    if guard_mode == "kube-lease":
+        pod_name = os.environ.get("POD_NAME", "sluice")
+        pod_ns = os.environ.get("POD_NAMESPACE", "default")
+        guard = KubeLeaseGuard(
+            lease_name="sluice",
+            namespace=pod_ns,
+            identity=pod_name,
+        )
+        log.info("  singleton_guard:   kube-lease (identity=%s, ns=%s)", pod_name, pod_ns)
+    else:
+        guard = NoopGuard()
+        log.info("  singleton_guard:   noop")
+
     usage_client = UsageClient(
         base_url=upstream,
         api_key=usage_key,
@@ -172,12 +192,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         controller_config=ControllerConfig(target=target),
         breaker_config=BreakerConfig(),
         poll_interval=poll_interval,
+        guard=guard,
     )
     app = ProxyApp(
         upstream_base_url=upstream,
         gate=gate,
         reconcile=reconcile,
         queue_timeout=queue_timeout,
+        guard=guard,
+        admin_token=admin_token,
     )
 
     log.info("sluice %s starting", __version__)
@@ -204,9 +227,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    headers: dict[str, str] = {}
+    if args.admin_token:
+        headers["Authorization"] = f"Bearer {args.admin_token}"
     try:
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(f"http://{args.host}/metrics")
+        with httpx.Client(timeout=10.0, headers=headers) as client:
+            response = client.get(f"http://{args.host}/status.json")
     except httpx.ConnectError:
         print(f"sluice: cannot connect to {args.host} — is sluice running?", file=sys.stderr)
         return 1
@@ -219,13 +245,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"band:               {d['band']}")
     print(f"breaker:            {d['breaker']}")
     print(f"effective_permits:  {d['effective_permits']}")
-    print(f"in_flight:          {d['in_flight']}")
-    print(f"observed_sessions:  {d['observed_concurrent_sessions']}")
+    print(f"in_flight:          {d['local_in_flight']}")
+    print(f"observed_sessions:  {d['concurrent_sessions']}")
     print(f"phantom_estimate:   {d.get('phantom_estimate', '?')}")
     print(f"gate_closed_reason: {d.get('gate_closed_reason', '?')}")
     print(f"total_429s:         {d['total_429s']}")
     print(f"queue_depth:        {d['queue_depth']}")
-    print(f"cooling_down:       {d['cooling_down']}")
     print(f"ready:              {d.get('ready', '?')}")
     return 0
 

@@ -3,6 +3,9 @@ kind: Kustomization
 namespace: sluice
 resources:
 - namespace.yaml
+- serviceaccount.yaml
+- role.yaml
+- rolebinding.yaml
 - deployment.yaml
 - service.yaml
 - ingress-internal.yaml

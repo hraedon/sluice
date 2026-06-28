@@ -38,6 +38,7 @@ from sluice.control import (
     phantom_estimate,
 )
 from sluice.gate import PermitGate
+from sluice.singleton import SingletonGuard
 from sluice.usage import CachedReading, UsageClient
 
 log = logging.getLogger("sluice.reconcile")
@@ -56,6 +57,7 @@ class ReconciliationLoop:
         poll_interval: float = 5.0,
         monotonic_clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
+        guard: SingletonGuard | None = None,
     ) -> None:
         self._usage = usage_client
         self._gate = gate
@@ -64,6 +66,7 @@ class ReconciliationLoop:
         self._poll_interval = poll_interval
         self._mono = monotonic_clock
         self._wall = wall_clock
+        self._guard = guard
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
@@ -115,6 +118,11 @@ class ReconciliationLoop:
 
     async def tick(self) -> None:
         """One reconciliation cycle: fetch → compute → resize."""
+        # Non-leader: don't poll, hold the gate closed (fail-safe).
+        if self._guard is not None and not self._guard.is_held():
+            await self._gate.resize(0)
+            return
+
         now_mono = self._mono()
         now_wall = self._wall()
 
