@@ -19,6 +19,7 @@ import abc
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -127,7 +128,13 @@ class KubeLeaseGuard(SingletonGuard):
         lease_duration_seconds: int = 30,
         renew_interval: float = 10.0,
         client: httpx.AsyncClient | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if renew_interval >= lease_duration_seconds:
+            raise ValueError(
+                f"renew_interval ({renew_interval}) must be strictly less than "
+                f"lease_duration_seconds ({lease_duration_seconds})"
+            )
         self._lease_name = lease_name
         self._namespace = namespace
         self._identity = identity
@@ -137,6 +144,16 @@ class KubeLeaseGuard(SingletonGuard):
         self._client = client
         self._owns_client = client is None
         self._renewer_task: asyncio.Task[None] | None = None
+        self._mono = monotonic_clock
+        self._last_renewed_mono: float | None = None
+        # Guard so the local-expiry path in is_held() logs once per expiry
+        # episode, not on every call (is_held runs per-request + per readiness probe).
+        self._expiry_logged = False
+
+    def _mark_renewed(self) -> None:
+        """Stamp a fresh local renewal and clear the expiry-log latch."""
+        self._last_renewed_mono = self._mono()
+        self._expiry_logged = False
 
     @property
     def _base_url(self) -> str:
@@ -182,6 +199,7 @@ class KubeLeaseGuard(SingletonGuard):
                 resp = await client.post(self._base_url, json=self._lease_body(now))
                 if resp.status_code in (200, 201):
                     self._held = True
+                    self._mark_renewed()
                     log.info("KubeLeaseGuard: acquired lease (created)")
                     return True
                 log.warning("KubeLeaseGuard: create failed: %d", resp.status_code)
@@ -194,6 +212,7 @@ class KubeLeaseGuard(SingletonGuard):
 
                 if holder == self._identity:
                     self._held = True
+                    self._mark_renewed()
                     log.info("KubeLeaseGuard: already held by us")
                     return True
 
@@ -209,6 +228,7 @@ class KubeLeaseGuard(SingletonGuard):
                     resp = await client.put(self._lease_url, json=existing)
                     if resp.status_code == 200:
                         self._held = True
+                        self._mark_renewed()
                         log.info("KubeLeaseGuard: acquired lease (expired peer)")
                         return True
                     log.warning("KubeLeaseGuard: take-over failed: %d", resp.status_code)
@@ -254,6 +274,7 @@ class KubeLeaseGuard(SingletonGuard):
                 self._held = False
                 return False
 
+            self._mark_renewed()
             return True
 
         except Exception:
@@ -262,11 +283,27 @@ class KubeLeaseGuard(SingletonGuard):
             return False
 
     def is_held(self) -> bool:
-        return self._held
+        if not self._held:
+            return False
+        if self._last_renewed_mono is not None:
+            elapsed = self._mono() - self._last_renewed_mono
+            if elapsed > self._lease_duration:
+                if not self._expiry_logged:
+                    log.warning(
+                        "KubeLeaseGuard: local lease expiry — %.1fs since last renew "
+                        "exceeds lease_duration %ds; shedding traffic until renew recovers "
+                        "(likely a stalled event loop or unreachable kube-apiserver)",
+                        elapsed,
+                        self._lease_duration,
+                    )
+                    self._expiry_logged = True
+                return False
+        return True
 
     async def release(self) -> None:
         was_held = self._held
         self._held = False
+        self._last_renewed_mono = None
         if not was_held:
             return
         if self._client is not None and not self._client.is_closed:

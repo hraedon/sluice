@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 
 from sluice.singleton import KubeLeaseGuard, NoopGuard, SingletonGuard
 
@@ -237,3 +238,83 @@ async def test_kube_acquire_failure_on_api_error():
     )
     assert await guard.acquire() is False
     assert guard.is_held() is False
+
+
+# ---------------------------------------------------------------------------
+# WI-003: is_held() checks local lease expiry (split-brain prevention)
+# ---------------------------------------------------------------------------
+
+
+async def test_kube_is_held_false_after_local_lease_expiry():
+    """is_held() returns False when the local lease has expired.
+
+    If the event loop was blocked for > lease_duration, the lease may have been
+    taken by another pod. is_held() must return False so the gate sheds traffic
+    rather than serving as a split-brain second leader.
+    """
+    m = [1000.0]
+    api = FakeLeaseAPI()
+    guard = KubeLeaseGuard(
+        lease_name="sluice",
+        namespace="default",
+        identity="pod-1",
+        client=api.make_client(),
+        lease_duration_seconds=30,
+        renew_interval=10.0,
+        monotonic_clock=lambda: m[0],
+    )
+    assert await guard.acquire() is True
+    assert guard.is_held() is True
+
+    m[0] = 1031.0  # 31s later → past lease_duration
+    assert guard.is_held() is False
+
+    assert await guard.renew() is True
+    assert guard.is_held() is True
+
+
+async def test_kube_is_held_true_at_exact_lease_duration():
+    """is_held() returns True at exactly lease_duration (boundary is exclusive)."""
+    m = [1000.0]
+    api = FakeLeaseAPI()
+    guard = KubeLeaseGuard(
+        lease_name="sluice",
+        namespace="default",
+        identity="pod-1",
+        client=api.make_client(),
+        lease_duration_seconds=30,
+        renew_interval=10.0,
+        monotonic_clock=lambda: m[0],
+    )
+    await guard.acquire()
+    m[0] = 1030.0  # exactly 30s later
+    assert guard.is_held() is True
+
+
+# ---------------------------------------------------------------------------
+# WI-005: renew_interval must be < lease_duration_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_kube_renew_interval_equal_lease_duration_rejected():
+    """KubeLeaseGuard rejects renew_interval == lease_duration_seconds."""
+    with pytest.raises(ValueError, match="renew_interval"):
+        KubeLeaseGuard(
+            lease_name="sluice",
+            namespace="default",
+            identity="pod-1",
+            lease_duration_seconds=30,
+            renew_interval=30.0,
+        )
+
+
+def test_kube_renew_interval_greater_than_lease_duration_rejected():
+    """KubeLeaseGuard rejects renew_interval > lease_duration_seconds."""
+    with pytest.raises(ValueError, match="renew_interval"):
+        KubeLeaseGuard(
+            lease_name="sluice",
+            namespace="default",
+            identity="pod-1",
+            lease_duration_seconds=30,
+            renew_interval=31.0,
+        )

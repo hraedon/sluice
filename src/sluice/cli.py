@@ -37,6 +37,7 @@ _DEFAULTS: dict[str, Any] = {
     "poll_interval": 5.0,
     "release_cooldown": 2.0,
     "queue_timeout": 30.0,
+    "retry_interval": 10.0,
     "usage_key_env": "SLUICE_USAGE_KEY",
     "usage_auth_header": "authorization",
     "log_level": "INFO",
@@ -62,7 +63,7 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 def _coerce(env_val: str, key: str) -> Any:
     if key in ("target",):
         return int(env_val)
-    if key in ("poll_interval", "release_cooldown", "queue_timeout"):
+    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval"):
         return float(env_val)
     return env_val
 
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--poll-interval", type=float, default=None, help="seconds between /v1/usage polls (default: 5)")
     serve.add_argument("--release-cooldown", type=float, default=None, help="seconds a freed permit rests (default: 2)")
     serve.add_argument("--queue-timeout", type=float, default=None, help="max seconds to wait for a permit (default: 30)")
+    serve.add_argument("--retry-interval", type=float, default=None, help="seconds between singleton-lease re-acquire attempts when not leader (default: 10)")
     serve.add_argument("--usage-key-env", default=None, help="env var holding the usage API key (default: SLUICE_USAGE_KEY)")
     serve.add_argument(
         "--usage-auth-header",
@@ -140,6 +142,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     poll_interval = _resolve("poll_interval", args)
     release_cooldown = _resolve("release_cooldown", args)
     queue_timeout = _resolve("queue_timeout", args)
+    retry_interval = _resolve("retry_interval", args)
     usage_key_env = _resolve("usage_key_env", args)
     usage_auth_header = _resolve("usage_auth_header", args)
     log_level = _resolve("log_level", args)
@@ -201,6 +204,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         queue_timeout=queue_timeout,
         guard=guard,
         admin_token=admin_token,
+        retry_interval=retry_interval,
     )
 
     log.info("sluice %s starting", __version__)
@@ -210,6 +214,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     log.info("  poll_interval:     %.1fs", poll_interval)
     log.info("  release_cooldown:  %.1fs", release_cooldown)
     log.info("  queue_timeout:     %.1fs", queue_timeout)
+    log.info("  retry_interval:    %.1fs", retry_interval)
     log.info("  usage_key_env:     %s", usage_key_env)
     log.info("  usage_auth_header: %s", usage_auth_header)
     if config_path:

@@ -372,3 +372,34 @@ async def test_retry_after_seconds_open_is_default():
     loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=2))
     await loop.tick()
     assert loop.retry_after_seconds() == 5
+
+
+# --- WI-006: stale resets_at capped when cached.ok=False ---------------------
+
+
+async def test_retry_after_seconds_stale_capped():
+    """When the cached reading is stale (ok=False), retry_after is capped at 300."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_001_000.0, resets_at_epoch=1_001_000.0)
+    )
+    await loop.tick()
+
+    client.set_fail(True)
+    m[0] += 1
+    await loop.tick()
+
+    # resets_at = 1_001_000, now_wall = 1_000_000 → remaining = 1000
+    # Stale (ok=False) → capped at 300
+    assert loop.retry_after_seconds() == 300
+
+
+async def test_retry_after_seconds_fresh_not_capped():
+    """When the cached reading is fresh (ok=True), retry_after is not capped."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_001_000.0, resets_at_epoch=1_001_000.0)
+    )
+    await loop.tick()
+
+    # resets_at = 1_001_000, now_wall = 1_000_000 → remaining = 1000
+    # Fresh (ok=True) → not capped
+    assert loop.retry_after_seconds() == 1000

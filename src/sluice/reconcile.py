@@ -43,6 +43,8 @@ from sluice.usage import CachedReading, UsageClient
 
 log = logging.getLogger("sluice.reconcile")
 
+_RETRY_AFTER_STALE_CAP = 300
+
 
 class ReconciliationLoop:
     """Background task that reconciles the gate against upstream truth."""
@@ -276,6 +278,8 @@ class ReconciliationLoop:
         """Honest Retry-After based on the gate-closed reason.
 
         - **boxed:** ``ceil(resets_at - now)``, floored at 30 s.
+          When the reading is stale (``ok=False``), capped at 300 s — a stale
+          ``resets_at`` could be hours in the future and mislead clients.
         - **breaker:** remaining cooldown.
         - **saturated / open:** short default (5 s).
         """
@@ -285,7 +289,10 @@ class ReconciliationLoop:
                 r = self._last_reading_cached.reading
                 if r.resets_at_epoch is not None:
                     remaining = int(r.resets_at_epoch - self._wall())
-                    return max(30, remaining)
+                    result = max(30, remaining)
+                    if not self._last_reading_cached.ok:
+                        return min(result, _RETRY_AFTER_STALE_CAP)
+                    return result
             return 30  # floor when resets_at is unknown
         if reason == "breaker":
             if self._breaker.opened_at is not None:

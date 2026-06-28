@@ -17,6 +17,7 @@ import asyncio
 import hmac
 import json
 import logging
+import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -64,6 +65,8 @@ _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
+_RETRY_ACQUIRE_INTERVAL = 10.0
+_BODY_QUEUE_MAXSIZE = 1
 
 
 class ProxyApp:
@@ -79,6 +82,7 @@ class ProxyApp:
         upstream_client: httpx.AsyncClient | None = None,
         guard: SingletonGuard | None = None,
         admin_token: str | None = None,
+        retry_interval: float = _RETRY_ACQUIRE_INTERVAL,
     ) -> None:
         self._upstream = upstream_base_url.rstrip("/")
         self._gate = gate
@@ -89,6 +93,8 @@ class ProxyApp:
         self._guard = guard
         self._admin_token = admin_token
         self._guard_acquired = False
+        self._retry_interval = retry_interval
+        self._acquire_retry_task: asyncio.Task[None] | None = None
 
     def _check_admin_auth(self, scope: Scope) -> bool:
         """Return True if the request is authorized for admin routes."""
@@ -148,15 +154,33 @@ class ProxyApp:
                 if self._guard is not None:
                     acquired = await self._guard.acquire()
                     if not acquired:
-                        log.warning("singleton guard acquire failed — starting as non-leader")
+                        log.warning("singleton guard acquire failed — starting as non-leader, will retry")
+                        self._acquire_retry_task = asyncio.create_task(self._retry_acquire())
                     else:
-                        self._guard_acquired = True
-                        await self._guard.start_renewer()
-                        await self._reconcile.start()
+                        try:
+                            await self._guard.start_renewer()
+                            await self._reconcile.start()
+                        except Exception:
+                            log.warning(
+                                "singleton guard start failed after acquire — releasing lease, will retry",
+                                exc_info=True,
+                            )
+                            await self._guard.stop_renewer()
+                            await self._guard.release()
+                            self._acquire_retry_task = asyncio.create_task(self._retry_acquire())
+                        else:
+                            self._guard_acquired = True
                 else:
                     await self._reconcile.start()
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
+                if self._acquire_retry_task is not None:
+                    self._acquire_retry_task.cancel()
+                    try:
+                        await self._acquire_retry_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._acquire_retry_task = None
                 await self._reconcile.stop()
                 if self._guard is not None:
                     await self._guard.stop_renewer()
@@ -166,6 +190,36 @@ class ProxyApp:
                     await self._client.aclose()
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    async def _retry_acquire(self) -> None:
+        """Periodically retry lease acquisition when the initial acquire failed."""
+        guard = self._guard
+        if guard is None:
+            return
+        while not self._guard_acquired:
+            # Jitter (±50%) so multiple non-leader pods retrying after a leader
+            # crash don't stampede the apiserver in lockstep.
+            await asyncio.sleep(self._retry_interval * (0.5 + random.random()))
+            try:
+                acquired = await guard.acquire()
+                if acquired:
+                    try:
+                        await guard.start_renewer()
+                        await self._reconcile.start()
+                    except Exception:
+                        log.warning(
+                            "singleton guard start failed after acquire — releasing lease, will retry",
+                            exc_info=True,
+                        )
+                        await guard.stop_renewer()
+                        await guard.release()
+                        continue
+                    self._guard_acquired = True
+                    log.info("singleton guard acquired on retry — becoming leader")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("singleton guard retry acquire failed", exc_info=True)
 
     async def _proxy_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Non-leader fast-fail: if the singleton guard is not held, refuse admission.
@@ -217,7 +271,7 @@ class ProxyApp:
         method = scope["method"]
 
         disconnect = asyncio.Event()
-        body_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        body_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_BODY_QUEUE_MAXSIZE)
 
         async def pump_receive() -> None:
             """Single consumer of the ASGI receive callable."""
