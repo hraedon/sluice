@@ -63,6 +63,20 @@ spec:
                   fieldPath: metadata.namespace
             - name: SLUICE_SINGLETON_GUARD
               value: kube-lease
+            # --- External-exposure hardening (currently internal-only) ---------
+            # Admin routes (/status.json, /metrics) are unauthenticated by
+            # default — fine behind traefik-internal. BEFORE adding the external
+            # ingress, gate them by setting an admin token here (and the matching
+            # key in the secret). Caveat: the HTML dashboard at / fetches
+            # /status.json from the browser with no token, so enabling this
+            # blanks the live dashboard until token-in-browser auth exists
+            # (tracked — see deploy/README.md). The proxy routes are always
+            # auth-bound: clients must present their own upstream key.
+            # - name: SLUICE_ADMIN_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: sluice-secrets
+            #       key: admin-token
           ports:
             - name: http
               containerPort: 8800

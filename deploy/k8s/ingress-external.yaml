@@ -1,3 +1,12 @@
+# NOT referenced by kustomization.yaml — sluice is internal-only for now.
+# This manifest is kept ready for future external exposure. Before enabling it:
+#   1. add `- ingress-external.yaml` to kustomization.yaml resources;
+#   2. set an admin token (SLUICE_ADMIN_TOKEN block in deployment.yaml + the
+#      admin-token key in the secret) so /status.json and /metrics are not
+#      published unauthenticated to the internet;
+#   3. note the dashboard caveat in deploy/README.md.
+# The NetworkPolicy already admits the traefik-external namespace, so no
+# network-policy change is needed when this is turned on.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

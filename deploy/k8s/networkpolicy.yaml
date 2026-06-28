@@ -41,3 +41,8 @@ spec:
     - ports:
         - port: 443
           protocol: TCP
+    # Kubernetes API server — the kubernetes service DNATs 443→6443 on the
+    # node IPs; the CNI evaluates post-DNAT, so we must allow 6443 explicitly.
+    - ports:
+        - port: 6443
+          protocol: TCP
