@@ -26,7 +26,11 @@ from sluice.usage import CachedReading
 class FakeUsageClient:
     """Minimal usage client for proxy tests."""
 
+    def __init__(self) -> None:
+        self.fetch_count = 0
+
     async def fetch(self, *, now_monotonic: float) -> CachedReading:
+        self.fetch_count += 1
         return CachedReading(
             reading=UsageReading(concurrent_sessions=0, limit=4, hard_cap=8),
             fetched_at_monotonic=now_monotonic,
@@ -49,9 +53,9 @@ class _AsyncMockTransport(httpx.AsyncBaseTransport):
         self._handler = handler
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        # Drain the request body so the proxy's body_stream generator is consumed.
-        async for _ in request.stream:
-            pass
+        # Read the request body so the proxy's body_stream generator is consumed
+        # and the body is available for handler inspection via request.content.
+        await request.aread()
 
         response = self._handler(request)
 
@@ -358,15 +362,613 @@ async def test_healthz():
     assert response.json()["status"] == "ok"
 
 
+async def test_readyz_503_before_first_poll():
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "not ready"
+
+
+async def test_readyz_200_after_successful_tick():
+    app, _, reconcile = _make_app()
+
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+
+
+async def test_readyz_stays_503_after_failed_tick():
+    """If the first poll fails (ok=False), /readyz stays 503."""
+    app, _, reconcile = _make_app()
+    reconcile._first_poll_ok = False
+
+    # Simulate a failed tick by directly setting a non-ok cached reading.
+    from sluice.usage import CachedReading
+    from sluice.control import UsageReading
+
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(concurrent_sessions=8, limit=4, hard_cap=8, priority_low=True),
+        fetched_at_monotonic=0.0,
+        ok=False,
+    )
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+
+
 async def test_metrics():
     app, gate, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "effective_permits" in data
+    assert "band" in data
+    assert "breaker" in data
+    assert "ready" in data
+    assert "phantom_estimate" in data
+    assert "gate_closed_reason" in data
+    assert "local_in_flight" in data
+
+
+async def test_prometheus_metrics():
+    """GET /metrics returns OpenMetrics text exposition."""
+    app, _, _ = _make_app()
 
     async with _asgi_client(app) as client:
         response = await client.get("/metrics")
 
     assert response.status_code == 200
-    data = response.json()
-    assert "in_flight" in data
-    assert "effective_permits" in data
-    assert "band" in data
-    assert "breaker" in data
+    text = response.text
+    assert "# HELP" in text
+    assert "# TYPE" in text
+    assert "sluice_in_flight" in text
+    assert "sluice_effective_permits" in text
+    assert "sluice_band" in text
+
+
+async def test_dashboard():
+    """GET / returns the dashboard HTML page."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "sluice" in response.text.lower()
+
+
+async def test_admin_token_unauthorized():
+    """Admin routes return 401 when admin_token is set and not provided."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+
+    assert response.status_code == 401
+
+
+async def test_admin_token_authorized():
+    """Admin routes return 200 when admin_token is set and correct bearer is provided."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+
+
+async def test_admin_token_not_required_for_healthz():
+    """Health, readiness, and dashboard are not gated by admin_token."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        health = await client.get("/healthz")
+        dashboard = await client.get("/")
+
+    assert health.status_code == 200
+    assert dashboard.status_code == 200
+    assert "text/html" in dashboard.headers.get("content-type", "")
+
+
+# ---------------------------------------------------------------------------
+# Fast-fail when gate is closed (Plan 003 WI-004)
+# ---------------------------------------------------------------------------
+
+
+async def test_fast_fail_on_boxed():
+    """When boxed, the proxy returns 503 immediately without waiting for queue_timeout."""
+    from sluice.control import UsageReading
+    from sluice.usage import CachedReading
+
+    app, _, reconcile = _make_app(queue_timeout=30.0)
+
+    # Simulate a boxed state.
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(
+            concurrent_sessions=0,
+            limit=4,
+            hard_cap=8,
+            boxed_until_epoch=1e18,  # far future
+            resets_at_epoch=1e18,
+        ),
+        fetched_at_monotonic=0.0,
+        ok=True,
+    )
+    reconcile._last_permits = 0
+
+    async with _asgi_client(app) as client:
+        import time
+
+        start = time.monotonic()
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        elapsed = time.monotonic() - start
+
+    assert response.status_code == 503
+    assert elapsed < 2.0, "should fast-fail, not wait for queue_timeout"
+    assert response.json()["reason"] == "boxed"
+    assert response.headers.get("retry-after") is not None
+
+
+async def test_fast_fail_on_breaker():
+    """When breaker is open, the proxy returns 503 immediately."""
+    from sluice.control import BreakerState
+    from sluice.control import BreakerSnapshot
+
+    app, _, reconcile = _make_app(queue_timeout=30.0)
+
+    # Simulate breaker open.
+    reconcile._breaker = BreakerSnapshot(state=BreakerState.OPEN, opened_at=0.0)
+    reconcile._last_permits = 0
+
+    async with _asgi_client(app) as client:
+        import time
+
+        start = time.monotonic()
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        elapsed = time.monotonic() - start
+
+    assert response.status_code == 503
+    assert elapsed < 2.0, "should fast-fail, not wait for queue_timeout"
+    assert response.json()["reason"] == "breaker"
+
+
+async def test_saturated_503_has_reason():
+    """When acquire times out (saturated), the 503 carries reason='saturated'."""
+    app, _, _ = _make_app(gate_capacity=0, queue_timeout=0.1)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "saturated"
+
+
+# ---------------------------------------------------------------------------
+# Cache-transparency: wire-indistinguishable from a direct client (Plan 005 WI-000)
+# ---------------------------------------------------------------------------
+
+
+async def test_body_byte_identity():
+    """The bytes forwarded upstream equal the bytes the client sent — exactly.
+
+    Uses a body whose re-serialisation would differ (non-sorted keys, specific
+    spacing) so the test actually bites: if sluice parsed and re-serialised the
+    body, the upstream would receive different bytes and the cache key would change.
+    """
+    received_body = bytearray()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Capture the raw bytes the upstream received.
+        received_body.extend(request.content)
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    # Deliberately non-sorted keys with specific spacing.
+    raw_body = b'{"z": 1, "a": 2, "model": "claude-3"}'
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            content=raw_body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert bytes(received_body) == raw_body, (
+        "sluice must forward body bytes exactly as received — "
+        "re-serialisation changes the upstream's cache key"
+    )
+
+
+async def test_header_passthrough_unchanged():
+    """anthropic-*, authorization, x-api-key, content-type, arbitrary headers reach upstream."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={
+                "Authorization": "Bearer secret-key",
+                "x-api-key": "another-key",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
+                "x-custom-header": "custom-value",
+                "content-type": "application/json",
+            },
+        )
+
+    assert received.get("authorization") == "Bearer secret-key"
+    assert received.get("x-api-key") == "another-key"
+    assert received.get("anthropic-version") == "2023-06-01"
+    assert received.get("anthropic-beta") == "prompt-caching-2024-07-31"
+    assert received.get("x-custom-header") == "custom-value"
+
+
+async def test_sluice_control_headers_stripped():
+    """sluice-internal control headers are stripped before forwarding upstream."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={
+                "x-sluice-client-label": "interactive",
+                "x-sluice-qos": "high",
+                "x-sluice-unknown-future-header": "value",
+                "X-Sluice-Mixed-Case": "test",
+                "Authorization": "Bearer secret-key",
+            },
+        )
+
+    # ALL x-sluice-* headers must not reach upstream (prefix match, case-insensitive).
+    assert "x-sluice-client-label" not in received
+    assert "x-sluice-qos" not in received
+    assert "x-sluice-unknown-future-header" not in received
+    assert "x-sluice-mixed-case" not in received
+    # But auth passes through.
+    assert received.get("authorization") == "Bearer secret-key"
+
+
+# ---------------------------------------------------------------------------
+# Singleton guard integration (Plan 004)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGuard:
+    """Test guard with controllable is_held()."""
+
+    def __init__(self, held: bool = True, acquire_result: bool = True) -> None:
+        self._held = held
+        self._acquire_result = acquire_result
+        self.acquire_called = False
+        self.release_called = False
+        self.renewer_started = False
+
+    async def acquire(self) -> bool:
+        self.acquire_called = True
+        self._held = self._acquire_result
+        return self._acquire_result
+
+    async def renew(self) -> bool:
+        return self._held
+
+    def is_held(self) -> bool:
+        return self._held
+
+    async def release(self) -> None:
+        self.release_called = True
+        self._held = False
+
+    async def start_renewer(self) -> None:
+        self.renewer_started = True
+
+    async def stop_renewer(self) -> None:
+        pass
+
+
+def _make_app_with_guard(
+    guard,
+    *,
+    gate_capacity: int = 3,
+    upstream_handler=None,
+) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
+    gate = PermitGate(initial_capacity=gate_capacity)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(
+        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        timeout=None,
+    )
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+        guard=guard,  # type: ignore[arg-type]
+    )
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+        guard=guard,  # type: ignore[arg-type]
+    )
+    return app, gate, reconcile
+
+
+async def test_non_leader_fast_fails_503():
+    """A non-leader proxy returns 503 not_leader immediately."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "not_leader"
+
+
+async def test_leader_serves_normally():
+    """A leader proxy serves requests normally."""
+    guard = _FakeGuard(held=True, acquire_result=True)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 200
+
+
+async def test_readyz_requires_guard_held():
+    """/readyz is 503 when guard is not held, even if reconcile is ready."""
+    guard = _FakeGuard(held=True, acquire_result=True)
+    app, _, reconcile = _make_app_with_guard(guard)
+
+    # Make reconcile ready.
+    await reconcile.tick()
+    assert reconcile.ready is True
+
+    # Guard held → ready.
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+    assert response.status_code == 200
+
+    # Guard lost → not ready.
+    guard._held = False
+    async with _asgi_client(app) as client:
+        response = await client.get("/readyz")
+    assert response.status_code == 503
+
+
+async def test_healthz_unaffected_by_guard():
+    """/healthz returns 200 regardless of guard state."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+async def test_non_leader_does_not_poll_usage():
+    """A non-leader reconcile loop does not poll /v1/usage."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+        guard=guard,  # type: ignore[arg-type]
+    )
+
+    await reconcile.tick()
+
+    assert usage.fetch_count == 0
+    assert gate.capacity == 0  # gate closed
+
+
+# ---------------------------------------------------------------------------
+# WI-004: Retry lease acquisition after failed startup
+# ---------------------------------------------------------------------------
+
+
+class _FakeGuardRetryable:
+    """Guard that fails the first acquire, succeeds on subsequent calls.
+
+    Set ``_start_renewer_fail_count`` to make ``start_renewer`` raise that many
+    times before succeeding — used to test the zombie-leader prevention path.
+    """
+
+    def __init__(self) -> None:
+        self._held = False
+        self._acquire_count = 0
+        self.renewer_started = False
+        self._start_renewer_fail_count = 0
+        self._release_count = 0
+
+    async def acquire(self) -> bool:
+        self._acquire_count += 1
+        if self._acquire_count == 1:
+            return False
+        self._held = True
+        return True
+
+    async def renew(self) -> bool:
+        return self._held
+
+    def is_held(self) -> bool:
+        return self._held
+
+    async def release(self) -> None:
+        self._held = False
+        self._release_count += 1
+
+    async def start_renewer(self) -> None:
+        if self._start_renewer_fail_count > 0:
+            self._start_renewer_fail_count -= 1
+            raise RuntimeError("simulated start_renewer failure")
+        self.renewer_started = True
+
+    async def stop_renewer(self) -> None:
+        pass
+
+
+async def test_retry_acquire_after_failed_startup():
+    """When initial acquire fails, the proxy retries and becomes leader."""
+    guard = _FakeGuardRetryable()
+    app, _, reconcile = _make_app_with_guard(guard)
+    app._retry_interval = 0.01
+
+    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+
+    await asyncio.sleep(0.2)
+
+    assert app._guard_acquired is True
+    assert guard.renewer_started is True
+    assert reconcile._task is not None
+
+    await reconcile.stop()
+    if app._acquire_retry_task and not app._acquire_retry_task.done():
+        app._acquire_retry_task.cancel()
+        try:
+            await app._acquire_retry_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_retry_acquire_cancelled_on_shutdown():
+    """The retry task is properly cancelled during shutdown."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+    app._retry_interval = 0.01
+
+    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+
+    await asyncio.sleep(0.05)
+
+    # Simulate shutdown cancelling the task.
+    assert app._acquire_retry_task is not None
+    app._acquire_retry_task.cancel()
+    try:
+        await app._acquire_retry_task
+    except asyncio.CancelledError:
+        pass
+
+    assert app._acquire_retry_task.cancelled()
+    assert app._guard_acquired is False
+
+
+async def test_retry_acquire_releases_lease_if_start_fails():
+    """If start_renewer raises after acquire succeeds, the lease is released and retry continues.
+
+    Without this, the proxy would hold the lease but have no renewer or reconcile
+    running — a zombie leader that serves traffic without usage polling.
+    """
+    guard = _FakeGuardRetryable()
+    guard._start_renewer_fail_count = 1  # fail first start_renewer call
+    app, _, reconcile = _make_app_with_guard(guard)
+    app._retry_interval = 0.01
+
+    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+
+    await asyncio.sleep(0.3)
+
+    assert app._guard_acquired is True
+    assert guard.renewer_started is True
+    assert reconcile._task is not None
+    assert guard._release_count >= 1  # lease was released after the failed start
+
+    await reconcile.stop()
+    if app._acquire_retry_task and not app._acquire_retry_task.done():
+        app._acquire_retry_task.cancel()
+        try:
+            await app._acquire_retry_task
+        except asyncio.CancelledError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# WI-007: Request body queue is bounded (memory DoS prevention)
+# ---------------------------------------------------------------------------
+
+
+async def test_large_multi_chunk_body_proxied():
+    """A large multi-chunk request body is proxied correctly with the bounded queue.
+
+    The body queue has maxsize=1 to prevent unbounded memory growth. This test
+    verifies that a body sent in multiple chunks is still proxied byte-for-byte.
+    """
+    chunks = [b"x" * 10000 for _ in range(10)]
+    expected_body = b"".join(chunks)
+
+    received_body = bytearray()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received_body.extend(request.content)
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    for chunk in chunks:
+        await receive_queue.put({"type": "http.request", "body": chunk, "more_body": True})
+    await receive_queue.put({"type": "http.request", "body": b"", "more_body": False})
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await app(scope, receive, send)
+
+    assert bytes(received_body) == expected_body
+    status_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(status_events) == 1
+    assert status_events[0]["status"] == 200

@@ -1,0 +1,16 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sluice-lease
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["sluice"]
+    verbs: ["get", "create", "update", "delete"]
+  # create without resourceName is needed for the initial create
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]

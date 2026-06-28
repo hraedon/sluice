@@ -15,6 +15,7 @@ from sluice.control import (
     classify_band,
     effective_permits,
     phantom_estimate,
+    phantom_estimate_instant,
     breaker_on_429,
     breaker_on_success,
     breaker_on_tick,
@@ -31,8 +32,10 @@ def reading(**kw) -> UsageReading:
     return UsageReading(**base)
 
 
-def state(r: UsageReading, in_flight: int = 0, breaker=BreakerState.CLOSED) -> ControllerState:
-    return ControllerState(reading=r, local_in_flight=in_flight, breaker=breaker)
+def state(r: UsageReading, in_flight: int = 0, breaker=BreakerState.CLOSED, phantom: int | None = None) -> ControllerState:
+    if phantom is None:
+        phantom = phantom_estimate_instant(r, in_flight)
+    return ControllerState(reading=r, local_in_flight=in_flight, breaker=breaker, phantom_estimate=phantom)
 
 
 # --- band classification ----------------------------------------------------
@@ -59,12 +62,44 @@ def test_box_elapsed_is_not_boxed():
     assert classify_band(r, now=NOW) != Band.BOXED
 
 
-# --- phantom estimate -------------------------------------------------------
+# --- phantom estimate (instant) -------------------------------------------
 
 
-def test_phantom_estimate_only_counts_excess():
-    assert phantom_estimate(reading(concurrent_sessions=6), local_in_flight=4) == 2
-    assert phantom_estimate(reading(concurrent_sessions=2), local_in_flight=4) == 0
+def test_phantom_estimate_instant_only_counts_excess():
+    assert phantom_estimate_instant(reading(concurrent_sessions=6), local_in_flight=4) == 2
+    assert phantom_estimate_instant(reading(concurrent_sessions=2), local_in_flight=4) == 0
+
+
+# --- phantom estimate (windowed — Plan 003) --------------------------------
+
+
+def test_phantom_estimate_windowed_empty_returns_zero():
+    assert phantom_estimate([]) == 0
+
+
+def test_phantom_estimate_windowed_sustained_excess():
+    # observed runs 2 over local for the whole window → estimate is 2
+    samples = [(6, 4), (6, 4), (6, 4)]
+    assert phantom_estimate(samples) == 2
+
+
+def test_phantom_estimate_windowed_single_tick_spike_dropped():
+    # one tick of excess (transient release-lag), rest clean → min is 0
+    samples = [(6, 4), (4, 4), (4, 4)]
+    assert phantom_estimate(samples) == 0
+
+
+def test_phantom_estimate_windowed_churn_trace():
+    # admit/release rapidly while observed lags one tick high → estimate is 0
+    samples = [(5, 3), (3, 3), (3, 3)]
+    assert phantom_estimate(samples) == 0
+
+
+def test_phantom_estimate_windowed_monotonicity():
+    # higher sustained observed never raises permits (lower estimate is worse)
+    low = phantom_estimate([(5, 3), (5, 3), (5, 3)])
+    high = phantom_estimate([(7, 3), (7, 3), (7, 3)])
+    assert high >= low
 
 
 # --- effective_permits hard stops -------------------------------------------

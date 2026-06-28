@@ -48,6 +48,18 @@ silently dropped.
 6. **Validate on CI early; distrust green local gates.** Push to a branch and watch CI
    (3.12 + 3.13) before trusting. Async/streaming behaviour is easy to get locally-green
    and actually-broken.
+7. **Cache-transparency — be indistinguishable from a direct client.** Prompt caching
+   lives entirely upstream and is keyed off the request the provider receives. So the
+   request sluice *egresses* must be byte-for-byte what the client sent — same body bytes
+   (never parse/re-serialise/reorder/buffer a body), same content and `anthropic-*` /
+   cache-control / `authorization` headers — minus only hop-by-hop headers, plus **nothing
+   sluice-internal**. Any sluice control header (e.g. a QoS client label) is consumed and
+   **stripped before forwarding**, never sent upstream. We don't know umans' cache
+   internals and don't need to: a request through sluice must hash identically to the same
+   request sent directly, so whatever the provider caches is unaffected by our presence.
+   The only caching effect sluice may have is *timing* (queuing/throttling can space a
+   client's turns past the provider's cache TTL) — that is a provisioning cost, surfaced in
+   metrics, not a transform of the request.
 
 ## Layout
 
@@ -72,3 +84,8 @@ plans/                     # numbered implementation plans
   bounded TTL, then tighten — never assume zero phantoms.
 - Don't add response caching, prompt logging, or model routing. Those are out of scope and
   break the "inert in-path" guarantee.
+- Don't add, rename, reorder, or buffer anything on the wire to the upstream — not headers,
+  not body bytes. The upstream's prompt cache keys off the exact request; a body sluice
+  re-serialised (even with identical JSON, different key order/whitespace) is a different
+  cache key and a silent cache miss. Classify QoS by metadata, never by peeking at or
+  reshaping the body.

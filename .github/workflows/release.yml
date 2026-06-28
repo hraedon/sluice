@@ -1,0 +1,120 @@
+name: release
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'deploy/k8s/kustomization.yaml'
+      - '**.md'
+      - 'docs/**'
+      - 'plans/**'
+      - 'reflections/**'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Compute tags
+        id: tag
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          echo "sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          git_tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+          echo "git_tag=${git_tag}" >> "$GITHUB_OUTPUT"
+          {
+            echo "image_tags<<EOF"
+            echo "ghcr.io/${{ github.repository_owner }}/sluice:latest"
+            echo "ghcr.io/${{ github.repository_owner }}/sluice:${short_sha}"
+            if [ -n "$git_tag" ]; then
+              echo "ghcr.io/${{ github.repository_owner }}/sluice:${git_tag}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4
+
+      # Build a single-arch (amd64) image into the local daemon and scan it
+      # BEFORE anything is published. Multi-arch builds can't be `load`ed, so the
+      # gate runs on amd64; the dependency CVEs we gate on live in arch-independent
+      # Python wheels, and the push build below reuses these exact layers from the
+      # gha cache. Nothing reaches ghcr until the scan passes.
+      - name: Build image for scanning (amd64)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: sluice:scan-${{ steps.tag.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: "sluice:scan-${{ steps.tag.outputs.sha }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+      # Only after the scan gates do we authenticate and publish the multi-arch
+      # image. The amd64 layers are reused from the gha cache, so this does not
+      # rebuild what was just scanned.
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tag.outputs.image_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Bump kustomize image tag to the immutable digest tag
+        run: |
+          KUSTOMIZE_VERSION="v5.4.3"
+          KUSTOMIZE_URL="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          CHECKSUMS_URL="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/checksums.txt"
+          curl -sSL -o /tmp/kustomize.tgz "$KUSTOMIZE_URL"
+          curl -sSL -o /tmp/checksums.txt "$CHECKSUMS_URL"
+          EXPECTED_SHA=$(grep "kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" /tmp/checksums.txt | awk '{print $1}')
+          ACTUAL_SHA=$(sha256sum /tmp/kustomize.tgz | awk '{print $1}')
+          if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+            echo "Kustomize checksum mismatch: expected $EXPECTED_SHA, got $ACTUAL_SHA"
+            exit 1
+          fi
+          tar -xzf /tmp/kustomize.tgz -C /tmp
+          IMAGE_TAG="${{ steps.tag.outputs.git_tag || steps.tag.outputs.sha }}"
+          cd "$GITHUB_WORKSPACE/deploy/k8s"
+          /tmp/kustomize edit set image ghcr.io/${{ github.repository_owner }}/sluice=ghcr.io/${{ github.repository_owner }}/sluice:${IMAGE_TAG}
+
+      - name: Commit tag bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "No image change to commit."
+            exit 0
+          fi
+          git add deploy/k8s/kustomization.yaml
+          IMAGE_TAG="${{ steps.tag.outputs.git_tag || steps.tag.outputs.sha }}"
+          git commit -m "chore(deploy): bump image to ${IMAGE_TAG}"
+          git push

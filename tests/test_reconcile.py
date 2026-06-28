@@ -15,7 +15,7 @@ from sluice.gate import PermitGate
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-CFG = ControllerConfig(target=3, min_floor=1, usage_fresh_ttl=15.0, stale_penalty=1, low_penalty=1)
+CFG = ControllerConfig(target=3, min_floor=1, usage_fresh_ttl=15.0, stale_penalty=1, low_penalty=1, phantom_window=3)
 BCFG = BreakerConfig(threshold=5, window_seconds=300.0, cooldown_seconds=60.0)
 
 
@@ -238,3 +238,168 @@ async def test_gate_release_cooldown():
     assert gate.held == 0
     assert gate.cooling_down == 1
     assert gate.available == 0  # in cooldown, not reusable yet
+
+
+# --- windowed phantom estimation (Plan 003) --------------------------------
+
+
+async def test_churn_does_not_shrink_gate():
+    """Under churn at/under target, the gate does not dip below target.
+
+    A request that completed moments ago has left local_in_flight but still sits
+    in the lagged observed. The windowed min drops this transient spike.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=3))
+
+    # Tick 1: observed=3, local=0 → instant phantom=3, but window has 1 sample.
+    # With K=3, a single sample's excess survives (min of 1 sample = that sample).
+    # So gate shrinks. This is correct — we can't know yet if it's transient.
+    await loop.tick()
+
+    # Tick 2: observed drops to 0 (request gone from provider's view), local=0
+    client.set_reading(_reading(concurrent_sessions=0))
+    await loop.tick()
+    # Now samples = [(3,0), (0,0)] → min(3, 0) = 0 → no phantom → gate at target
+    assert gate.capacity == 3
+
+
+async def test_sustained_phantom_shrinks_gate():
+    """A phantom present in every sample survives the windowed min."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=5))
+
+    # Fill the window with sustained excess: observed=5, local=3 → phantom=2
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+    # held=3, observed=5 → phantom=2 → target(3) - 2 = 1
+    await loop.tick()
+    assert gate.capacity == 1
+
+    # Next tick: still sustained
+    await loop.tick()
+    assert gate.capacity == 1
+
+
+async def test_single_tick_spike_does_not_persist():
+    """A one-tick spike in an otherwise-clean window doesn't keep the gate down."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=5))
+
+    # Tick 1: spike (observed=5, local=3) → phantom=2
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+    await loop.tick()
+    assert gate.capacity == 1  # shrunk due to spike
+
+    # Tick 2-3: phantom clears
+    client.set_reading(_reading(concurrent_sessions=3))
+    await loop.tick()
+    await loop.tick()
+    # Window now has clean samples → phantom=0 → gate back to target
+    assert gate.capacity == 3
+
+
+# --- gate_closed_reason + retry_after_seconds (Plan 003 WI-003) -------------
+
+
+async def test_gate_closed_reason_open():
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=2))
+    await loop.tick()
+    assert loop.gate_closed_reason() == "open"
+
+
+async def test_gate_closed_reason_boxed():
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_000_100.0, resets_at_epoch=1_000_100.0)
+    )
+    await loop.tick()
+    assert loop.gate_closed_reason() == "boxed"
+
+
+async def test_gate_closed_reason_boxed_elapsed_is_open():
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_000_000.0)
+    )
+    await loop.tick()
+    assert loop.gate_closed_reason() == "open"
+
+
+async def test_gate_closed_reason_breaker():
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    bcfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+    loop._brk_cfg = bcfg
+
+    await loop.tick()
+    for _ in range(3):
+        loop.record_429()
+    await loop.tick()
+    assert loop.gate_closed_reason() == "breaker"
+
+
+async def test_retry_after_seconds_boxed_with_resets_at():
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_000_100.0, resets_at_epoch=1_000_100.0)
+    )
+    await loop.tick()
+    # resets_at - now_wall = 1_000_100 - 1_000_000 = 100
+    assert loop.retry_after_seconds() == 100
+
+
+async def test_retry_after_seconds_boxed_without_resets_at():
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_000_100.0)
+    )
+    await loop.tick()
+    # No resets_at → floor of 30
+    assert loop.retry_after_seconds() == 30
+
+
+async def test_retry_after_seconds_breaker():
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    bcfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+    loop._brk_cfg = bcfg
+
+    await loop.tick()
+    for _ in range(3):
+        loop.record_429()
+    await loop.tick()
+    # Just tripped → cooldown is ~60s remaining
+    ra = loop.retry_after_seconds()
+    assert 55 <= ra <= 60
+
+
+async def test_retry_after_seconds_open_is_default():
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=2))
+    await loop.tick()
+    assert loop.retry_after_seconds() == 5
+
+
+# --- WI-006: stale resets_at capped when cached.ok=False ---------------------
+
+
+async def test_retry_after_seconds_stale_capped():
+    """When the cached reading is stale (ok=False), retry_after is capped at 300."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_001_000.0, resets_at_epoch=1_001_000.0)
+    )
+    await loop.tick()
+
+    client.set_fail(True)
+    m[0] += 1
+    await loop.tick()
+
+    # resets_at = 1_001_000, now_wall = 1_000_000 → remaining = 1000
+    # Stale (ok=False) → capped at 300
+    assert loop.retry_after_seconds() == 300
+
+
+async def test_retry_after_seconds_fresh_not_capped():
+    """When the cached reading is fresh (ok=True), retry_after is not capped."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, boxed_until_epoch=1_001_000.0, resets_at_epoch=1_001_000.0)
+    )
+    await loop.tick()
+
+    # resets_at = 1_001_000, now_wall = 1_000_000 → remaining = 1000
+    # Fresh (ok=True) → not capped
+    assert loop.retry_after_seconds() == 1000

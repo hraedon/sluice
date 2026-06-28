@@ -43,6 +43,7 @@ class UsageReading:
     hard_cap: int
     priority_low: bool = False
     boxed_until_epoch: float | None = None  # seconds since epoch, or None
+    resets_at_epoch: float | None = None  # when the box lifts (epoch seconds), or None
     age_seconds: float = 0.0  # how stale this reading is, at decision time
 
 
@@ -55,6 +56,7 @@ class ControllerConfig:
     usage_fresh_ttl: float = 15.0  # readings older than this are "stale"
     stale_penalty: int = 1  # how much to tighten when the reading is stale
     low_penalty: int = 1  # tighten by this when already in the 'low' band
+    phantom_window: int = 3  # samples for sustained phantom detection (Plan 003)
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class ControllerState:
     reading: UsageReading
     local_in_flight: int
     breaker: BreakerState = BreakerState.CLOSED
+    phantom_estimate: int = 0  # pre-computed windowed estimate (Plan 003)
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +86,33 @@ def classify_band(reading: UsageReading, *, now: float) -> Band:
     return Band.NORMAL
 
 
-def phantom_estimate(reading: UsageReading, local_in_flight: int) -> int:
-    """Concurrency the provider sees that sluice did not create.
+def phantom_estimate_instant(reading: UsageReading, local_in_flight: int) -> int:
+    """Instantaneous excess of observed over local — a single sample.
 
     The provider's count is authority; any excess over what sluice is holding is treated
-    as phantom load to be absorbed by tightening the gate.
+    as phantom load.  Used as a building block for the windowed estimate; callers should
+    prefer :func:`phantom_estimate` (windowed) to avoid over-throttling on transient lag.
     """
     return max(0, reading.concurrent_sessions - local_in_flight)
+
+
+def phantom_estimate(samples: Sequence[tuple[int, int]]) -> int:
+    """Windowed phantom estimate: sustained excess over K samples.
+
+    Each sample is ``(observed_i, local_in_flight_i)`` captured *at the time reading i
+    was taken*.  Returns ``max(0, min_i(observed_i − local_in_flight_i))``.
+
+    A transient spike (a just-completed request still in the lagged ``observed``) appears
+    in only one sample, so the windowed ``min`` drops it.  A genuine phantom present in
+    *every* sample survives the ``min`` — its excess is the floor the ``min`` selects.
+
+    Fail-safe bound: a brand-new real phantom is only ignored for at most ``K−1`` polls,
+    strictly shorter than the breaker window and far shorter than the day-scale box
+    accumulation.  The slow backstops still catch sustained overload.
+    """
+    if not samples:
+        return 0
+    return max(0, min(obs - local for obs, local in samples))
 
 
 def _clamp(value: int, low: int, high: int) -> int:
@@ -109,7 +132,8 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     * Fail safe — every uncertain input (box, breaker, priority.low, staleness, phantoms)
       can only *lower* the result. Bad information never widens the gate.
     * Phantom-absorbing — provider-observed excess shrinks the gate so phantoms age out
-      before sluice adds more load.
+      before sluice adds more load.  The estimate is windowed (Plan 003) so transient
+      release-lag does not cause self-throttling.
     * Pure — ``now`` and the reading's ``age_seconds`` are supplied; no clock is read here.
     """
     reading = state.reading
@@ -129,7 +153,7 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     # Absorb phantoms only when the reading is fresh enough to trust the number;
     # otherwise apply a flat staleness penalty rather than assuming zero phantoms.
     if reading.age_seconds <= config.usage_fresh_ttl:
-        base -= phantom_estimate(reading, state.local_in_flight)
+        base -= state.phantom_estimate
     else:
         base = min(base, config.target - config.stale_penalty)
 
