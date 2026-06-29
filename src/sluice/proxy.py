@@ -477,13 +477,13 @@ th{color:var(--gap);font-weight:400}
 </div>
 <script>
 async function poll(){
+ let active=false;
  try{
   const r=await fetch('/status.json');
-  if(!r.ok)return;
-  const d=await r.json();
-  render(d);
+  if(r.ok){active=render(await r.json());}
  }catch(e){}
- setTimeout(poll,1000);
+ // Stream-ish: poll fast while there's activity, idle back to a slow heartbeat.
+ setTimeout(poll,active?1000:5000);
 }
 function render(d){
  const limit=d.limit||4,hc=d.hard_cap||8,tgt=d.target||3;
@@ -510,6 +510,8 @@ function render(d){
   ['phantom_estimate',d.phantom_estimate],
   ['breaker',d.breaker],['recent_429s',d.recent_429s],
   ['total_429s',d.total_429s],['queue_depth',d.queue_depth],
+  ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95'],
+  ['queue_timeouts',d.queue_timeouts],
   ['gate_closed',d.gate_closed_reason],['ready',d.ready],
   ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':'')],
  ];
@@ -522,6 +524,8 @@ function render(d){
  }else bb.style.display='none';
  const br=document.getElementById('banner-breaker');
  br.style.display=(d.breaker==='open')?'block':'none';
+ // "Active" = anything moving: in-flight, a queue, or a non-nominal state.
+ return (loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
 }
 poll();
 </script>

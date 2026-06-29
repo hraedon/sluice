@@ -236,6 +236,18 @@ class ReconciliationLoop:
         return self._gate.cooling_down
 
     @property
+    def avg_wait_seconds(self) -> float:
+        return self._gate.avg_wait_seconds
+
+    @property
+    def p95_wait_seconds(self) -> float:
+        return self._gate.p95_wait_seconds
+
+    @property
+    def queue_timeouts(self) -> int:
+        return self._gate.queue_timeouts
+
+    @property
     def last_age_seconds(self) -> float:
         return self._last_age
 

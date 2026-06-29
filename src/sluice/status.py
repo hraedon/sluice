@@ -41,6 +41,9 @@ class StatusSnapshot:
     queue_depth: int
     local_in_flight: int
     cooling_down: int
+    avg_wait_seconds: float
+    p95_wait_seconds: float
+    queue_timeouts: int
     ready: bool
     gate_closed_reason: str
 
@@ -64,6 +67,9 @@ class StatusSnapshot:
             "queue_depth": self.queue_depth,
             "local_in_flight": self.local_in_flight,
             "cooling_down": self.cooling_down,
+            "avg_wait_seconds": round(self.avg_wait_seconds, 2),
+            "p95_wait_seconds": round(self.p95_wait_seconds, 2),
+            "queue_timeouts": self.queue_timeouts,
             "ready": self.ready,
             "gate_closed_reason": self.gate_closed_reason,
         }
@@ -98,6 +104,9 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
         cooling_down=reconcile.cooling_down,
+        avg_wait_seconds=reconcile.avg_wait_seconds,
+        p95_wait_seconds=reconcile.p95_wait_seconds,
+        queue_timeouts=reconcile.queue_timeouts,
         ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
     )
@@ -127,6 +136,9 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_total_429s", "Total 429s since startup", snap.total_429s)
     gauge("sluice_queue_depth", "Requests waiting for a permit", snap.queue_depth)
     gauge("sluice_cooling_down", "Permits in release cooldown", snap.cooling_down)
+    gauge("sluice_queue_wait_avg_seconds", "Mean queue wait over recent blocked grants", round(snap.avg_wait_seconds, 3))
+    gauge("sluice_queue_wait_p95_seconds", "95th-pct queue wait over recent blocked grants", round(snap.p95_wait_seconds, 3))
+    gauge("sluice_queue_timeouts_total", "Requests that gave up waiting for a permit", snap.queue_timeouts)
     enum_gauge(
         "sluice_band",
         "Current enforcement band",

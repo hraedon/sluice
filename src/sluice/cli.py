@@ -256,6 +256,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"gate_closed_reason: {d.get('gate_closed_reason', '?')}")
     print(f"total_429s:         {d['total_429s']}")
     print(f"queue_depth:        {d['queue_depth']}")
+    print(f"queue_wait:         {d.get('avg_wait_seconds', '?')}s avg / {d.get('p95_wait_seconds', '?')}s p95")
+    print(f"queue_timeouts:     {d.get('queue_timeouts', '?')}")
     print(f"ready:              {d.get('ready', '?')}")
     return 0
 

@@ -56,6 +56,26 @@ async def test_snapshot_fields():
     assert d["gate_closed_reason"] == "open"
     assert d["phantom_estimate"] == 0
     assert d["cooling_down"] == 0
+    assert d["avg_wait_seconds"] == 0.0
+    assert d["p95_wait_seconds"] == 0.0
+    assert d["queue_timeouts"] == 0
+
+
+async def test_snapshot_queue_wait_reflects_gate():
+    """avg/p95 queue wait and timeouts in the snapshot read the gate's counters."""
+    gate = PermitGate(initial_capacity=0)  # no permits → acquire times out
+    loop = ReconciliationLoop(
+        usage_client=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(target=3, phantom_window=3),
+        breaker_config=BreakerConfig(),
+    )
+
+    assert await gate.acquire(timeout=0.01) is False
+
+    snap = snapshot(loop)
+    assert snap.queue_timeouts == 1
+    assert snap.to_dict()["queue_timeouts"] == 1
 
 
 async def test_snapshot_cooling_down_reflects_gate():
