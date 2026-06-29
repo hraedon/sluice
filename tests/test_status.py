@@ -55,6 +55,25 @@ async def test_snapshot_fields():
     assert d["ready"] is True
     assert d["gate_closed_reason"] == "open"
     assert d["phantom_estimate"] == 0
+    assert d["cooling_down"] == 0
+
+
+async def test_snapshot_cooling_down_reflects_gate():
+    """cooling_down in the snapshot reads the gate's actual cooldown count."""
+    gate = PermitGate(initial_capacity=3, release_cooldown=999.0)
+    loop = ReconciliationLoop(
+        usage_client=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(target=3, phantom_window=3),
+        breaker_config=BreakerConfig(),
+    )
+    await loop.tick()
+
+    await gate.acquire(timeout=1.0)
+    await gate.release()
+
+    snap = snapshot(loop)
+    assert snap.cooling_down == 1
 
 
 async def test_snapshot_before_first_tick():

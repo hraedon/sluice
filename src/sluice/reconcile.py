@@ -232,6 +232,10 @@ class ReconciliationLoop:
         return self._gate.queue_depth
 
     @property
+    def cooling_down(self) -> int:
+        return self._gate.cooling_down
+
+    @property
     def last_age_seconds(self) -> float:
         return self._last_age
 

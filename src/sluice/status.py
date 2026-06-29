@@ -97,7 +97,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         target=reconcile._ctrl_cfg.target,
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
-        cooling_down=0,
+        cooling_down=reconcile.cooling_down,
         ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
     )
