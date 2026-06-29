@@ -53,6 +53,56 @@ sluice is that shared choke point, and it closes the loop against upstream truth
 - **Both API surfaces.** Transparent streaming passthrough for the Anthropic
   (`/v1/messages`) and OpenAI (`/v1/chat/completions`) routes.
 
+## Quickstart
+
+sluice needs an **upstream URL** and an **API key it can use to poll `/v1/usage`** (the same
+key your clients send). It listens on `:8800`, serves a live dashboard at `/`, and proxies
+every other path straight through to the upstream.
+
+**pip / pipx** (not on PyPI — install from git):
+
+```sh
+pip install "sluice @ git+https://github.com/hraedon/sluice.git@main"
+export SLUICE_USAGE_KEY=sk-...        # key used only for /v1/usage polling
+sluice serve --upstream https://api.code.umans.ai --listen 127.0.0.1:8800
+```
+
+**Docker** (the `ENTRYPOINT` is `sluice`, so pass only the subcommand):
+
+```sh
+docker build -t sluice:local .
+docker run --rm -p 8800:8800 -e SLUICE_USAGE_KEY=sk-... sluice:local \
+  serve --upstream https://api.code.umans.ai --listen 0.0.0.0:8800
+```
+
+Then point your clients (opencode, open-webui, …) at `http://127.0.0.1:8800` instead of the
+provider, and open `http://127.0.0.1:8800/` for the dashboard. `--target` is the concurrency
+sluice aims to hold (default **3**, one below umans Code Max's limit of 4 — pass `--target 4`
+to use the full limit, trading the safety buffer). See `docs/client-configuration.md` for
+per-client setup and `deploy/` for the Kubernetes / ArgoCD manifests.
+
+## Why not LiteLLM (or nginx, or a Redis semaphore)?
+
+Because every generic concurrency limiter counts **what you sent** — its own in-flight
+requests. sluice counts **what the provider sees** — `concurrent_sessions` from
+`/v1/usage`, reconciled every few seconds. That difference is the entire point:
+
+- A local semaphore (nginx `limit_conn`, a Redis counter, LiteLLM's parallel-request cap)
+  is blind to **phantoms** — sessions the provider still counts as live after a client
+  disconnects. They exist only in the provider's counter, and they're exactly what tips you
+  over the cliff. sluice shrinks its own permits to absorb an excess it didn't create
+  (`effective = target − max(0, observed − local_in_flight)`); a limiter that only knows its
+  own number can't see the gap.
+- sluice models the provider's **specific enforcement ladder** — `priority.low` at the
+  limit, 429s past `hard_cap`, and the day-scale **penalty box** (5-hour pause, a handful of
+  self-reactivations per week). It holds one slot below the cliff and respects `boxed_until`
+  instead of hammering a locked account. A generic limiter has no concept of a box.
+
+If your provider doesn't expose a live concurrency reading — or you don't share one account
+across hosts — you probably **don't** need sluice; reach for LiteLLM or `limit_conn`. sluice
+earns its place only where the provider's own count is the number that punishes you, and
+that number can drift from yours.
+
 ## Scope
 
 **In:** reverse-proxy data plane (streaming, both surfaces); a deterministic concurrency
@@ -62,8 +112,8 @@ release cooldown + circuit breaker; minimal operational metrics.
 **Out:** request *content* inspection, prompt logging, caching, or model routing — sluice
 is a concurrency governor, not a gateway. It does not transform bodies.
 
-**Non-goals:** being a general API gateway; per-prompt billing/analytics (that's
-[[project-usage-dashboard]]'s job — observability, read-only); reselling concurrency by
+**Non-goals:** being a general API gateway; per-prompt billing/analytics (that's a separate
+observability concern, read-only); reselling concurrency by
 key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurrency pack).
 
 ## Boundary vs. siblings
@@ -86,8 +136,8 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **deployed** (internal-only, GitOps via ArgoCD) and serving on the LAN at
-`https://sluice.k8s.hraedon.com`; not yet validated against real streaming agent traffic
-(that's the current step). See `docs/concurrency-model.md` for the data model,
+Status: **deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
+real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
+boxed). See `docs/concurrency-model.md` for the data model,
 `docs/client-configuration.md` to point clients at it, and `deploy/README.md` for the
 deployment and the external-exposure toggle.
