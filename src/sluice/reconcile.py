@@ -227,6 +227,13 @@ class ReconciliationLoop:
         return self._breaker.state
 
     @property
+    def breaker_half_open_age_seconds(self) -> float | None:
+        """Seconds since the breaker entered HALF_OPEN, or None if not half-open."""
+        if self._breaker.state is not BreakerState.HALF_OPEN or self._breaker.half_opened_at is None:
+            return None
+        return self._mono() - self._breaker.half_opened_at
+
+    @property
     def total_429s(self) -> int:
         return self._total_429s
 

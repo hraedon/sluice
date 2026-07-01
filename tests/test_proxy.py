@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
@@ -43,32 +44,61 @@ class FakeUsageClient:
         pass
 
 
-class _AsyncMockTransport(httpx.AsyncBaseTransport):
-    """Mock transport that ensures responses support async streaming.
+class _StreamingMockTransport(httpx.AsyncBaseTransport):
+    """Mock transport that streams the request body chunk-by-chunk (WI-1).
 
-    httpx.Response(json=...) creates a ByteStream with is_stream_consumed=True,
-    which breaks aiter_raw().  This transport re-wraps content as an async
-    generator so the proxy can stream it properly.
+    Replaces _AsyncMockTransport which called ``await request.aread()``,
+    buffering the entire body — so no test exercised ``body_stream()``'s
+    backpressure.  This transport consumes ``request.stream`` incrementally,
+    exercising the real streaming path.
+
+    Supports configurable delays for race testing (WI-2):
+
+    - ``header_delay``: sleep before calling the handler, simulating upstream
+      latency so the ``asyncio.wait`` race (entry_task vs disconnect_task)
+      actually races.
+    - ``chunk_delay``: sleep before yielding each response chunk, so
+      disconnect-during-response-streaming has a real window to fire in.
     """
 
-    def __init__(self, handler):
+    def __init__(
+        self,
+        handler,
+        *,
+        header_delay: float = 0.0,
+        chunk_delay: float = 0.0,
+    ):
         self._handler = handler
+        self._header_delay = header_delay
+        self._chunk_delay = chunk_delay
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        # Read the request body so the proxy's body_stream generator is consumed
-        # and the body is available for handler inspection via request.content.
-        await request.aread()
+        # WI-1: Consume the request body chunk-by-chunk from the stream,
+        # NOT via aread() which buffers the entire body.  This exercises
+        # body_stream()'s backpressure: if we are slow to consume a chunk,
+        # the proxy does not call receive() for the next one.
+        body_parts: list[bytes] = []
+        async for chunk in request.stream:
+            body_parts.append(chunk)
+        request._content = b"".join(body_parts)
+
+        if self._header_delay > 0:
+            await asyncio.sleep(self._header_delay)
 
         response = self._handler(request)
+
+        # Apply chunk_delay to response streaming if configured (WI-2).
+        if self._chunk_delay > 0:
+            return self._wrap_with_chunk_delay(response)
 
         # Already a proper async stream — pass through.
         if isinstance(response.stream, httpx.AsyncByteStream) and not response.is_stream_consumed:
             return response
 
-        # Re-wrap content as async generator.
+        # Re-wrap content as async generator (for bytes content).
         content = response.content if response.is_stream_consumed else b"".join(response.stream)
 
-        async def gen():
+        async def gen() -> AsyncIterator[bytes]:
             yield content
 
         headers = [
@@ -77,6 +107,31 @@ class _AsyncMockTransport(httpx.AsyncBaseTransport):
             if k.lower() not in ("content-length", "transfer-encoding")
         ]
         return httpx.Response(response.status_code, headers=headers, content=gen())
+
+    def _wrap_with_chunk_delay(self, response: httpx.Response) -> httpx.Response:
+        original = response.stream
+        delay = self._chunk_delay
+
+        if isinstance(original, httpx.AsyncByteStream) and not response.is_stream_consumed:
+            async def delayed_async() -> AsyncIterator[bytes]:
+                async for chunk in original:
+                    await asyncio.sleep(delay)
+                    yield chunk
+            content_gen: AsyncIterator[bytes] = delayed_async()
+        else:
+            content = response.content if response.is_stream_consumed else b"".join(original)
+
+            async def delayed_sync() -> AsyncIterator[bytes]:
+                await asyncio.sleep(delay)
+                yield content
+            content_gen = delayed_sync()
+
+        headers = [
+            (k, v)
+            for k, v in response.headers.items()
+            if k.lower() not in ("content-length", "transfer-encoding")
+        ]
+        return httpx.Response(response.status_code, headers=headers, content=content_gen)
 
 
 def _resp(status: int = 200, *, json_data=None, headers=None) -> httpx.Response:
@@ -106,11 +161,18 @@ def _make_app(
     gate_capacity: int = 3,
     queue_timeout: float = 30.0,
     upstream_handler=None,
+    first_poll_ok: bool = True,
+    header_delay: float = 0.0,
+    chunk_delay: float = 0.0,
 ) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
     gate = PermitGate(initial_capacity=gate_capacity)
     usage = FakeUsageClient()
     upstream_client = httpx.AsyncClient(
-        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        transport=_StreamingMockTransport(
+            upstream_handler or _default_handler,
+            header_delay=header_delay,
+            chunk_delay=chunk_delay,
+        ),
         timeout=None,
     )
     reconcile = ReconciliationLoop(
@@ -119,7 +181,7 @@ def _make_app(
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
     )
-    reconcile._first_poll_ok = True  # most tests assume ready state
+    reconcile._first_poll_ok = first_poll_ok
     app = ProxyApp(
         upstream_base_url="https://upstream.example.com",
         gate=gate,
@@ -450,8 +512,8 @@ async def test_healthz():
 
 
 async def test_readyz_503_before_first_poll():
-    app, _, reconcile = _make_app()
-    reconcile._first_poll_ok = False  # simulate pre-first-poll state
+    app, _, reconcile = _make_app(first_poll_ok=False)
+    assert reconcile._first_poll_ok is False
 
     async with _asgi_client(app) as client:
         response = await client.get("/readyz")
@@ -474,8 +536,7 @@ async def test_readyz_200_after_successful_tick():
 
 async def test_readyz_stays_503_after_failed_tick():
     """If the first poll fails (ok=False), /readyz stays 503."""
-    app, _, reconcile = _make_app()
-    reconcile._first_poll_ok = False
+    app, _, reconcile = _make_app(first_poll_ok=False)
 
     # Simulate a failed tick by directly setting a non-ok cached reading.
     from sluice.usage import CachedReading
@@ -508,6 +569,7 @@ async def test_metrics():
     assert "phantom_estimate" in data
     assert "gate_closed_reason" in data
     assert "local_in_flight" in data
+    assert "breaker_half_open_age_seconds" in data
 
 
 async def test_prometheus_metrics():
@@ -524,6 +586,7 @@ async def test_prometheus_metrics():
     assert "sluice_in_flight" in text
     assert "sluice_effective_permits" in text
     assert "sluice_band" in text
+    assert "sluice_breaker_half_open_age_seconds" in text
 
 
 async def test_dashboard():
@@ -618,9 +681,8 @@ async def test_admin_token_authorized():
 
 async def test_admin_token_not_required_for_healthz():
     """Health and readiness are not gated by admin_token."""
-    app, _, reconcile = _make_app()
+    app, _, reconcile = _make_app(first_poll_ok=False)
     app._admin_token = "secret"
-    reconcile._first_poll_ok = False  # simulate pre-first-poll state
 
     async with _asgi_client(app) as client:
         health = await client.get("/healthz")
@@ -902,11 +964,12 @@ def _make_app_with_guard(
     *,
     gate_capacity: int = 3,
     upstream_handler=None,
+    first_poll_ok: bool = True,
 ) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
     gate = PermitGate(initial_capacity=gate_capacity)
     usage = FakeUsageClient()
     upstream_client = httpx.AsyncClient(
-        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        transport=_StreamingMockTransport(upstream_handler or _default_handler),
         timeout=None,
     )
     reconcile = ReconciliationLoop(
@@ -916,7 +979,7 @@ def _make_app_with_guard(
         breaker_config=BreakerConfig(),
         guard=guard,  # type: ignore[arg-type]
     )
-    reconcile._first_poll_ok = True  # most tests assume ready state
+    reconcile._first_poll_ok = first_poll_ok
     app = ProxyApp(
         upstream_base_url="https://upstream.example.com",
         gate=gate,
@@ -1355,8 +1418,7 @@ async def test_upstream_cancelled_on_disconnect_while_waiting_for_headers():
 
 async def test_fast_fail_when_not_ready():
     """Before the first successful usage poll, the proxy returns 503 not_ready."""
-    app, _, reconcile = _make_app()
-    reconcile._first_poll_ok = False  # simulate pre-first-poll state
+    app, _, _ = _make_app(first_poll_ok=False)
 
     async with _asgi_client(app) as client:
         import time
@@ -1522,11 +1584,12 @@ def _make_app_with_reserve(
     reserve: int = 1,
     queue_timeout: float = 30.0,
     upstream_handler=None,
+    first_poll_ok: bool = True,
 ) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
     gate = PermitGate(initial_capacity=gate_capacity, reserve=reserve)
     usage = FakeUsageClient()
     upstream_client = httpx.AsyncClient(
-        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        transport=_StreamingMockTransport(upstream_handler or _default_handler),
         timeout=None,
     )
     reconcile = ReconciliationLoop(
@@ -1535,7 +1598,7 @@ def _make_app_with_reserve(
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
     )
-    reconcile._first_poll_ok = True
+    reconcile._first_poll_ok = first_poll_ok
     app = ProxyApp(
         upstream_base_url="https://upstream.example.com",
         gate=gate,
@@ -1629,5 +1692,376 @@ async def test_no_reserve_configured_is_pure_fifo():
                 headers={"x-sluice-client-label": "interactive"},
             )
             assert r.status_code == 200
+
+    assert gate.held == 0
+
+
+# ---------------------------------------------------------------------------
+# Plan 007 WI-1: Streaming mock transport — backpressure is real
+# ---------------------------------------------------------------------------
+
+
+async def test_backpressure_real():
+    """body_stream() does not call receive() for chunk N+1 until the
+    transport has consumed chunk N — backpressure is real, not buffered away.
+
+    This test fails if body_stream() is replaced with a buffering implementation
+    (e.g. await request.aread() in the transport), because aread() would
+    consume all chunks immediately, causing receive() to be called for all
+    chunks before the handler runs.
+    """
+
+    chunk_consumed = asyncio.Event()
+    transport_waiting = asyncio.Event()
+    receive_count = 0
+
+    class _GatedTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async for chunk in request.stream:
+                transport_waiting.set()
+                await chunk_consumed.wait()
+                chunk_consumed.clear()
+            request._content = b""
+            return _resp(200)
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(transport=_GatedTransport(), timeout=None)
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+    )
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        nonlocal receive_count
+        receive_count += 1
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    await receive_queue.put({"type": "http.request", "body": b"AAA", "more_body": True})
+    await receive_queue.put({"type": "http.request", "body": b"BBB", "more_body": False})
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+
+    await asyncio.wait_for(transport_waiting.wait(), timeout=5.0)
+
+    assert receive_count == 1, (
+        f"backpressure not exercised: receive() called {receive_count} times, "
+        "expected 1 (transport should not have consumed chunk 2 yet)"
+    )
+
+    chunk_consumed.set()
+
+    transport_waiting.clear()
+    await asyncio.wait_for(transport_waiting.wait(), timeout=5.0)
+
+    assert receive_count == 2
+
+    chunk_consumed.set()
+
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 1
+    assert start_events[0]["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Plan 007 WI-2: Latency-injecting transport — race the races
+# ---------------------------------------------------------------------------
+
+
+async def test_mid_body_upload_disconnect_with_latency():
+    """Client disconnects mid-body-upload with real upstream latency.
+
+    The header_delay ensures the asyncio.wait race (entry_task vs disconnect_task)
+    actually races — the disconnect should win, cancelling the upstream request
+    before it completes.  Permit must be released exactly once.
+    """
+    app, gate, _ = _make_app(header_delay=1.0)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put({"type": "http.request", "body": b"part1", "more_body": True})
+    await receive_queue.put({"type": "http.disconnect"})
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 0, "should not send response after disconnect"
+
+    assert gate.held == 0
+
+
+async def test_disconnect_while_waiting_for_headers_with_latency():
+    """Client disconnects while waiting for upstream headers with real latency.
+
+    The header_delay ensures the asyncio.wait race (entry_task vs disconnect_task)
+    actually races — both tasks are pending simultaneously, and the disconnect
+    should win, cancelling the upstream request.
+
+    This exercises the body_done/disconnect_watcher handoff: body_stream()
+    completes, disconnect_watcher takes over receive(), and the disconnect
+    is detected during the header_delay window.
+    """
+    app, gate, _ = _make_app(header_delay=1.0)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+    await receive_queue.put({"type": "http.disconnect"})
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 0, "should not send response after disconnect"
+
+    assert gate.held == 0
+
+
+async def test_upstream_raises_after_headers_streaming_transport():
+    """Upstream raises after headers are sent — no double http.response.start.
+
+    Regression guard for WI-013's response_started flag, now exercised under
+    the streaming transport (which consumes request.stream chunk-by-chunk).
+    """
+
+    async def dropping_gen() -> AsyncIterator[bytes]:
+        yield b"chunk1\n"
+        raise httpx.ConnectError("upstream dropped mid-stream")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=dropping_gen(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    sent_events: list[dict] = []
+    receive_queue: asyncio.Queue = asyncio.Queue()
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await app(scope, receive, send)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 1, "must not send a second http.response.start"
+
+
+async def test_disconnect_during_response_streaming_with_chunk_delay():
+    """Client disconnects during response streaming with transport-injected chunk_delay.
+
+    Uses the _StreamingMockTransport's chunk_delay parameter (not a hand-rolled
+    generator sleep) to create a deterministic race window for disconnect-during-
+    response-streaming.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _streaming_resp([b"chunk1\n", b"chunk2\n", b"chunk3\n"])
+
+    app, gate, _ = _make_app(upstream_handler=handler, chunk_delay=0.3)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+    first_chunk = asyncio.Event()
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+        if event["type"] == "http.response.body" and event.get("body"):
+            first_chunk.set()
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+
+    await asyncio.wait_for(first_chunk.wait(), timeout=5.0)
+    await receive_queue.put({"type": "http.disconnect"})
+
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    assert gate.held == 0
+
+    body_events = [e for e in sent_events if e["type"] == "http.response.body" and e.get("body")]
+    assert len(body_events) < 3, "should have stopped streaming after disconnect"
+
+
+# ---------------------------------------------------------------------------
+# Plan 007 WI-3: Startup-window honesty
+# ---------------------------------------------------------------------------
+
+
+async def test_startup_window_closes_on_first_poll():
+    """Requests fail during the startup window, then succeed after the first poll.
+
+    The startup fail-closed window (WI-018) is bypassed by almost every test
+    via first_poll_ok=True.  This test exercises both sides explicitly.
+    """
+    app, _, reconcile = _make_app(first_poll_ok=False)
+
+    async with _asgi_client(app) as client:
+        r1 = await client.post("/v1/messages", json={"prompt": "hi"})
+    assert r1.status_code == 503
+    assert r1.json()["reason"] == "not_ready"
+
+    await reconcile.tick()
+    assert reconcile.ready is True
+
+    async with _asgi_client(app) as client:
+        r2 = await client.post("/v1/messages", json={"prompt": "hi"})
+    assert r2.status_code == 200
+
+
+async def test_startup_window_503_has_retry_after():
+    """The startup fail-closed 503 includes a Retry-After header."""
+    app, _, _ = _make_app(first_poll_ok=False)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.headers.get("retry-after") is not None
+    assert response.json()["reason"] == "not_ready"
+
+
+# ---------------------------------------------------------------------------
+# Plan 007 WI-4: body_done/disconnect_watcher handoff pinning test
+# ---------------------------------------------------------------------------
+
+
+async def test_body_done_disconnect_watcher_handoff():
+    """Pin the current behaviour of the body_done/disconnect_watcher handoff.
+
+    There is a narrow window (proxy.py:disconnect_watcher) where a disconnect
+    can arrive after body_done.set() but before disconnect_watcher calls
+    receive().  This test documents that the current implementation catches
+    the disconnect via the ASGI receive queue — the event is not lost, just
+    delayed until the watcher arms.
+
+    See docs/concurrency-model.md §8 for the full description of this window.
+    If a future change alters this behaviour, this test should fail and force
+    a deliberate update.
+    """
+    app, gate, _ = _make_app(header_delay=1.0)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    # Send complete body — body_done is set, disconnect_watcher takes over.
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+    # Immediately queue a disconnect — it arrives in the handoff window
+    # (after body_done.set() but before the watcher's first receive()).
+    await receive_queue.put({"type": "http.disconnect"})
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    # The disconnect was caught — no response sent to the disconnected client.
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 0, (
+        "disconnect in the handoff window should be caught — no response sent"
+    )
 
     assert gate.held == 0

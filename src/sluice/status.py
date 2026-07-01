@@ -33,6 +33,7 @@ class StatusSnapshot:
     band: str
     phantom_estimate: int
     breaker: str
+    breaker_half_open_age_seconds: float | None
     recent_429s: int
     total_429s: int
 
@@ -62,6 +63,11 @@ class StatusSnapshot:
             "band": self.band,
             "phantom_estimate": self.phantom_estimate,
             "breaker": self.breaker,
+            "breaker_half_open_age_seconds": (
+                round(self.breaker_half_open_age_seconds, 1)
+                if self.breaker_half_open_age_seconds is not None
+                else None
+            ),
             "recent_429s": self.recent_429s,
             "total_429s": self.total_429s,
             "target": self.target,
@@ -100,6 +106,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         band=reconcile.band.value,
         phantom_estimate=reconcile.phantom_estimate_value,
         breaker=reconcile.breaker_state.value,
+        breaker_half_open_age_seconds=reconcile.breaker_half_open_age_seconds,
         recent_429s=reconcile.recent_429_count,
         total_429s=reconcile.total_429s,
         target=reconcile._ctrl_cfg.target,
@@ -146,6 +153,11 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_phantom_estimate", "Windowed phantom estimate (sustained excess)", snap.phantom_estimate)
     gauge("sluice_recent_429s", "Recent 429 count (within breaker window)", snap.recent_429s)
     gauge("sluice_total_429s", "Total 429s since startup", snap.total_429s)
+    gauge(
+        "sluice_breaker_half_open_age_seconds",
+        "Seconds since breaker entered HALF_OPEN (None if not half-open)",
+        snap.breaker_half_open_age_seconds,
+    )
     gauge("sluice_queue_depth", "Requests waiting for a permit", snap.queue_depth)
     gauge("sluice_cooling_down", "Permits in release cooldown", snap.cooling_down)
     gauge("sluice_queue_wait_avg_seconds", "Mean queue wait over recent blocked grants", round(snap.avg_wait_seconds, 3))
