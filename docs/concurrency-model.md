@@ -157,3 +157,26 @@ is exactly the old FIFO.
 **When to consider weighted fair queuing:** only if a real pilot shows interactive requests
 actually timing out behind agent traffic *despite* the reserved floor. That would be a
 future extension (Plan 005 Stage 2), not a 1.0 concern.
+
+## 8. The body_done / disconnect_watcher handoff window
+
+When a request body finishes uploading, `body_stream()` sets `body_done` and returns.
+A separate `disconnect_watcher` task — waiting on `body_done.wait()` — then takes over
+`receive()` to listen for client disconnects during the response phase.
+
+There is a narrow scheduling window between `body_done.set()` and the watcher's first
+`receive()` call. If a client disconnect arrives during this window, the `http.disconnect`
+event is **queued by the ASGI server** (not lost) and the watcher picks it up as soon as it
+calls `receive()`. The disconnect is not missed — it is delayed by at most one event-loop
+turn.
+
+The residual risk: if the upstream responds *before* the watcher picks up the queued
+disconnect, the proxy may attempt one `send()` to a client that has already gone. This
+is caught by the `send()` exception handler (which sets `disconnect` and breaks), so the
+proxy exits cleanly — it just wastes one write attempt. This is not a correctness issue
+(the permit is released, the upstream is cancelled), only a minor efficiency one.
+
+Closing the window entirely would require a non-blocking `receive()` poll (which the ASGI
+spec does not provide) or a more complex two-channel design. The cost of the fix exceeds
+the benefit of closing a window whose consequence is one wasted `send()`. The current
+behaviour is pinned by `test_body_done_disconnect_watcher_handoff` in `tests/test_proxy.py`.

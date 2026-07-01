@@ -109,6 +109,39 @@ async def test_snapshot_before_first_tick():
     assert d["ready"] is False
 
 
+async def test_snapshot_breaker_half_open_age_none_when_closed():
+    """breaker_half_open_age_seconds is None when breaker is closed."""
+    loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))
+    await loop.tick()
+
+    snap = snapshot(loop)
+    d = snap.to_dict()
+
+    assert d["breaker"] == "closed"
+    assert d["breaker_half_open_age_seconds"] is None
+
+
+async def test_snapshot_breaker_half_open_age_set_when_half_open():
+    """breaker_half_open_age_seconds has a value when breaker is half-open."""
+    from sluice.control import BreakerSnapshot, BreakerState
+
+    loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))
+    await loop.tick()
+
+    loop._breaker = BreakerSnapshot(
+        state=BreakerState.HALF_OPEN,
+        opened_at=0.0,
+        half_opened_at=loop._mono() - 5.0,
+    )
+
+    snap = snapshot(loop)
+    d = snap.to_dict()
+
+    assert d["breaker"] == "half_open"
+    assert d["breaker_half_open_age_seconds"] is not None
+    assert d["breaker_half_open_age_seconds"] >= 4.9
+
+
 async def test_prometheus_format():
     loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))
     await loop.tick()

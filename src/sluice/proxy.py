@@ -839,14 +839,21 @@ function render(d){
     ['band',d.band],['effective_permits',d.effective_permits],
     ['concurrent_sessions',obs],['local_in_flight',loc],
     ['phantom_estimate',d.phantom_estimate],
-    ['breaker',d.breaker],['recent_429s',d.recent_429s],
+    ['breaker',d.breaker],
+    ['breaker_half_open_age',
+      d.breaker_half_open_age_seconds!=null
+        ? d.breaker_half_open_age_seconds+'s'
+        : null],
+    ['recent_429s',d.recent_429s],
     ['total_429s',d.total_429s],['queue_depth',d.queue_depth],
     ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95'],
     ['queue_timeouts',d.queue_timeouts],
     ['gate_closed',d.gate_closed_reason],['ready',d.ready],
     ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':'')],
   ];
-  document.getElementById('stats').innerHTML=rows.map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
+  document.getElementById('stats').innerHTML=rows
+    .filter(function(r){return r[1]!=null;})
+    .map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
   // Config table
   var c=d.config||{};
   var crows=[
@@ -866,7 +873,15 @@ function render(d){
     var ra=d.resets_at?Math.max(0,Math.round(d.resets_at-Date.now()/1000)):'?';
     document.getElementById('countdown').textContent=ra;
   }else bb.style.display='none';
-  document.getElementById('banner-breaker').style.display=(d.breaker==='open')?'block':'none';
+  document.getElementById('banner-breaker').style.display=
+    (d.breaker==='open'||d.breaker==='half_open')?'block':'none';
+  if(d.breaker==='half_open'&&d.breaker_half_open_age_seconds!=null){
+    document.getElementById('banner-breaker').textContent=
+      'CIRCUIT BREAKER HALF_OPEN — probing ('+d.breaker_half_open_age_seconds+'s)';
+  }else{
+    document.getElementById('banner-breaker').textContent=
+      'CIRCUIT BREAKER OPEN — backing off';
+  }
   // Active = anything moving
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
 }
