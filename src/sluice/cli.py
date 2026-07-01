@@ -43,6 +43,7 @@ _DEFAULTS: dict[str, Any] = {
     "log_level": "INFO",
     "config": None,
     "admin_token": None,
+    "reserve": None,
 }
 
 
@@ -111,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="logging level (default: INFO)")
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
     serve.add_argument("--admin-token", default=None, help="token for admin routes (/, /status.json, /metrics) — sent as Bearer header or Basic auth password")
+    serve.add_argument("--reserve", default=None, help="reserve permits for a QoS class, e.g. 'interactive=1' (default: none → pure FIFO)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -147,6 +149,22 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     usage_auth_header = _resolve("usage_auth_header", args)
     log_level = _resolve("log_level", args)
     admin_token = _resolve("admin_token", args)
+    reserve_raw = _resolve("reserve", args)
+
+    reserve_count = 0
+    reserved_labels: set[str] = set()
+    if reserve_raw:
+        # Format: "label=count" (e.g. "interactive=1")
+        if "=" not in reserve_raw:
+            print(f"sluice: error: --reserve must be 'label=count', got '{reserve_raw}'", file=sys.stderr)
+            return 2
+        label, _, count_str = reserve_raw.rpartition("=")
+        try:
+            reserve_count = int(count_str)
+        except ValueError:
+            print(f"sluice: error: --reserve count must be an integer, got '{count_str}'", file=sys.stderr)
+            return 2
+        reserved_labels = {label}
 
     logging.basicConfig(
         level=getattr(logging, log_level),
@@ -188,6 +206,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     gate = PermitGate(
         initial_capacity=0,
         release_cooldown=release_cooldown,
+        reserve=reserve_count,
     )
     reconcile = ReconciliationLoop(
         usage_client=usage_client,
@@ -205,6 +224,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         guard=guard,
         admin_token=admin_token,
         retry_interval=retry_interval,
+        reserved_labels=reserved_labels,
     )
 
     log.info("sluice %s starting", __version__)
@@ -219,6 +239,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     log.info("  usage_auth_header: %s", usage_auth_header)
     if config_path:
         log.info("  config:            %s", config_path)
+    if reserve_count > 0:
+        log.info("  reserve:           %s=%d", next(iter(reserved_labels)), reserve_count)
 
     import uvicorn
 

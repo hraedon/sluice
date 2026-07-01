@@ -56,6 +56,6 @@ The manifests are kept ready but external exposure is **off**. To turn it on:
 The NetworkPolicy already admits the `traefik-external` namespace, so no
 network-policy change is needed.
 
-> **Known caveat:** the HTML dashboard at `/` fetches `/status.json` from the
-> browser with no auth header, so enabling `SLUICE_ADMIN_TOKEN` blanks the live
-> dashboard until token-in-browser auth is added. Tracked as **WI-008**.
+> The dashboard's JS fetch sends `credentials:'include'`, so browser-cached
+> Basic auth from the dashboard login authorizes the `/status.json` poll
+> automatically — no separate token-in-browser auth needed.

@@ -16,11 +16,13 @@ upstream; umans behaves exactly as before (regression-gated), and a provider wit
 concurrency reading is governed by a header/429-driven adaptive controller — all without
 reading a single response body.**
 
-> **Sequencing gate:** land *after* the umans path (Plans 003–005) is **live-validated**.
-> Live validation of the umans controller is what tells us where the `TruthSource` /
-> controller boundary actually belongs; abstracting on theory risks a `LimitState` shaped
-> around guesses (the family's "scaffolding propagates drift" lesson). Depends on Plan 003
-> (reuses its `gate_closed_reason` / `Retry-After` machinery for header-driven backpressure).
+> **Sequencing gate: MET.** The umans path (Plans 003–005) is **live-validated** — sluice
+> is deployed and live in the lab, serving real streaming agent traffic (opencode → umans
+> on the OpenAI surface: 200s, zero 429s, not boxed). The windowed phantom estimator, box
+> handling, fast-fail, breaker, and singleton guard are all proven under real load. The
+> `TruthSource` / controller boundary can now be abstracted from observed behaviour, not
+> theory. Depends on Plan 003 (reuses its `gate_closed_reason` / `Retry-After` machinery
+> for header-driven backpressure).
 
 ## What does and doesn't carry off umans
 

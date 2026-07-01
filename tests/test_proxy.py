@@ -535,6 +535,59 @@ async def test_dashboard():
     assert response.status_code == 200
     assert "text/html" in response.headers.get("content-type", "")
     assert "sluice" in response.text.lower()
+    assert "/static/css/tokens.css" in response.text
+    assert "/static/theme.js" in response.text
+
+
+async def test_static_css_served():
+    """GET /static/css/tokens.css serves the vendored patina tokens."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/static/css/tokens.css")
+
+    assert response.status_code == 200
+    assert "text/css" in response.headers.get("content-type", "")
+    assert "--accent" in response.text
+
+
+async def test_static_theme_js_served():
+    """GET /static/theme.js serves the patina theme toggle."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/static/theme.js")
+
+    assert response.status_code == 200
+    assert "javascript" in response.headers.get("content-type", "")
+    assert "data-theme" in response.text
+
+
+async def test_static_path_traversal_blocked():
+    """Path traversal attempts on /static/ are blocked (404)."""
+    app, _, _ = _make_app()
+
+    # Use a raw ASGI scope because httpx normalizes ../ in the URL path.
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.disconnect"}
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/static/css/../../../../../etc/passwd",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    await app(scope, receive, send)
+
+    start = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert start[0]["status"] == 404
 
 
 async def test_admin_token_unauthorized():
@@ -1365,3 +1418,125 @@ async def test_429_with_retry_after_zero_is_not_recorded():
         await client.post("/v1/messages", json={"prompt": "hi"})
 
     assert reconcile.total_429s == 0, "retry-after: 0 is still a rate-limit signal"
+
+
+# ---------------------------------------------------------------------------
+# Plan 005 WI-002: Reserved floor (proxy-level)
+# ---------------------------------------------------------------------------
+
+
+def _make_app_with_reserve(
+    *,
+    gate_capacity: int = 3,
+    reserve: int = 1,
+    queue_timeout: float = 30.0,
+    upstream_handler=None,
+) -> tuple[ProxyApp, PermitGate, ReconciliationLoop]:
+    gate = PermitGate(initial_capacity=gate_capacity, reserve=reserve)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(
+        transport=_AsyncMockTransport(upstream_handler or _default_handler),
+        timeout=None,
+    )
+    reconcile = ReconciliationLoop(
+        usage_client=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        queue_timeout=queue_timeout,
+        upstream_client=upstream_client,
+    )
+    return app, gate, reconcile
+
+
+async def test_reserved_label_admitted_when_shared_full():
+    """A request with x-sluice-client-label: interactive is admitted via the
+    reserved slot when the shared pool is full."""
+    # capacity=2, reserve=1 → 1 shared, 1 reserved
+    app, gate, _ = _make_app_with_reserve(gate_capacity=2, reserve=1, queue_timeout=0.1)
+
+    # Use a slow upstream so the first request's permit stays held
+    blocker = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def slow_gen():
+            yield b"data: chunk1\n\n"
+            await blocker.wait()  # hold the permit
+            yield b"data: done\n\n"
+
+        return httpx.Response(200, content=slow_gen(),
+                               headers={"content-type": "text/event-stream"})
+
+    app, gate, _ = _make_app_with_reserve(
+        gate_capacity=2, reserve=1, queue_timeout=0.1, upstream_handler=handler
+    )
+
+    async with _asgi_client(app) as client:
+        # Start the first (non-reserved) request — it holds the shared permit
+        r1_task = asyncio.create_task(client.post("/v1/messages", json={"prompt": "hi"}))
+        await asyncio.sleep(0.1)  # let it acquire
+
+        # Non-reserved: shared full → 503 (queue_timeout=0.1)
+        r2 = await client.post("/v1/messages", json={"prompt": "hi"})
+        assert r2.status_code == 503
+
+        # Reserved (interactive label): admitted via reserved slot
+        r3_task = asyncio.create_task(
+            client.post(
+                "/v1/messages",
+                json={"prompt": "hi"},
+                headers={"x-sluice-client-label": "interactive"},
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert gate.held == 2  # both permits held
+
+        # Release both
+        blocker.set()
+        await r1_task
+        await r3_task
+
+    assert gate.held == 0  # all released after completion
+
+
+async def test_reserved_label_stripped_from_upstream():
+    """The x-sluice-client-label header is stripped before forwarding (WI-000)."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app_with_reserve(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={"x-sluice-client-label": "interactive"},
+        )
+
+    assert "x-sluice-client-label" not in received
+
+
+async def test_no_reserve_configured_is_pure_fifo():
+    """Without --reserve, all requests use the same pool regardless of label."""
+    app, gate, _ = _make_app()  # default: no reserve
+
+    async with _asgi_client(app) as client:
+        # capacity=3, fill all
+        for _ in range(3):
+            r = await client.post(
+                "/v1/messages",
+                json={"prompt": "hi"},
+                headers={"x-sluice-client-label": "interactive"},
+            )
+            assert r.status_code == 200
+
+    assert gate.held == 0

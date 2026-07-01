@@ -500,3 +500,75 @@ async def test_breaker_half_open_times_out_to_open():
     await loop.tick()
     assert gate.capacity == 0  # breaker open again
     assert loop.breaker_state is BreakerState.OPEN
+
+
+# --- Concurrent record_429 during tick() -----------------------------------
+
+
+async def test_concurrent_429_during_tick_does_not_lose_event():
+    """A 429 arriving concurrently with tick() must not be lost.
+
+    The fix (WI-016) reads self._breaker *after* the fetch so concurrent
+    record_429 updates land between the fetch and the tick's breaker_on_tick
+    call.  This test exercises actual concurrency: a 429 is recorded while
+    the tick's fetch is in-flight.
+    """
+    import asyncio
+
+    class SlowUsageClient:
+        """Usage client with a delay to create a real concurrency window."""
+
+        def __init__(self, reading: UsageReading) -> None:
+            self._reading = reading
+            self.fetch_count = 0
+
+        async def fetch(self, *, now_monotonic: float) -> CachedReading:
+            self.fetch_count += 1
+            await asyncio.sleep(0.05)
+            return CachedReading(
+                reading=self._reading, fetched_at_monotonic=now_monotonic, ok=True
+            )
+
+        async def close(self) -> None:
+            pass
+
+    client = SlowUsageClient(_reading(concurrent_sessions=0))
+    gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0)
+    loop = ReconciliationLoop(
+        usage_client=client,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0),
+        poll_interval=5.0,
+        monotonic_clock=lambda: 1000.0,
+        wall_clock=lambda: 1_000_000.0,
+    )
+
+    # Pre-load 2 429s (one below threshold)
+    loop.record_429()
+    loop.record_429()
+    assert loop.recent_429_count == 2
+
+    # Start a tick (fetch will sleep 50ms)
+    tick_task = asyncio.create_task(loop.tick())
+
+    # Wait until the fetch is in-flight before recording the 429, so we
+    # actually exercise the concurrency window the test claims to test.
+    while client.fetch_count == 0:
+        await asyncio.sleep(0.001)
+    loop.record_429()
+
+    # Wait for the tick to complete
+    await tick_task
+
+    # The breaker should be OPEN — either from breaker_on_429 (immediate trip)
+    # or from breaker_on_tick (seeing 3 recent 429s).  The key assertion is
+    # that the 429 was not lost: the breaker tripped.
+    from sluice.control import BreakerState
+    assert loop.breaker_state is BreakerState.OPEN, (
+        f"breaker should be OPEN after concurrent 429, got {loop.breaker_state}"
+    )
+    assert loop.recent_429_count == 3
+    assert gate.capacity == 0, (
+        f"gate should be closed when breaker is OPEN, got capacity={gate.capacity}"
+    )

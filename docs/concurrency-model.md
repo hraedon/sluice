@@ -134,3 +134,26 @@ the provider is imperfect.
 - Fairness beyond FIFO. Home-lab scale; a single FIFO queue across clients is enough.
   Per-client weighting is a possible later extension, explicitly out of the first build.
 - Model routing / failover. One upstream, passthrough only.
+
+## 7. Fairness and head-of-line blocking
+
+sluice admits through a **single FIFO queue** across every client. This is deliberate
+for home-lab scale: a single queue is simple, fair in the "first come, first served"
+sense, and avoids the complexity of per-client weighting.
+
+**The trade-off:** under saturation (all permits held), an interactive request (e.g. an
+open-webui chat turn) can queue behind long-running agent requests (opencode, hermes) and
+wait up to `queue_timeout` (~30 s) before receiving a `503`. This is **known, expected, and
+bounded by `queue_timeout`** — it is not a bug.
+
+**Mitigation (opt-in):** `--reserve interactive=1` reserves a small slice of the permit
+pool for an "interactive" class so an agent flood cannot drive it to zero. A request in a
+reserved class may use the reserved slot(s) *or* the shared pool; a non-reserved request may
+use only the shared pool. The reserved floor only *bites* under saturation — below saturation
+it is invisible. Classification keys on a `x-sluice-client-label` header (stripped before
+forwarding per Rule 7), falling back to the default class. Without `--reserve`, behaviour
+is exactly the old FIFO.
+
+**When to consider weighted fair queuing:** only if a real pilot shows interactive requests
+actually timing out behind agent traffic *despite* the reserved floor. That would be a
+future extension (Plan 005 Stage 2), not a 1.0 concern.

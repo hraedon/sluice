@@ -20,6 +20,7 @@ import json
 import logging
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -67,6 +68,15 @@ _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
+_RESERVED_LABEL = "interactive"
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+_STATIC_CONTENT_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain; charset=utf-8",
+}
 
 
 class ProxyApp:
@@ -83,6 +93,7 @@ class ProxyApp:
         guard: SingletonGuard | None = None,
         admin_token: str | None = None,
         retry_interval: float = _RETRY_ACQUIRE_INTERVAL,
+        reserved_labels: set[str] | None = None,
     ) -> None:
         self._upstream = upstream_base_url.rstrip("/")
         self._gate = gate
@@ -95,6 +106,7 @@ class ProxyApp:
         self._guard_acquired = False
         self._retry_interval = retry_interval
         self._acquire_retry_task: asyncio.Task[None] | None = None
+        self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
 
     def _is_admin_auth_value(self, value: bytes) -> bool:
         """Check if an Authorization header value matches sluice admin credentials.
@@ -159,6 +171,12 @@ class ProxyApp:
                 await self._send_json(send, 200, {"status": "ready"})
             else:
                 await self._send_json(send, 503, {"status": "not ready"})
+            return
+
+        # Static assets (patina design system: tokens.css, theme.js, fonts).
+        # These are served unauthenticated — they contain no secrets.
+        if path.startswith("/static/"):
+            await self._serve_static(path, send)
             return
 
         # Admin routes — token-gated when admin_token is set.  The dashboard
@@ -300,7 +318,20 @@ class ProxyApp:
             )
             return
 
-        acquired = await self._gate.acquire(timeout=self._queue_timeout)
+        # Read QoS class from the sluice control header (stripped before
+        # forwarding by _filter_request_headers).  If the label matches a
+        # reserved class and the gate has a reserve, the request may use
+        # reserved slots (Plan 005 WI-002).
+        reserved = False
+        if self._reserved_labels:
+            for k, v in scope.get("headers", []):
+                if k == b"x-sluice-client-label":
+                    label = v.decode("latin-1")
+                    if label in self._reserved_labels:
+                        reserved = True
+                    break
+
+        acquired = await self._gate.acquire(timeout=self._queue_timeout, reserved=reserved)
         if not acquired:
             log.info("permit queue timeout — returning 503")
             await self._send_json(
@@ -316,7 +347,7 @@ class ProxyApp:
         except Exception:
             log.exception("proxy forward failed")
         finally:
-            await self._gate.release()
+            await self._gate.release(reserved=reserved)
 
     async def _forward(self, scope: Scope, receive: Receive, send: Send) -> None:
         url = self._build_url(scope)
@@ -416,10 +447,19 @@ class ProxyApp:
                     return
 
                 # 429 is an upstream signal — but only concurrency 429s should
-                # trip the breaker (WI-019).  Rate-limit 429s (request-count
-                # window exhausted) include a retry-after header telling the
-                # client when to retry; concurrency rejections don't.  We
-                # inspect headers only (never the body) to classify.
+                # trip the breaker (WI-019).  Heuristic: concurrency 429s (the
+                # kind that accumulate toward the box) do not include a
+                # retry-after header; rate-limit 429s (request-count window
+                # exhausted) do.  We inspect headers only (never the body) to
+                # classify.
+                #
+                # Assumption (unverified against umans API): if umans sends
+                # retry-after on concurrency 429s, the breaker will silently
+                # stop tripping — a fail-open.  The reconciliation loop's
+                # phantom absorption provides a backstop (sustained overload
+                # shrinks the gate regardless), but if this heuristic is wrong
+                # the breaker's fast trip is defeated.  Revisit when a real
+                # concurrency 429 is observed live.
                 if response.status_code == 429 and not response.headers.get("retry-after"):
                     self._reconcile.record_429()
 
@@ -549,6 +589,30 @@ class ProxyApp:
     async def _send_dashboard(self, send: Send) -> None:
         await self._send_text(send, 200, _DASHBOARD_HTML, content_type="text/html; charset=utf-8")
 
+    async def _serve_static(self, path: str, send: Send) -> None:
+        """Serve a file from the vendored static directory (patina assets)."""
+        rel = path[len("/static/"):]
+        # Prevent path traversal: resolve and verify it's inside _STATIC_DIR
+        try:
+            file_path = (_STATIC_DIR / rel).resolve()
+            file_path.relative_to(_STATIC_DIR)
+        except (ValueError, OSError):
+            await self._send_text(send, 404, "Not found")
+            return
+        if not file_path.is_file():
+            await self._send_text(send, 404, "Not found")
+            return
+        ext = file_path.suffix.lower()
+        content_type = _STATIC_CONTENT_TYPES.get(ext, "application/octet-stream")
+        data = file_path.read_bytes()
+        headers: list[tuple[bytes, bytes]] = [
+            (b"content-type", content_type.encode()),
+            (b"content-length", str(len(data)).encode()),
+            (b"cache-control", b"public, max-age=3600"),
+        ]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": data, "more_body": False})
+
     async def _send_text(
         self,
         send: Send,
@@ -571,42 +635,55 @@ class ProxyApp:
 
 _DASHBOARD_HTML = """\
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme-key="sluice-theme">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sluice</title>
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/css/tokens.css">
 <style>
-:root{--bg:#0d1117;--fg:#c9d1d9;--accent:#58a6ff;--warn:#d29922;--alarm:#f85149;
---card:#161b22;--border:#30363d;--mono:monospace;--gap:#6e7681;--green:#3fb950}
-*{box-sizing:border-box}body{font-family:var(--mono);background:var(--bg);color:var(--fg);margin:0;padding:1rem}
-.header{display:flex;justify-content:space-between;align-items:center;margin:0 0 1rem}
-h1{font-size:1rem;font-weight:400;margin:0}
-.controls{display:flex;gap:.4rem}
-.controls button{background:var(--card);border:1px solid var(--border);color:var(--fg);
-padding:.25rem .6rem;border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:.7rem}
-.controls button:hover{border-color:var(--accent)}
-.row{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem}
-.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:1rem;flex:1;min-width:260px}
-.card h2{font-size:.8rem;font-weight:400;color:var(--gap);margin:0 0 .5rem}
-table{width:100%;border-collapse:collapse;font-size:.75rem}
-td,th{padding:.2rem .4rem;text-align:left;border-bottom:1px solid var(--border)}
-th{color:var(--gap);font-weight:400}
-.banner{padding:.6rem 1rem;border-radius:4px;margin-bottom:1rem;font-size:.8rem;display:none}
-.banner.boxed{display:block;background:rgba(248,81,73,.15);color:var(--alarm);border:1px solid var(--alarm)}
-.banner.breaker{display:block;background:rgba(210,153,34,.15);color:var(--warn);border:1px solid var(--warn)}
-#countdown{font-weight:700}
-.gauge{position:relative;height:24px;background:var(--bg);border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+body{font-family:var(--font-mono);background:var(--bg);color:var(--text);margin:0;padding:var(--space-4);font-size:var(--fs-sm);line-height:1.5}
+.header{display:flex;justify-content:space-between;align-items:center;margin:0 0 var(--space-4)}
+h1{font-size:var(--fs-base);font-weight:500;margin:0;color:var(--accent)}
+.controls{display:flex;gap:var(--space-2);align-items:center}
+.controls button{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text-2);
+padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm);cursor:pointer;
+font-family:var(--font-mono);font-size:var(--fs-xs)}
+.controls button:hover{border-color:var(--accent);color:var(--accent)}
+#theme-toggle{background:none;border:none;color:var(--text-3);cursor:pointer;padding:var(--space-1);font-size:var(--fs-md)}
+#theme-toggle:hover{color:var(--accent)}
+#theme-icon-dark{display:none}
+:root[data-theme="dark"] #theme-icon-dark{display:none}
+:root[data-theme="dark"] #theme-icon-light{display:block}
+:root[data-theme="light"] #theme-icon-dark{display:block}
+:root[data-theme="light"] #theme-icon-light{display:none}
+.row{display:flex;gap:var(--space-4);flex-wrap:wrap;margin-bottom:var(--space-4)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-4);flex:1;min-width:260px}
+.card h2{font-size:var(--fs-xs);font-weight:400;color:var(--text-3);margin:0 0 var(--space-3);text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-xs)}
+td,th{padding:var(--space-1) var(--space-2);text-align:left;border-bottom:1px solid var(--border)}
+th{color:var(--text-3);font-weight:400}
+td{color:var(--text);font-variant-numeric:tabular-nums}
+.banner{padding:var(--space-3) var(--space-4);border-radius:var(--radius-sm);margin-bottom:var(--space-4);font-size:var(--fs-sm);display:none}
+.banner.boxed{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit)}
+.banner.breaker{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
+#countdown{font-weight:600}
+.gauge{position:relative;height:24px;background:var(--inset);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
 .gz{position:absolute;top:0;height:100%}
-.gz-n{background:rgba(88,166,255,.06)}.gz-l{background:rgba(210,153,34,.08)}
+.gz-n{background:var(--info-soft)}.gz-l{background:var(--warn-soft)}
 .gm{position:absolute;top:0;height:100%;width:2px;transition:left .3s}
 .gm-o{background:var(--accent)}.gm-l{background:var(--warn)}
 .gt{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--accent)}
-.gl{display:flex;justify-content:space-between;font-size:.65rem;color:var(--gap);margin-top:.2rem}
+.gl{display:flex;justify-content:space-between;font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1)}
+.gl .gl-limit{color:var(--accent)}
+.gl .gl-hardcap{color:var(--crit)}
 .spark{width:100%;height:60px;display:block}
-.sleg{display:flex;gap:.8rem;font-size:.65rem;color:var(--gap);margin-top:.2rem}
-.sleg span{display:flex;align-items:center;gap:.2rem}
+.sleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1)}
+.sleg span{display:flex;align-items:center;gap:var(--space-1)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.spark-obs{stroke:var(--accent)}.spark-loc{stroke:var(--warn)}.spark-ph{stroke:var(--text-3)}
+.spark-grid{stroke:var(--border);stroke-dasharray:2,2}
 </style>
 </head>
 <body>
@@ -615,6 +692,10 @@ th{color:var(--gap);font-weight:400}
   <div class="controls">
     <button id="btn-pause" onclick="togglePause()">pause</button>
     <button onclick="refresh()">refresh</button>
+    <button id="theme-toggle" title="toggle theme">
+      <span id="theme-icon-dark">\u2600</span>
+      <span id="theme-icon-light">\u263d</span>
+    </button>
   </div>
 </div>
 <div id="banner-boxed" class="banner boxed">ACCOUNT BOXED \u2014 retry after <span id="countdown">?</span>s</div>
@@ -628,12 +709,12 @@ th{color:var(--gap);font-weight:400}
 </div>
 <div class="row">
   <div class="card">
-    <h2>Sparkline <span id="spark-info" style="color:var(--gap)"></span></h2>
+    <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span></h2>
     <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"></svg>
     <div class="sleg">
       <span><span class="dot" style="background:var(--accent)"></span> observed</span>
       <span><span class="dot" style="background:var(--warn)"></span> local</span>
-      <span><span class="dot" style="background:var(--gap)"></span> phantom</span>
+      <span><span class="dot" style="background:var(--text-3)"></span> phantom</span>
     </div>
   </div>
   <div class="card">
@@ -658,7 +739,7 @@ async function doPoll(){
   if(fetching) return;
   fetching=true;
   try{
-    const r=await fetch('/status.json',{credentials:'same-origin'});
+    const r=await fetch('/status.json',{credentials:'include'});
     if(!r.ok){
       document.getElementById('stats').innerHTML='<tr><th>error</th><td>status '+r.status+'</td></tr>';
       return;
@@ -704,7 +785,7 @@ function render(d){
   // Gauge
   const g=document.getElementById('gauge');
   if(obs==null||hc==null||limit==null){
-    g.innerHTML='<div style="text-align:center;color:var(--gap);font-size:.7rem;line-height:24px">waiting for data...</div>';
+    g.innerHTML='<div style="text-align:center;color:var(--text-3);font-size:var(--fs-xs);line-height:24px">waiting for data...</div>';
     document.getElementById('gauge-labels').innerHTML='';
   }else{
     var nW=Math.min(100,Math.max(0,(limit/hc)*100));
@@ -721,7 +802,7 @@ function render(d){
     }
     g.innerHTML=h;
     document.getElementById('gauge-labels').innerHTML=
-      '<span>0</span><span style="color:var(--accent)">limit='+limit+'</span><span style="color:var(--alarm)">hard_cap='+hc+'</span>';
+      '<span>0</span><span class="gl-limit">limit='+limit+'</span><span class="gl-hardcap">hard_cap='+hc+'</span>';
   }
   // Stats table
   var rows=[
@@ -767,7 +848,7 @@ function renderSpark(d){
   var valid=hist.filter(function(h){return h.obs!=null;});
   info.textContent=valid.length+'/'+HIST_MAX+' samples';
   if(valid.length<2){
-    svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="#6e7681" font-size="7" font-family="monospace">waiting for data...</text>';
+    svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
     return;
   }
   var W=200,H=60,pad=3;
@@ -784,12 +865,12 @@ function renderSpark(d){
   }
   var limitY=(H-pad-(limit/maxV)*(H-2*pad)).toFixed(1);
   var s='';
-  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" stroke="#30363d" stroke-dasharray="2,2" stroke-width="0.5"/>';
-  s+='<polyline points="'+pts('obs')+'" fill="none" stroke="#58a6ff" stroke-width="1"/>';
-  s+='<polyline points="'+pts('loc')+'" fill="none" stroke="#d29922" stroke-width="1"/>';
+  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" class="spark-grid" stroke-width="0.5"/>';
+  s+='<polyline points="'+pts('obs')+'" fill="none" class="spark-obs" stroke-width="1"/>';
+  s+='<polyline points="'+pts('loc')+'" fill="none" class="spark-loc" stroke-width="1"/>';
   var hasPh=false;
   for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
-  if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" stroke="#6e7681" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
+  if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" class="spark-ph" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
   svg.innerHTML=s;
 }
 

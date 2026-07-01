@@ -202,7 +202,7 @@ class ReconciliationLoop:
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        """Cancel the background loop."""
+        """Cancel the background loop and close the usage client."""
         if self._task is not None:
             self._task.cancel()
             try:
@@ -210,6 +210,7 @@ class ReconciliationLoop:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        await self._usage.close()
 
     # -- observability (read by /metrics, /status, etc.) ---------------------
 
