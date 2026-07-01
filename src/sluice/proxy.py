@@ -453,15 +453,23 @@ class ProxyApp:
                 # exhausted) do.  We inspect headers only (never the body) to
                 # classify.
                 #
+                # Edge case: retry-after: 0 means "retry immediately" — this is
+                # a transient concurrency signal, not a rate-limit window.  The
+                # string "0" is truthy in Python, so a naive ``not header``
+                # check would silently skip breaker recording (fail-open).  We
+                # explicitly treat retry-after: 0 as a concurrency 429.
+                #
                 # Assumption (unverified against umans API): if umans sends
-                # retry-after on concurrency 429s, the breaker will silently
-                # stop tripping — a fail-open.  The reconciliation loop's
-                # phantom absorption provides a backstop (sustained overload
-                # shrinks the gate regardless), but if this heuristic is wrong
-                # the breaker's fast trip is defeated.  Revisit when a real
-                # concurrency 429 is observed live.
-                if response.status_code == 429 and not response.headers.get("retry-after"):
-                    self._reconcile.record_429()
+                # a non-zero retry-after on concurrency 429s, the breaker will
+                # silently stop tripping — a fail-open.  The reconciliation
+                # loop's phantom absorption provides a backstop (sustained
+                # overload shrinks the gate regardless), but if this heuristic
+                # is wrong the breaker's fast trip is defeated.  Revisit when
+                # a real concurrency 429 is observed live.
+                if response.status_code == 429:
+                    _ra = response.headers.get("retry-after")
+                    if _ra is None or _ra == "0":
+                        self._reconcile.record_429()
 
                 try:
                     await send(

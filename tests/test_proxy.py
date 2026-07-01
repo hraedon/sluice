@@ -1404,11 +1404,16 @@ async def test_rate_limit_429_with_retry_after_is_not_recorded():
     assert reconcile.total_429s == 0, "rate-limit 429s must not trip the breaker"
 
 
-async def test_429_with_retry_after_zero_is_not_recorded():
-    """A 429 with retry-after: 0 is still a rate-limit signal — not recorded."""
+async def test_429_with_retry_after_zero_is_recorded():
+    """A 429 with retry-after: 0 is a transient concurrency signal — recorded.
+
+    retry-after: 0 means "retry immediately," which is a concurrency rejection,
+    not a rate-limit window.  The string "0" is truthy in Python, so a naive
+    ``not header`` check would silently skip the breaker — fail-open.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        resp = _resp(429, json_data={"error": "rate_limit_exceeded"})
+        resp = _resp(429, json_data={"error": "overloaded"})
         resp.headers["retry-after"] = "0"
         return resp
 
@@ -1417,7 +1422,7 @@ async def test_429_with_retry_after_zero_is_not_recorded():
     async with _asgi_client(app) as client:
         await client.post("/v1/messages", json={"prompt": "hi"})
 
-    assert reconcile.total_429s == 0, "retry-after: 0 is still a rate-limit signal"
+    assert reconcile.total_429s == 1, "retry-after: 0 must trip the breaker (concurrency signal)"
 
 
 # ---------------------------------------------------------------------------
