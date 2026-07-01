@@ -14,6 +14,7 @@ key of its own beyond the usage poller's.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import logging
@@ -66,7 +67,6 @@ _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
-_BODY_QUEUE_MAXSIZE = 1
 
 
 class ProxyApp:
@@ -96,15 +96,48 @@ class ProxyApp:
         self._retry_interval = retry_interval
         self._acquire_retry_task: asyncio.Task[None] | None = None
 
+    def _is_admin_auth_value(self, value: bytes) -> bool:
+        """Check if an Authorization header value matches sluice admin credentials.
+
+        Used both to gate admin routes and to strip sluice-internal auth headers
+        from proxied requests (browsers cache Basic auth origin-wide, so the
+        dashboard login would otherwise leak to the upstream — Rule 7).
+        """
+        if not self._admin_token:
+            return False
+        # Bearer token (API clients like ``sluice status``).
+        bearer_expected = f"Bearer {self._admin_token}".encode()
+        if hmac.compare_digest(value, bearer_expected):
+            return True
+        # Basic auth (browser — password = admin token, username ignored).
+        # Scheme is case-insensitive per RFC 7235.
+        if value.lower().startswith(b"basic "):
+            try:
+                decoded = base64.b64decode(value[6:]).decode("utf-8")
+                _, _, password = decoded.partition(":")
+                if hmac.compare_digest(
+                    password.encode("utf-8"),
+                    self._admin_token.encode("utf-8"),
+                ):
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _check_admin_auth(self, scope: Scope) -> bool:
-        """Return True if the request is authorized for admin routes."""
-        if self._admin_token is None:
+        """Return True if the request is authorized for admin routes.
+
+        Accepts either a Bearer token (for API clients like ``sluice status``)
+        or HTTP Basic auth (for browser access to the dashboard, where the
+        password is the admin token — username is ignored).  Basic auth lets
+        the browser cache credentials so the dashboard's JS fetch to
+        /status.json succeeds after the initial 401 prompt.
+        """
+        if not self._admin_token:
             return True
         for k, v in scope.get("headers", []):
-            if k == b"authorization":
-                expected = f"Bearer {self._admin_token}".encode()
-                if hmac.compare_digest(v, expected):
-                    return True
+            if k == b"authorization" and self._is_admin_auth_value(v):
+                return True
         return False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -128,15 +161,22 @@ class ProxyApp:
                 await self._send_json(send, 503, {"status": "not ready"})
             return
 
-        # Dashboard is a static page — no auth needed (data comes from /status.json).
-        if path == "/":
-            await self._send_dashboard(send)
-            return
-
-        # Admin routes — token-gated when admin_token is set.
-        if path in ("/status.json", "/metrics"):
+        # Admin routes — token-gated when admin_token is set.  The dashboard
+        # (/) is included so the browser prompts for Basic auth on first
+        # visit; the cached credentials then authorize the JS fetch to
+        # /status.json.  Without gating /, the dashboard's fetch would 401.
+        if path in ("/", "/status.json", "/metrics"):
             if not self._check_admin_auth(scope):
-                await self._send_text(send, 401, "Unauthorized", content_type="text/plain")
+                await self._send_text(
+                    send,
+                    401,
+                    "Unauthorized",
+                    content_type="text/plain",
+                    extra_headers=[(b"www-authenticate", b'Basic realm="sluice"')],
+                )
+                return
+            if path == "/":
+                await self._send_dashboard(send)
                 return
             if path == "/status.json":
                 await self._send_status_json(send)
@@ -271,33 +311,48 @@ class ProxyApp:
         method = scope["method"]
 
         disconnect = asyncio.Event()
-        body_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=_BODY_QUEUE_MAXSIZE)
+        body_done = asyncio.Event()
 
-        async def pump_receive() -> None:
-            """Single consumer of the ASGI receive callable."""
+        async def body_stream() -> AsyncIterator[bytes]:
+            """Consume ASGI receive() directly — no intermediate queue.
+
+            By reading from receive() inline, backpressure is applied at the
+            ASGI level: if the upstream is slow to accept a chunk, we don't
+            call receive() again, so the ASGI server's TCP buffer fills and
+            the client slows down.  This avoids both the memory risk of an
+            unbounded queue and the disconnect-detection delay of a bounded
+            one (the pump could block on body_queue.put() and miss
+            http.disconnect events).
+            """
             while True:
                 event = await receive()
                 etype = event["type"]
                 if etype == "http.disconnect":
                     disconnect.set()
-                    await body_queue.put(None)  # unblock body_stream
                     return
                 if etype == "http.request":
                     data = event.get("body", b"")
                     if data:
-                        await body_queue.put(data)
+                        yield data
                     if not event.get("more_body", False):
-                        await body_queue.put(None)
-                        # Keep listening for disconnect during response phase.
+                        body_done.set()
+                        return
 
-        async def body_stream() -> AsyncIterator[bytes]:
+        async def disconnect_watcher() -> None:
+            """Listen for client disconnect during the response phase.
+
+            body_stream() owns receive() while the request body is being
+            uploaded; this task takes over once the body is complete so
+            disconnects during response streaming are detected promptly.
+            """
+            await body_done.wait()
             while True:
-                chunk = await body_queue.get()
-                if chunk is None:
+                event = await receive()
+                if event["type"] == "http.disconnect":
+                    disconnect.set()
                     return
-                yield chunk
 
-        pump_task = asyncio.create_task(pump_receive())
+        watcher_task = asyncio.create_task(disconnect_watcher())
 
         try:
             async with self._client.stream(
@@ -348,10 +403,10 @@ class ProxyApp:
                 except Exception:
                     pass
         finally:
-            if not pump_task.done():
-                pump_task.cancel()
+            if not watcher_task.done():
+                watcher_task.cancel()
                 try:
-                    await pump_task
+                    await watcher_task
                 except asyncio.CancelledError:
                     pass
 
@@ -362,14 +417,20 @@ class ProxyApp:
             path += "?" + qs.decode("latin-1")
         return self._upstream + path
 
-    @staticmethod
-    def _filter_request_headers(scope_headers: list[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
+    def _filter_request_headers(self, scope_headers: list[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []
         for k, v in scope_headers:
             name = k.decode("latin-1").lower()
             if name in _STRIP_REQUEST:
                 continue
             if name.startswith("x-sluice-"):
+                continue
+            # Strip sluice admin auth credentials that the browser caches
+            # origin-wide after dashboard login (Basic auth realm is not
+            # path-scoped).  The client's own upstream Authorization header
+            # (e.g. ``Bearer sk-...``) is not affected — only values that
+            # match sluice's admin token are stripped.  (Rule 7.)
+            if name == "authorization" and self._is_admin_auth_value(v):
                 continue
             result.append((k.decode("latin-1"), v.decode("latin-1")))
         return result
@@ -419,12 +480,15 @@ class ProxyApp:
         body: str,
         *,
         content_type: str = "text/plain",
+        extra_headers: list[tuple[bytes, bytes]] | None = None,
     ) -> None:
         payload = body.encode()
         headers: list[tuple[bytes, bytes]] = [
             (b"content-type", content_type.encode()),
             (b"content-length", str(len(payload)).encode()),
         ]
+        if extra_headers:
+            headers.extend(extra_headers)
         await send({"type": "http.response.start", "status": status, "headers": headers})
         await send({"type": "http.response.body", "body": payload, "more_body": False})
 
@@ -438,19 +502,17 @@ _DASHBOARD_HTML = """\
 <title>sluice</title>
 <style>
 :root{--bg:#0d1117;--fg:#c9d1d9;--accent:#58a6ff;--warn:#d29922;--alarm:#f85149;
---card:#161b22;--border:#30363d;--mono:monospace;--gap:#6e7681}
+--card:#161b22;--border:#30363d;--mono:monospace;--gap:#6e7681;--green:#3fb950}
 *{box-sizing:border-box}body{font-family:var(--mono);background:var(--bg);color:var(--fg);margin:0;padding:1rem}
-h1{font-size:1rem;font-weight:400;margin:0 0 1rem}
-.row{display:flex;gap:1rem;flex-wrap:wrap}
-.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:1rem;min-width:260px}
-.ladder{display:flex;flex-direction:column;gap:2px;width:100%}
-.band{display:flex;align-items:center;gap:.5rem;padding:.4rem .6rem;border-radius:4px;font-size:.8rem;position:relative}
-.boxed{background:rgba(248,81,73,.15);border:1px solid var(--alarm);color:var(--alarm)}
-.reject{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3)}
-.low{background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3)}
-.normal{background:rgba(88,166,255,.05);border:1px solid var(--border)}
-.target-line{border-top:1px dashed var(--accent);padding:.3rem .6rem;font-size:.7rem;color:var(--accent)}
-.marker{font-size:.9rem}.obs{color:var(--accent)}.loc{color:var(--warn)}.phantom{color:var(--gap)}
+.header{display:flex;justify-content:space-between;align-items:center;margin:0 0 1rem}
+h1{font-size:1rem;font-weight:400;margin:0}
+.controls{display:flex;gap:.4rem}
+.controls button{background:var(--card);border:1px solid var(--border);color:var(--fg);
+padding:.25rem .6rem;border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:.7rem}
+.controls button:hover{border-color:var(--accent)}
+.row{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem}
+.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:1rem;flex:1;min-width:260px}
+.card h2{font-size:.8rem;font-weight:400;color:var(--gap);margin:0 0 .5rem}
 table{width:100%;border-collapse:collapse;font-size:.75rem}
 td,th{padding:.2rem .4rem;text-align:left;border-bottom:1px solid var(--border)}
 th{color:var(--gap);font-weight:400}
@@ -458,75 +520,203 @@ th{color:var(--gap);font-weight:400}
 .banner.boxed{display:block;background:rgba(248,81,73,.15);color:var(--alarm);border:1px solid var(--alarm)}
 .banner.breaker{display:block;background:rgba(210,153,34,.15);color:var(--warn);border:1px solid var(--warn)}
 #countdown{font-weight:700}
-.stale{color:var(--gap);font-size:.7rem}
+.gauge{position:relative;height:24px;background:var(--bg);border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+.gz{position:absolute;top:0;height:100%}
+.gz-n{background:rgba(88,166,255,.06)}.gz-l{background:rgba(210,153,34,.08)}
+.gm{position:absolute;top:0;height:100%;width:2px;transition:left .3s}
+.gm-o{background:var(--accent)}.gm-l{background:var(--warn)}
+.gt{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--accent)}
+.gl{display:flex;justify-content:space-between;font-size:.65rem;color:var(--gap);margin-top:.2rem}
+.spark{width:100%;height:60px;display:block}
+.sleg{display:flex;gap:.8rem;font-size:.65rem;color:var(--gap);margin-top:.2rem}
+.sleg span{display:flex;align-items:center;gap:.2rem}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 </style>
 </head>
 <body>
-<h1>sluice</h1>
-<div id="banner-boxed" class="banner boxed">ACCOUNT BOXED — retry after <span id="countdown">?</span>s</div>
-<div id="banner-breaker" class="banner breaker">CIRCUIT BREAKER OPEN — backing off</div>
+<div class="header">
+  <h1>sluice</h1>
+  <div class="controls">
+    <button id="btn-pause" onclick="togglePause()">pause</button>
+    <button onclick="refresh()">refresh</button>
+  </div>
+</div>
+<div id="banner-boxed" class="banner boxed">ACCOUNT BOXED \u2014 retry after <span id="countdown">?</span>s</div>
+<div id="banner-breaker" class="banner breaker">CIRCUIT BREAKER OPEN \u2014 backing off</div>
 <div class="row">
   <div class="card">
-    <h2 style="font-size:.8rem;font-weight:400;color:var(--gap)">Gate Ladder</h2>
-    <div class="ladder" id="ladder"></div>
+    <h2>Concurrency Gauge</h2>
+    <div class="gauge" id="gauge"></div>
+    <div class="gl" id="gauge-labels"></div>
+  </div>
+</div>
+<div class="row">
+  <div class="card">
+    <h2>Sparkline <span id="spark-info" style="color:var(--gap)"></span></h2>
+    <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"></svg>
+    <div class="sleg">
+      <span><span class="dot" style="background:var(--accent)"></span> observed</span>
+      <span><span class="dot" style="background:var(--warn)"></span> local</span>
+      <span><span class="dot" style="background:var(--gap)"></span> phantom</span>
+    </div>
   </div>
   <div class="card">
-    <h2 style="font-size:.8rem;font-weight:400;color:var(--gap)">Reading</h2>
+    <h2>Reading</h2>
     <table id="stats"></table>
   </div>
 </div>
+<div class="row">
+  <div class="card">
+    <h2>Config</h2>
+    <table id="config-table"></table>
+  </div>
+</div>
 <script>
+let paused=false,isActive=false,timer=null,fetching=false;
+const HIST_MAX=60;
+let hist=[];
+
+function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
+
+async function doPoll(){
+  if(fetching) return;
+  fetching=true;
+  try{
+    const r=await fetch('/status.json',{credentials:'same-origin'});
+    if(!r.ok){
+      document.getElementById('stats').innerHTML='<tr><th>error</th><td>status '+r.status+'</td></tr>';
+      return;
+    }
+    const d=await r.json();
+    render(d);
+    hist.push({obs:d.concurrent_sessions,loc:d.local_in_flight,ph:d.phantom_estimate,
+               ep:d.effective_permits,limit:d.limit});
+    if(hist.length>HIST_MAX) hist.shift();
+    renderSpark(d);
+  }catch(e){
+    document.getElementById('stats').innerHTML='<tr><th>error</th><td>'+esc(e.message)+'</td></tr>';
+  }finally{
+    fetching=false;
+  }
+}
+
+function schedule(delay){
+  if(timer) clearTimeout(timer);
+  timer=setTimeout(poll,delay);
+}
+
 async function poll(){
- let active=false;
- try{
-  const r=await fetch('/status.json');
-  if(r.ok){active=render(await r.json());}
- }catch(e){}
- // Stream-ish: poll fast while there's activity, idle back to a slow heartbeat.
- setTimeout(poll,active?1000:5000);
+  if(!paused) await doPoll();
+  schedule(paused?5000:(isActive?1000:5000));
 }
+
+function refresh(){
+  if(timer) clearTimeout(timer);
+  doPoll();
+  schedule(paused?5000:(isActive?1000:5000));
+}
+
+function togglePause(){
+  paused=!paused;
+  document.getElementById('btn-pause').textContent=paused?'resume':'pause';
+  if(!paused) schedule(0);
+}
+
 function render(d){
- const limit=d.limit||4,hc=d.hard_cap||8,tgt=d.target||3;
- const obs=d.concurrent_sessions,loc=d.local_in_flight;
- const bands=[
-  {n:'boxed',lo:hc+1,hi:null,c:'boxed',label:'> '+hc},
-  {n:'low',lo:limit+1,hi:hc,c:'low',label:(limit+1)+'\u2013'+hc},
-  {n:'normal',lo:0,hi:limit,c:'normal',label:'0\u2013'+limit},
- ];
- let html='';
- html+='<div class="target-line">target = '+tgt+'</div>';
- for(const b of bands){
-  let cls=b.c;
-  let mk='';
-  if(obs!=null&&((b.n==='boxed'&&obs>hc)||(b.n==='low'&&obs>limit&&obs<=hc)||(b.n==='normal'&&obs<=limit))) mk+='<span class="marker obs">\u25cf</span> obs='+obs;
-  if(loc!=null&&((b.n==='boxed'&&loc>hc)||(b.n==='low'&&loc>limit&&loc<=hc)||(b.n==='normal'&&loc<=limit))) mk+=' <span class="marker loc">\u25a3</span> loc='+loc;
-  if(d.phantom_estimate>0&&b.n==='low') mk+=' <span class="phantom">gap='+d.phantom_estimate+'</span>';
-  html+='<div class="band '+cls+'">'+b.label+' '+mk+'</div>';
- }
- document.getElementById('ladder').innerHTML=html;
- const rows=[
-  ['band',d.band],['effective_permits',d.effective_permits],
-  ['concurrent_sessions',obs],['local_in_flight',loc],
-  ['phantom_estimate',d.phantom_estimate],
-  ['breaker',d.breaker],['recent_429s',d.recent_429s],
-  ['total_429s',d.total_429s],['queue_depth',d.queue_depth],
-  ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95'],
-  ['queue_timeouts',d.queue_timeouts],
-  ['gate_closed',d.gate_closed_reason],['ready',d.ready],
-  ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':'')],
- ];
- document.getElementById('stats').innerHTML=rows.map(r=>'<tr><th>'+r[0]+'</th><td>'+r[1]+'</td></tr>').join('');
- const bb=document.getElementById('banner-boxed');
- if(d.band==='boxed'){
-  bb.style.display='block';
-  const ra=d.resets_at?Math.max(0,Math.round(d.resets_at-Date.now()/1000)):'?';
-  document.getElementById('countdown').textContent=ra;
- }else bb.style.display='none';
- const br=document.getElementById('banner-breaker');
- br.style.display=(d.breaker==='open')?'block':'none';
- // "Active" = anything moving: in-flight, a queue, or a non-nominal state.
- return (loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
+  const limit=d.limit??4,hc=d.hard_cap??8,tgt=d.target??3;
+  const obs=d.concurrent_sessions,loc=d.local_in_flight;
+  // Gauge
+  const g=document.getElementById('gauge');
+  if(obs==null||hc==null||limit==null){
+    g.innerHTML='<div style="text-align:center;color:var(--gap);font-size:.7rem;line-height:24px">waiting for data...</div>';
+    document.getElementById('gauge-labels').innerHTML='';
+  }else{
+    var nW=Math.min(100,Math.max(0,(limit/hc)*100));
+    var lW=Math.max(0,100-nW);
+    var h='<div class="gz gz-n" style="left:0;width:'+nW+'%"></div>';
+    h+='<div class="gz gz-l" style="left:'+nW+'%;width:'+lW+'%"></div>';
+    var tP=Math.min(100,(tgt/hc)*100);
+    h+='<div class="gt" style="left:'+tP+'%" title="target='+tgt+'"></div>';
+    var oP=Math.min(100,(obs/hc)*100);
+    h+='<div class="gm gm-o" style="left:'+oP+'%" title="observed='+obs+'"></div>';
+    if(loc!=null){
+      var lP=Math.min(100,(loc/hc)*100);
+      h+='<div class="gm gm-l" style="left:'+lP+'%" title="local='+loc+'"></div>';
+    }
+    g.innerHTML=h;
+    document.getElementById('gauge-labels').innerHTML=
+      '<span>0</span><span style="color:var(--accent)">limit='+limit+'</span><span style="color:var(--alarm)">hard_cap='+hc+'</span>';
+  }
+  // Stats table
+  var rows=[
+    ['band',d.band],['effective_permits',d.effective_permits],
+    ['concurrent_sessions',obs],['local_in_flight',loc],
+    ['phantom_estimate',d.phantom_estimate],
+    ['breaker',d.breaker],['recent_429s',d.recent_429s],
+    ['total_429s',d.total_429s],['queue_depth',d.queue_depth],
+    ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95'],
+    ['queue_timeouts',d.queue_timeouts],
+    ['gate_closed',d.gate_closed_reason],['ready',d.ready],
+    ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':'')],
+  ];
+  document.getElementById('stats').innerHTML=rows.map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
+  // Config table
+  var c=d.config||{};
+  var crows=[
+    ['target',c.target],['min_floor',c.min_floor],
+    ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null],
+    ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null],
+    ['phantom_window',c.phantom_window],
+    ['breaker_threshold',c.breaker_threshold],
+    ['breaker_window',c.breaker_window_seconds!=null?c.breaker_window_seconds+'s':null],
+    ['breaker_cooldown',c.breaker_cooldown_seconds!=null?c.breaker_cooldown_seconds+'s':null],
+  ].filter(function(r){return r[1]!=null;});
+  document.getElementById('config-table').innerHTML=crows.map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
+  // Banners
+  var bb=document.getElementById('banner-boxed');
+  if(d.band==='boxed'){
+    bb.style.display='block';
+    var ra=d.resets_at?Math.max(0,Math.round(d.resets_at-Date.now()/1000)):'?';
+    document.getElementById('countdown').textContent=ra;
+  }else bb.style.display='none';
+  document.getElementById('banner-breaker').style.display=(d.breaker==='open')?'block':'none';
+  // Active = anything moving
+  isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
 }
+
+function renderSpark(d){
+  var svg=document.getElementById('spark');
+  var info=document.getElementById('spark-info');
+  var hc=d.hard_cap??8,limit=d.limit??4;
+  var valid=hist.filter(function(h){return h.obs!=null;});
+  info.textContent=valid.length+'/'+HIST_MAX+' samples';
+  if(valid.length<2){
+    svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="#6e7681" font-size="7" font-family="monospace">waiting for data...</text>';
+    return;
+  }
+  var W=200,H=60,pad=3;
+  var maxV=hc;
+  for(var i=0;i<valid.length;i++){if(valid[i].obs>maxV) maxV=valid[i].obs;}
+  if(maxV<1) maxV=1;
+  function pts(key){
+    return valid.map(function(h,i){
+      var x=pad+(i/(HIST_MAX-1))*(W-2*pad);
+      var v=h[key]||0;
+      var y=H-pad-(v/maxV)*(H-2*pad);
+      return x.toFixed(1)+','+y.toFixed(1);
+    }).join(' ');
+  }
+  var limitY=(H-pad-(limit/maxV)*(H-2*pad)).toFixed(1);
+  var s='';
+  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" stroke="#30363d" stroke-dasharray="2,2" stroke-width="0.5"/>';
+  s+='<polyline points="'+pts('obs')+'" fill="none" stroke="#58a6ff" stroke-width="1"/>';
+  s+='<polyline points="'+pts('loc')+'" fill="none" stroke="#d29922" stroke-width="1"/>';
+  var hasPh=false;
+  for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
+  if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" stroke="#6e7681" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
+  svg.innerHTML=s;
+}
+
 poll();
 </script>
 </body>

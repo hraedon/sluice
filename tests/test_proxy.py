@@ -7,6 +7,7 @@ completion and disconnect, auth passthrough, 429 reporting.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import httpx
@@ -327,6 +328,90 @@ async def test_auth_header_passes_through():
     assert received.get("x-api-key") == "another-key"
 
 
+async def test_admin_basic_auth_stripped_from_proxy_request():
+    """Browser-cached Basic auth (admin token) must not leak to upstream.
+
+    After dashboard login, the browser sends Basic auth on all same-origin
+    requests.  The proxy must strip the admin credentials before forwarding
+    so the upstream never sees sluice's internal auth token (Rule 7).
+    """
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+    app._admin_token = "admin-secret"
+
+    basic = "Basic " + base64.b64encode(b"user:admin-secret").decode()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={"Authorization": basic},
+        )
+
+    assert "authorization" not in received, "admin Basic auth must not reach upstream"
+
+
+async def test_provider_bearer_auth_preserved_when_admin_token_set():
+    """The client's own upstream Bearer token is forwarded even when admin_token is set."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+    app._admin_token = "admin-secret"
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={"Authorization": "Bearer sk-provider-key"},
+        )
+
+    assert received.get("authorization") == "Bearer sk-provider-key"
+
+
+async def test_admin_bearer_auth_stripped_from_proxy_request():
+    """Admin Bearer token is stripped from proxied requests (same as Basic)."""
+    received: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.update(dict(request.headers))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+    app._admin_token = "admin-secret"
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/v1/messages",
+            json={"prompt": "hi"},
+            headers={"Authorization": "Bearer admin-secret"},
+        )
+
+    assert "authorization" not in received
+
+
+async def test_basic_auth_case_insensitive_scheme():
+    """Basic auth with lowercase scheme is accepted (RFC 7235)."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "basic " + base64.b64encode(b"user:secret").decode()},
+        )
+
+    assert response.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # 429 reporting
 # ---------------------------------------------------------------------------
@@ -476,17 +561,73 @@ async def test_admin_token_authorized():
 
 
 async def test_admin_token_not_required_for_healthz():
-    """Health, readiness, and dashboard are not gated by admin_token."""
+    """Health and readiness are not gated by admin_token."""
     app, _, _ = _make_app()
     app._admin_token = "secret"
 
     async with _asgi_client(app) as client:
         health = await client.get("/healthz")
-        dashboard = await client.get("/")
+        ready = await client.get("/readyz")
 
     assert health.status_code == 200
-    assert dashboard.status_code == 200
-    assert "text/html" in dashboard.headers.get("content-type", "")
+    assert ready.status_code == 503  # not ready before first poll
+
+
+async def test_dashboard_requires_auth_when_token_set():
+    """The dashboard at / requires auth when admin_token is set."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    assert response.status_code == 401
+    assert response.headers.get("www-authenticate") is not None
+    assert "Basic" in response.headers.get("www-authenticate", "")
+
+
+async def test_dashboard_works_with_basic_auth():
+    """The dashboard is served when Basic auth password matches admin_token."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/",
+            headers={"Authorization": "Basic " + base64.b64encode(b"anyuser:secret").decode()},
+        )
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "sluice" in response.text.lower()
+
+
+async def test_status_json_works_with_basic_auth():
+    """Status endpoint accepts Basic auth as well as Bearer."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "Basic " + base64.b64encode(b"user:secret").decode()},
+        )
+
+    assert response.status_code == 200
+
+
+async def test_basic_auth_rejects_wrong_password():
+    """Basic auth with wrong password returns 401."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "Basic " + base64.b64encode(b"user:wrong").decode()},
+        )
+
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -924,15 +1065,16 @@ async def test_retry_acquire_releases_lease_if_start_fails():
 
 
 # ---------------------------------------------------------------------------
-# WI-007: Request body queue is bounded (memory DoS prevention)
+# Multi-chunk request body (queueless direct-streaming)
 # ---------------------------------------------------------------------------
 
 
 async def test_large_multi_chunk_body_proxied():
-    """A large multi-chunk request body is proxied correctly with the bounded queue.
+    """A large multi-chunk request body is proxied correctly.
 
-    The body queue has maxsize=1 to prevent unbounded memory growth. This test
-    verifies that a body sent in multiple chunks is still proxied byte-for-byte.
+    body_stream() reads from receive() directly and yields to httpx, applying
+    natural backpressure.  This test verifies that a body sent in multiple
+    chunks is still proxied byte-for-byte.
     """
     chunks = [b"x" * 10000 for _ in range(10)]
     expected_body = b"".join(chunks)

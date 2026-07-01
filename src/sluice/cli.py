@@ -110,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="logging level (default: INFO)")
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
-    serve.add_argument("--admin-token", default=None, help="bearer token for admin routes (/, /status.json, /metrics)")
+    serve.add_argument("--admin-token", default=None, help="token for admin routes (/, /status.json, /metrics) — sent as Bearer header or Basic auth password")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")

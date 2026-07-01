@@ -46,6 +46,7 @@ class StatusSnapshot:
     queue_timeouts: int
     ready: bool
     gate_closed_reason: str
+    config: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +73,7 @@ class StatusSnapshot:
             "queue_timeouts": self.queue_timeouts,
             "ready": self.ready,
             "gate_closed_reason": self.gate_closed_reason,
+            "config": self.config,
         }
 
 
@@ -109,6 +111,16 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         queue_timeouts=reconcile.queue_timeouts,
         ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
+        config={
+            "target": reconcile._ctrl_cfg.target,
+            "min_floor": reconcile._ctrl_cfg.min_floor,
+            "poll_interval": reconcile._poll_interval,
+            "usage_fresh_ttl": reconcile._ctrl_cfg.usage_fresh_ttl,
+            "phantom_window": reconcile._ctrl_cfg.phantom_window,
+            "breaker_threshold": reconcile._brk_cfg.threshold,
+            "breaker_window_seconds": reconcile._brk_cfg.window_seconds,
+            "breaker_cooldown_seconds": reconcile._brk_cfg.cooldown_seconds,
+        },
     )
 
 

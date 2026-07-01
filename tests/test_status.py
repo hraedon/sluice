@@ -59,6 +59,10 @@ async def test_snapshot_fields():
     assert d["avg_wait_seconds"] == 0.0
     assert d["p95_wait_seconds"] == 0.0
     assert d["queue_timeouts"] == 0
+    assert "config" in d
+    assert d["config"]["target"] == 3
+    assert d["config"]["breaker_threshold"] == 5
+    assert d["config"]["poll_interval"] == 5.0
 
 
 async def test_snapshot_queue_wait_reflects_gate():
