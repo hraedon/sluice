@@ -273,6 +273,19 @@ class ProxyApp:
             )
             return
 
+        # Not-ready fast-fail: before the first successful usage poll, the gate
+        # has no truth to size against.  Refuse admission rather than allowing
+        # traffic at the initial (target) capacity — fail-safe (WI-018).
+        if not self._reconcile.ready:
+            log.info("not ready (first poll pending) — fast-failing 503")
+            await self._send_json(
+                send,
+                503,
+                {"error": "not_ready", "reason": "not_ready", "retry_after": _RETRY_AFTER_DEFAULT},
+                retry_after=_RETRY_AFTER_DEFAULT,
+            )
+            return
+
         # Fast-fail if the gate is closed for a structural reason (boxed / breaker).
         # Don't burn the queue timeout against a gate that cannot open.
         reason = self._reconcile.gate_closed_reason()
@@ -329,6 +342,7 @@ class ProxyApp:
                 etype = event["type"]
                 if etype == "http.disconnect":
                     disconnect.set()
+                    body_done.set()  # WI-014: unblock disconnect_watcher
                     return
                 if etype == "http.request":
                     data = event.get("body", b"")
@@ -346,6 +360,8 @@ class ProxyApp:
             disconnects during response streaming are detected promptly.
             """
             await body_done.wait()
+            if disconnect.is_set():  # WI-014: body_stream already saw disconnect
+                return
             while True:
                 event = await receive()
                 if event["type"] == "http.disconnect":
@@ -353,23 +369,72 @@ class ProxyApp:
                     return
 
         watcher_task = asyncio.create_task(disconnect_watcher())
+        response_started = False  # WI-013: guard against double http.response.start
 
         try:
-            async with self._client.stream(
+            stream_cm = self._client.stream(
                 method, url, headers=headers, content=body_stream()
-            ) as response:
-                # 429 is an upstream signal — record immediately so the breaker
-                # can react without waiting for the (possibly short) body.
-                if response.status_code == 429:
+            )
+
+            # WI-014: Race stream entry against client disconnect.  If the
+            # client disconnects while we're waiting for response headers or
+            # during body upload, cancel the upstream request instead of
+            # letting it run to completion as a phantom.
+            entry_task = asyncio.ensure_future(stream_cm.__aenter__())
+            disconnect_task = asyncio.ensure_future(disconnect.wait())
+            await asyncio.wait(
+                [entry_task, disconnect_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if disconnect_task.done() and not entry_task.done():
+                # Client disconnected — cancel entry to abort the upstream
+                # request.  __aenter__ cancellation closes the connection.
+                entry_task.cancel()
+                try:
+                    await entry_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                return
+
+            # Entry completed (or raised) — cancel the disconnect wait.
+            if not disconnect_task.done():
+                disconnect_task.cancel()
+                try:
+                    await disconnect_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # __aenter__ may have raised httpx.RequestError — let it
+            # propagate to the handler below.
+            response = entry_task.result()
+
+            try:
+                # WI-014: disconnect may have occurred during body upload
+                # (body_stream returned early after setting disconnect).
+                if disconnect.is_set():
+                    return
+
+                # 429 is an upstream signal — but only concurrency 429s should
+                # trip the breaker (WI-019).  Rate-limit 429s (request-count
+                # window exhausted) include a retry-after header telling the
+                # client when to retry; concurrency rejections don't.  We
+                # inspect headers only (never the body) to classify.
+                if response.status_code == 429 and not response.headers.get("retry-after"):
                     self._reconcile.record_429()
 
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": response.status_code,
-                        "headers": self._encode_response_headers(response),
-                    }
-                )
+                try:
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": response.status_code,
+                            "headers": self._encode_response_headers(response),
+                        }
+                    )
+                    response_started = True
+                except Exception:
+                    disconnect.set()
+                    return
 
                 async for chunk in response.aiter_raw():
                     if disconnect.is_set():
@@ -395,8 +460,19 @@ class ProxyApp:
                     # disconnects mid-stream must not count as success.
                     if 200 <= response.status_code < 400:
                         self._reconcile.record_success()
+            finally:
+                # Close the stream context to cancel the upstream request
+                # (WI-014: phantom prevention).
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
         except httpx.RequestError as exc:
-            if not disconnect.is_set():
+            # WI-013: only send 502 if we haven't started the response yet.
+            # If the upstream dropped mid-stream (after http.response.start),
+            # sending another http.response.start is an ASGI protocol violation.
+            if not disconnect.is_set() and not response_started:
                 log.warning("upstream error: %s: %s", type(exc).__name__, exc)
                 try:
                     await self._send_json(send, 502, {"error": "upstream error"})

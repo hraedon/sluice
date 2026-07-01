@@ -118,6 +118,7 @@ def _make_app(
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
     )
+    reconcile._first_poll_ok = True  # most tests assume ready state
     app = ProxyApp(
         upstream_base_url="https://upstream.example.com",
         gate=gate,
@@ -448,7 +449,8 @@ async def test_healthz():
 
 
 async def test_readyz_503_before_first_poll():
-    app, _, _ = _make_app()
+    app, _, reconcile = _make_app()
+    reconcile._first_poll_ok = False  # simulate pre-first-poll state
 
     async with _asgi_client(app) as client:
         response = await client.get("/readyz")
@@ -562,8 +564,9 @@ async def test_admin_token_authorized():
 
 async def test_admin_token_not_required_for_healthz():
     """Health and readiness are not gated by admin_token."""
-    app, _, _ = _make_app()
+    app, _, reconcile = _make_app()
     app._admin_token = "secret"
+    reconcile._first_poll_ok = False  # simulate pre-first-poll state
 
     async with _asgi_client(app) as client:
         health = await client.get("/healthz")
@@ -859,6 +862,7 @@ def _make_app_with_guard(
         breaker_config=BreakerConfig(),
         guard=guard,  # type: ignore[arg-type]
     )
+    reconcile._first_poll_ok = True  # most tests assume ready state
     app = ProxyApp(
         upstream_base_url="https://upstream.example.com",
         gate=gate,
@@ -1114,3 +1118,250 @@ async def test_large_multi_chunk_body_proxied():
     status_events = [e for e in sent_events if e["type"] == "http.response.start"]
     assert len(status_events) == 1
     assert status_events[0]["status"] == 200
+
+
+# ---------------------------------------------------------------------------
+# WI-013: No double http.response.start when upstream drops mid-stream
+# ---------------------------------------------------------------------------
+
+
+async def test_no_double_response_start_on_mid_stream_drop():
+    """If the upstream drops after sending headers, we must not send a second
+    http.response.start (ASGI protocol violation).
+
+    The proxy should send exactly one http.response.start, then stream what it
+    can, and stop — no 502 after the response has already started.
+    """
+
+    async def dropping_gen():
+        yield b"chunk1\n"
+        raise httpx.ConnectError("upstream dropped mid-stream")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=dropping_gen(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    sent_events: list[dict] = []
+    receive_queue: asyncio.Queue = asyncio.Queue()
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await app(scope, receive, send)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 1, "must not send a second http.response.start"
+
+
+# ---------------------------------------------------------------------------
+# WI-014: Upstream request cancelled on client disconnect during body upload
+# ---------------------------------------------------------------------------
+
+
+async def test_upstream_cancelled_on_disconnect_during_body_upload():
+    """When the client disconnects during body upload, the upstream request
+    should be cancelled (the stream context exited) rather than running to
+    completion as a phantom.
+
+    The key observable: the proxy does NOT send http.response.start to a
+    client that has already disconnected.  Before the fix, the proxy would
+    enter the stream context, send http.response.start, and only then notice
+    the disconnect — leaving the response in a half-sent state.
+    """
+    upstream_responded = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_responded.set()
+        return _resp(200)
+
+    app, gate, _ = _make_app(upstream_handler=handler)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    # Start sending body (more_body=True) then disconnect before body completes
+    await receive_queue.put({"type": "http.request", "body": b"part1", "more_body": True})
+    await receive_queue.put({"type": "http.disconnect"})
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+
+    # Wait for the proxy to finish (should be quick — disconnect detected)
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    # The proxy should not have sent a response (disconnect before headers)
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 0, "should not send response after disconnect"
+
+    # Permit should be released
+    assert gate.held == 0
+
+
+async def test_upstream_cancelled_on_disconnect_while_waiting_for_headers():
+    """When the client disconnects after body upload completes but while
+    waiting for upstream response headers, the upstream request should be
+    cancelled (not left running as a phantom).
+
+    This is the core phantom-prevention scenario: body is complete,
+    disconnect_watcher takes over receive(), detects disconnect, and
+    the racing logic cancels the stream entry task.
+    """
+    handler_called = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        handler_called.set()
+        # Return a slow-streaming response to simulate waiting for headers.
+        async def slow_gen():
+            await asyncio.sleep(10.0)
+            yield b"done"
+
+        return httpx.Response(
+            200,
+            content=slow_gen(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    app, gate, _ = _make_app(upstream_handler=handler)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    # Send complete body, then disconnect while waiting for upstream
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+    # Wait a moment for body_stream to complete and disconnect_watcher to start
+    await asyncio.sleep(0.05)
+    await receive_queue.put({"type": "http.disconnect"})
+
+    proxy_task = asyncio.create_task(app(scope, receive, send))
+
+    # Should complete quickly — disconnect detected
+    await asyncio.wait_for(proxy_task, timeout=5.0)
+
+    # No response should have been sent to the disconnected client
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 0, "should not send response after disconnect"
+
+    # Permit should be released
+    assert gate.held == 0
+
+
+# ---------------------------------------------------------------------------
+# WI-018: Proxy fast-fails 503 when not ready (before first usage poll)
+# ---------------------------------------------------------------------------
+
+
+async def test_fast_fail_when_not_ready():
+    """Before the first successful usage poll, the proxy returns 503 not_ready."""
+    app, _, reconcile = _make_app()
+    reconcile._first_poll_ok = False  # simulate pre-first-poll state
+
+    async with _asgi_client(app) as client:
+        import time
+
+        start = time.monotonic()
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        elapsed = time.monotonic() - start
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "not_ready"
+    assert elapsed < 2.0, "should fast-fail, not wait for queue_timeout"
+
+
+# ---------------------------------------------------------------------------
+# WI-019: Only concurrency 429s (no retry-after) are recorded
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrency_429_without_retry_after_is_recorded():
+    """A 429 without retry-after (concurrency rejection) is recorded."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "overloaded"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 1
+
+
+async def test_rate_limit_429_with_retry_after_is_not_recorded():
+    """A 429 with retry-after (rate-limit) is NOT recorded as a concurrency 429."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = _resp(429, json_data={"error": "rate_limit_exceeded"})
+        resp.headers["retry-after"] = "60"
+        return resp
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 0, "rate-limit 429s must not trip the breaker"
+
+
+async def test_429_with_retry_after_zero_is_not_recorded():
+    """A 429 with retry-after: 0 is still a rate-limit signal — not recorded."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = _resp(429, json_data={"error": "rate_limit_exceeded"})
+        resp.headers["retry-after"] = "0"
+        return resp
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 0, "retry-after: 0 is still a rate-limit signal"

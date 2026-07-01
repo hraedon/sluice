@@ -157,11 +157,13 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     else:
         base = min(base, config.target - config.stale_penalty)
 
-    # A half-open breaker admits exactly one probe.
+    # A half-open breaker admits at most one probe — but never *raises* the
+    # gate above what the phantom/penalty math already computed.  If phantoms
+    # or penalties drove base to 0, HALF_OPEN must not widen it to 1 (fail-safe).
     if state.breaker is BreakerState.HALF_OPEN:
-        base = min(base, 1)
+        return max(0, min(base, 1))
 
-    return _clamp(base, config.min_floor if state.breaker is BreakerState.CLOSED else 1, config.target)
+    return _clamp(base, config.min_floor, config.target)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +178,7 @@ class BreakerConfig:
     threshold: int = 5  # this many 429s within window → open
     window_seconds: float = 300.0  # 5-minute rolling window
     cooldown_seconds: float = 60.0  # OPEN → HALF_OPEN after this long
+    probe_timeout_seconds: float = 30.0  # HALF_OPEN → OPEN if no probe result
 
 
 @dataclass(frozen=True)
@@ -184,6 +187,7 @@ class BreakerSnapshot:
 
     state: BreakerState = BreakerState.CLOSED
     opened_at: float | None = None  # monotonic timestamp of last OPEN transition
+    half_opened_at: float | None = None  # monotonic timestamp of HALF_OPEN transition
 
 
 def _count_recent(
@@ -203,7 +207,10 @@ def breaker_on_tick(
 
     * CLOSED → OPEN when ``threshold`` 429s accumulated in the window.
     * OPEN → HALF_OPEN after ``cooldown_seconds``.
-    * HALF_OPEN is left to event-driven transitions (429 / success).
+    * HALF_OPEN → OPEN after ``probe_timeout_seconds`` with no event (success/429).
+      Without this, a breaker that enters half-open but never receives a probe
+      result (e.g. all requests are fast-failed by the proxy for other reasons)
+      would stay half-open forever (WI-020).
     """
     if snap.state is BreakerState.CLOSED:
         if _count_recent(recent_429s, now=now, window=config.window_seconds) >= config.threshold:
@@ -212,10 +219,16 @@ def breaker_on_tick(
 
     if snap.state is BreakerState.OPEN:
         if snap.opened_at is not None and now - snap.opened_at >= config.cooldown_seconds:
-            return BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=snap.opened_at)
+            return BreakerSnapshot(
+                state=BreakerState.HALF_OPEN, opened_at=snap.opened_at, half_opened_at=now
+            )
         return snap
 
-    return snap  # HALF_OPEN: wait for event
+    # HALF_OPEN: check for probe timeout.
+    if snap.half_opened_at is not None and now - snap.half_opened_at >= config.probe_timeout_seconds:
+        return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now, half_opened_at=None)
+
+    return snap
 
 
 def breaker_on_429(
@@ -231,7 +244,16 @@ def breaker_on_429(
     If half-open (probing), the probe failed → back to OPEN.
     """
     if snap.state is BreakerState.HALF_OPEN:
-        return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now)
+        return BreakerSnapshot(
+            state=BreakerState.OPEN, opened_at=now, half_opened_at=None
+        )
+
+    if snap.state is BreakerState.OPEN:
+        # A 429 while OPEN resets the cooldown so tick() doesn't prematurely
+        # transition to HALF_OPEN (WI-016).  Without this, a 429 arriving
+        # during the fetch would be invisible to breaker_on_tick, which would
+        # see the old opened_at and transition OPEN→HALF_OPEN.
+        return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now, half_opened_at=None)
 
     if snap.state is BreakerState.CLOSED:
         if _count_recent(recent_429s, now=now, window=config.window_seconds) >= config.threshold:
@@ -243,5 +265,5 @@ def breaker_on_429(
 def breaker_on_success(snap: BreakerSnapshot) -> BreakerSnapshot:
     """Event: an upstream request succeeded (probe succeeded if half-open)."""
     if snap.state is BreakerState.HALF_OPEN:
-        return BreakerSnapshot(state=BreakerState.CLOSED, opened_at=snap.opened_at)
+        return BreakerSnapshot(state=BreakerState.CLOSED, opened_at=snap.opened_at, half_opened_at=None)
     return snap

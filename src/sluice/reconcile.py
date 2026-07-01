@@ -128,6 +128,14 @@ class ReconciliationLoop:
         now_mono = self._mono()
         now_wall = self._wall()
 
+        # Capture local_in_flight *before* the fetch so the (observed, local)
+        # pair in the phantom sample is aligned in time.  The provider's
+        # concurrent_sessions reflects the moment the request was served, not
+        # the moment we read self._gate.held after the fetch returns (WI-017).
+        # Permits may be acquired or released during the fetch's network I/O,
+        # corrupting the windowed estimate if we pair them mismatched.
+        held_at_fetch = self._gate.held
+
         cached = await self._usage.fetch(now_monotonic=now_mono)
         age = now_mono - cached.fetched_at_monotonic
         reading = dataclasses.replace(cached.reading, age_seconds=age)
@@ -147,8 +155,10 @@ class ReconciliationLoop:
         # Record the (observed, local) pairing for windowed phantom estimation.
         # Only record real readings — synthetic fail-safe samples would poison
         # the window with fabricated concurrent_sessions values.
+        # Use held_at_fetch (captured before the fetch) so the pairing reflects
+        # the state at the time the provider counted the sessions (WI-017).
         if cached.ok:
-            self._phantom_samples.append((reading.concurrent_sessions, self._gate.held))
+            self._phantom_samples.append((reading.concurrent_sessions, held_at_fetch))
         phantom_est = phantom_estimate(self._phantom_samples)
 
         state = ControllerState(

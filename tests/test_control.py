@@ -228,3 +228,86 @@ def test_breaker_old_429s_outside_window_not_counted():
     four29s = [NOW - 400, NOW - 5, NOW - 1]  # first is >300s old
     snap = breaker_on_tick(_snap(), four29s, now=NOW, config=BCFG)
     assert snap.state is BreakerState.CLOSED  # only 2 within window
+
+
+# --- WI-015: half-open breaker must not raise permits above base ---------------
+
+
+def test_half_open_does_not_raise_above_base_when_phantoms_absorb_all():
+    """When phantoms drive base to 0, HALF_OPEN must not widen to 1.
+
+    The old code used _clamp(base, 1, target) which raised 0→1.
+    The fix returns max(0, min(base, 1)) — permits stay at 0.
+    """
+    r = reading(concurrent_sessions=10)
+    # phantom_estimate = 10 - 0 = 10, base = 3 - 10 = -7 → clamp to 0
+    s = state(r, in_flight=0, breaker=BreakerState.HALF_OPEN, phantom=10)
+    assert effective_permits(s, CFG, now=NOW) == 0
+
+
+def test_half_open_still_admits_one_when_no_phantoms():
+    """When base is positive, HALF_OPEN caps at 1 (one probe)."""
+    r = reading(concurrent_sessions=0)
+    s = state(r, in_flight=0, breaker=BreakerState.HALF_OPEN, phantom=0)
+    assert effective_permits(s, CFG, now=NOW) == 1
+
+
+def test_half_open_caps_at_one_even_when_base_higher():
+    """HALF_OPEN never admits more than one probe."""
+    r = reading(concurrent_sessions=0)
+    s = state(r, in_flight=0, breaker=BreakerState.HALF_OPEN, phantom=0)
+    assert effective_permits(s, CFG, now=NOW) == 1
+
+
+# --- WI-016: breaker_on_429 resets opened_at when OPEN ------------------------
+
+
+def test_breaker_on_429_open_resets_opened_at():
+    """A 429 while OPEN resets opened_at so tick() doesn't prematurely go HALF_OPEN."""
+    snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 100)
+    result = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
+    assert result.state is BreakerState.OPEN
+    assert result.opened_at == NOW  # reset, not the old value
+
+
+def test_breaker_on_429_open_prevents_premature_half_open():
+    """A 429 during OPEN prevents the next tick from transitioning to HALF_OPEN.
+
+    Without the fix, breaker_on_429 returned snap unchanged when OPEN, so
+    breaker_on_tick would see the old opened_at and transition to HALF_OPEN.
+    """
+    snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 100)
+    # Simulate a 429 arriving during the fetch
+    snap = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
+    assert snap.opened_at == NOW
+    # Now tick — cooldown is 60s, only 0s elapsed → stays OPEN
+    result = breaker_on_tick(snap, [NOW], now=NOW, config=BCFG)
+    assert result.state is BreakerState.OPEN
+
+
+# --- WI-020: HALF_OPEN → OPEN on probe timeout --------------------------------
+
+
+def test_breaker_half_open_to_open_on_probe_timeout():
+    """HALF_OPEN transitions to OPEN after probe_timeout_seconds."""
+    cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0, probe_timeout_seconds=30.0)
+    snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=NOW - 40)
+    result = breaker_on_tick(snap, [], now=NOW, config=cfg)
+    assert result.state is BreakerState.OPEN
+    assert result.opened_at == NOW
+    assert result.half_opened_at is None
+
+
+def test_breaker_half_open_stays_half_open_before_probe_timeout():
+    """HALF_OPEN stays HALF_OPEN before probe_timeout_seconds elapses."""
+    cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0, probe_timeout_seconds=30.0)
+    snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=NOW - 10)
+    result = breaker_on_tick(snap, [], now=NOW, config=cfg)
+    assert result.state is BreakerState.HALF_OPEN
+
+
+def test_breaker_half_open_no_half_opened_at_stays_half_open():
+    """If half_opened_at is None (legacy), don't time out — wait for event."""
+    snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=None)
+    result = breaker_on_tick(snap, [], now=NOW, config=BCFG)
+    assert result.state is BreakerState.HALF_OPEN

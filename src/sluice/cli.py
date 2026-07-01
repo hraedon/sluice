@@ -186,7 +186,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         auth_header=usage_auth_header,
     )
     gate = PermitGate(
-        initial_capacity=target,
+        initial_capacity=0,
         release_cooldown=release_cooldown,
     )
     reconcile = ReconciliationLoop(

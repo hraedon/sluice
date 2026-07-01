@@ -403,3 +403,100 @@ async def test_retry_after_seconds_fresh_not_capped():
     # resets_at = 1_001_000, now_wall = 1_000_000 → remaining = 1000
     # Fresh (ok=True) → not capped
     assert loop.retry_after_seconds() == 1000
+
+
+# --- WI-017: phantom sample timing uses held_at_fetch, not current held ---------
+
+
+async def test_phantom_sample_uses_held_at_fetch_not_current():
+    """The phantom sample must pair observed with held-at-fetch-time.
+
+    If permits are acquired during the fetch's network I/O, the current
+    gate.held will be higher than it was when the provider counted sessions.
+    Pairing the lagged observed with the post-fetch held would mask the
+    phantom (excess = observed - held_at_fetch = 5 - 3 = 2, but
+    observed - current_held = 5 - 5 = 0), causing a fail-open.
+    """
+
+    class SlowUsageClient:
+        """Usage client with a delay to simulate network I/O during fetch."""
+
+        def __init__(self, reading: UsageReading) -> None:
+            self._reading = reading
+            self.fetch_count = 0
+
+        async def fetch(self, *, now_monotonic: float) -> CachedReading:
+            self.fetch_count += 1
+            await asyncio.sleep(0.05)
+            return CachedReading(
+                reading=self._reading, fetched_at_monotonic=now_monotonic, ok=True
+            )
+
+        async def close(self) -> None:
+            pass
+
+    import asyncio
+
+    client = SlowUsageClient(_reading(concurrent_sessions=5))
+    gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0)
+    loop = ReconciliationLoop(
+        usage_client=client,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BCFG,
+        poll_interval=5.0,
+        monotonic_clock=lambda: 1000.0,
+        wall_clock=lambda: 1_000_000.0,
+    )
+
+    # Acquire 3 permits → held=3 at fetch time
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)
+
+    # Start the tick (fetch will sleep 50ms)
+    tick_task = asyncio.create_task(loop.tick())
+
+    # Let the fetch start, then acquire 2 more permits during the I/O
+    await asyncio.sleep(0.01)
+    await gate.acquire(timeout=0.1)
+    await gate.acquire(timeout=0.1)  # held is now 5
+
+    await tick_task
+
+    # With the fix: held_at_fetch=3, sample (5,3), excess=2 → phantom=2, gate=1
+    # Without the fix: held=current=5, sample (5,5), excess=0 → phantom=0, gate=3
+    assert gate.capacity == 1, (
+        f"phantom should be detected (held_at_fetch=3, observed=5 → excess=2), "
+        f"got capacity={gate.capacity}"
+    )
+
+
+# --- WI-020: HALF_OPEN → OPEN on probe timeout (integration) -----------------
+
+
+async def test_breaker_half_open_times_out_to_open():
+    """Breaker transitions from HALF_OPEN to OPEN after probe timeout."""
+    from sluice.control import BreakerState
+
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    loop._brk_cfg = BreakerConfig(
+        threshold=3, window_seconds=300.0, cooldown_seconds=60.0, probe_timeout_seconds=30.0
+    )
+
+    # Trip the breaker.
+    for _ in range(3):
+        loop.record_429()
+    await loop.tick()
+    assert gate.capacity == 0
+
+    # Advance past cooldown → half-open.
+    m[0] += 100
+    await loop.tick()
+    assert gate.capacity == 1  # half-open probe
+
+    # Advance past probe timeout without any event → back to OPEN.
+    m[0] += 40
+    await loop.tick()
+    assert gate.capacity == 0  # breaker open again
+    assert loop.breaker_state is BreakerState.OPEN
