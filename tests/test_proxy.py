@@ -11,10 +11,11 @@ import base64
 import json
 
 import httpx
+import pytest
 
 from sluice.control import BreakerConfig, ControllerConfig, UsageReading
 from sluice.gate import PermitGate
-from sluice.proxy import ProxyApp
+from sluice.proxy import ProxyApp, _is_concurrency_429
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
@@ -1374,6 +1375,35 @@ async def test_fast_fail_when_not_ready():
 # ---------------------------------------------------------------------------
 
 
+# --- unit tests for the classifier ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "retry_after, expected",
+    [
+        (None, True),
+        ("0", True),
+        ("00", True),
+        (" 0 ", True),
+        (" 0", True),
+        ("0 ", True),
+        ("-1", True),
+        ("", True),
+        ("abc", True),
+        ("60", False),
+        ("1", False),
+        (" 30 ", False),
+        ("300", False),
+    ],
+)
+def test_is_concurrency_429(retry_after, expected):
+    """The 429 classifier handles edge cases fail-safe (rule 1)."""
+    assert _is_concurrency_429(retry_after) is expected
+
+
+# --- integration tests through the proxy ------------------------------------
+
+
 async def test_concurrency_429_without_retry_after_is_recorded():
     """A 429 without retry-after (concurrency rejection) is recorded."""
 
@@ -1404,13 +1434,51 @@ async def test_rate_limit_429_with_retry_after_is_not_recorded():
     assert reconcile.total_429s == 0, "rate-limit 429s must not trip the breaker"
 
 
-async def test_429_with_retry_after_zero_is_recorded():
-    """A 429 with retry-after: 0 is a transient concurrency signal — recorded.
+@pytest.mark.parametrize("retry_after", ["0", "00", " 0 ", " 0", "0 "])
+async def test_429_with_retry_after_zero_variants_is_recorded(retry_after):
+    """A 429 with retry-after: 0 (any canonical form) is a concurrency signal.
 
     retry-after: 0 means "retry immediately," which is a concurrency rejection,
     not a rate-limit window.  The string "0" is truthy in Python, so a naive
     ``not header`` check would silently skip the breaker — fail-open.
     """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = _resp(429, json_data={"error": "overloaded"})
+        resp.headers["retry-after"] = retry_after
+        return resp
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 1, f"retry-after: {retry_after!r} must trip the breaker"
+
+
+@pytest.mark.parametrize("retry_after", ["", "abc", "-1"])
+async def test_429_with_unparseable_retry_after_is_recorded(retry_after):
+    """A 429 with an unparseable retry-after is treated as concurrency (fail safe).
+
+    Per AGENTS.md rule 1, any uncertainty must tighten the gate.  An unparseable
+    retry-after cannot be classified as a rate-limit window, so it trips the breaker.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = _resp(429, json_data={"error": "overloaded"})
+        resp.headers["retry-after"] = retry_after
+        return resp
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 1, f"unparseable retry-after: {retry_after!r} must trip the breaker (fail safe)"
+
+
+async def test_429_retry_after_forwarded_downstream():
+    """The retry-after header is forwarded to the client unchanged (cache-transparency)."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         resp = _resp(429, json_data={"error": "overloaded"})
@@ -1420,9 +1488,27 @@ async def test_429_with_retry_after_zero_is_recorded():
     app, _, reconcile = _make_app(upstream_handler=handler)
 
     async with _asgi_client(app) as client:
-        await client.post("/v1/messages", json={"prompt": "hi"})
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
 
-    assert reconcile.total_429s == 1, "retry-after: 0 must trip the breaker (concurrency signal)"
+    assert response.status_code == 429
+    assert response.headers.get("retry-after") == "0"
+    assert reconcile.total_429s == 1
+
+
+async def test_429_with_retry_after_zero_on_chat_completions_is_recorded():
+    """Both surfaces are identically gated (rule 5) — chat/completions trips too."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = _resp(429, json_data={"error": "overloaded"})
+        resp.headers["retry-after"] = "0"
+        return resp
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/chat/completions", json={"messages": []})
+
+    assert reconcile.total_429s == 1, "chat/completions must trip the breaker identically"
 
 
 # ---------------------------------------------------------------------------

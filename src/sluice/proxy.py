@@ -79,6 +79,27 @@ _STATIC_CONTENT_TYPES = {
 }
 
 
+def _is_concurrency_429(retry_after: str | None) -> bool:
+    """Classify a 429 as concurrency (trip breaker) or rate-limit (skip).
+
+    Returns True when the 429 should be recorded in the breaker.  Per
+    AGENTS.md rule 1 (fail safe), any unparseable or ambiguous value is
+    treated as a concurrency 429 — tightening the gate rather than
+    assuming a rate-limit window.
+
+    - ``None`` (no header): concurrency rejection → True
+    - ``"0"`` / ``"00"`` / ``" 0 "``: "retry immediately" → True
+    - ``"60"``: rate-limit window → False
+    - ``""`` / ``"abc"`` / ``"-1"``: unparseable → True (fail safe)
+    """
+    if retry_after is None:
+        return True
+    try:
+        return int(retry_after.strip()) <= 0
+    except (ValueError, TypeError):
+        return True
+
+
 class ProxyApp:
     """ASGI reverse proxy with concurrency gating."""
 
@@ -453,11 +474,12 @@ class ProxyApp:
                 # exhausted) do.  We inspect headers only (never the body) to
                 # classify.
                 #
-                # Edge case: retry-after: 0 means "retry immediately" — this is
-                # a transient concurrency signal, not a rate-limit window.  The
-                # string "0" is truthy in Python, so a naive ``not header``
-                # check would silently skip breaker recording (fail-open).  We
-                # explicitly treat retry-after: 0 as a concurrency 429.
+                # Edge case: retry-after: 0 (or "00", " 0 ", etc.) means
+                # "retry immediately" — a transient concurrency signal, not a
+                # rate-limit window.  The string "0" is truthy in Python, so a
+                # naive ``not header`` check would silently skip breaker
+                # recording (fail-open).  _is_concurrency_429 handles this and
+                # all other parse edge cases fail-safe.
                 #
                 # Assumption (unverified against umans API): if umans sends
                 # a non-zero retry-after on concurrency 429s, the breaker will
@@ -466,10 +488,10 @@ class ProxyApp:
                 # overload shrinks the gate regardless), but if this heuristic
                 # is wrong the breaker's fast trip is defeated.  Revisit when
                 # a real concurrency 429 is observed live.
-                if response.status_code == 429:
-                    _ra = response.headers.get("retry-after")
-                    if _ra is None or _ra == "0":
-                        self._reconcile.record_429()
+                if response.status_code == 429 and _is_concurrency_429(
+                    response.headers.get("retry-after")
+                ):
+                    self._reconcile.record_429()
 
                 try:
                     await send(
