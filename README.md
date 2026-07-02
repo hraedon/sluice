@@ -62,7 +62,13 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   (dashboard sparkline + `/history.json`), optionally persisted to SQLite
   (`--history-store`) so a restart doesn't wipe the picture of what led up to it.
 
-![sluice live dashboard: concurrency gauge against limit and hard cap, sparkline, current reading, and config](docs/dashboard.png)
+![sluice live dashboard during a deliberate fleet overload: local in-flight pinned at the limit of 4, provider-observed sessions below it, deep queue, zero 429s](docs/dashboard.png)
+
+*The dashboard mid-way through a deliberate fleet overload (~4× oversubscribed): local
+in-flight (yellow) rides the limit of 4 and never crosses it, the excess demand shows up
+as queue wait instead of provider 429s — `total_429s: 0` — and the gap between the
+provider's observed count (blue) and local truth is exactly the kind of divergence the
+reconciliation loop exists to watch.*
 
 ## Quickstart
 
