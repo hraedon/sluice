@@ -49,6 +49,16 @@ class StatusSnapshot:
     gate_closed_reason: str
     config: dict[str, Any]
 
+    # Request-window budget (umans Code Pro: limits.requests + usage.requests_in_window)
+    requests_in_window: int | None
+    requests_limit: int | None
+    requests_remaining: int | None
+    requests_hard_cap: int | None
+    requests_window_seconds: int | None
+    local_requests_in_window: int | None
+    request_window_delta: int | None
+    total_requests_forwarded: int
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "concurrent_sessions": self.concurrent_sessions,
@@ -80,6 +90,14 @@ class StatusSnapshot:
             "ready": self.ready,
             "gate_closed_reason": self.gate_closed_reason,
             "config": self.config,
+            "requests_in_window": self.requests_in_window,
+            "requests_limit": self.requests_limit,
+            "requests_remaining": self.requests_remaining,
+            "requests_hard_cap": self.requests_hard_cap,
+            "requests_window_seconds": self.requests_window_seconds,
+            "local_requests_in_window": self.local_requests_in_window,
+            "request_window_delta": self.request_window_delta,
+            "total_requests_forwarded": self.total_requests_forwarded,
         }
 
 
@@ -130,6 +148,14 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
             "provider": reconcile.provider_name,
             "controller": reconcile.controller_name,
         },
+        requests_in_window=reading.requests_in_window if reading else None,
+        requests_limit=reading.requests_limit if reading else None,
+        requests_remaining=reading.requests_remaining if reading else None,
+        requests_hard_cap=reading.requests_hard_cap if reading else None,
+        requests_window_seconds=reading.requests_window_seconds if reading else None,
+        local_requests_in_window=reconcile.local_requests_in_window,
+        request_window_delta=reconcile.request_window_delta,
+        total_requests_forwarded=reconcile.total_requests_forwarded,
     )
 
 
@@ -182,5 +208,11 @@ def to_prometheus(snap: StatusSnapshot) -> str:
         snap.gate_closed_reason,
         "open", "boxed", "breaker", "saturated",
     )
+    gauge("sluice_requests_in_window", "Provider-reported requests used in the current window", snap.requests_in_window)
+    gauge("sluice_requests_limit", "Provider request limit for the window", snap.requests_limit)
+    gauge("sluice_requests_remaining", "Provider-reported remaining requests in the window", snap.requests_remaining)
+    gauge("sluice_local_requests_in_window", "Sluice forwarded requests within the provider's window", snap.local_requests_in_window)
+    gauge("sluice_request_window_delta", "Provider requests_in_window minus sluice local count (leakage)", snap.request_window_delta)
+    gauge("sluice_total_requests_forwarded", "Total requests forwarded upstream since startup", snap.total_requests_forwarded)
 
     return "\n".join(lines) + "\n"

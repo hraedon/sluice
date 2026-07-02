@@ -54,6 +54,7 @@ log = logging.getLogger("sluice.reconcile")
 _RETRY_AFTER_STALE_CAP = 300
 _PRUNE_INTERVAL_TICKS = 60
 _DEFAULT_HISTORY_TTL = 604800.0
+_REQ_TS_MAXLEN = 10000  # safety cap for local request-timestamp deque
 
 
 class ReconciliationLoop:
@@ -99,6 +100,16 @@ class ReconciliationLoop:
             maxlen=controller_config.phantom_window
         )
         self._last_phantom_estimate = 0
+
+        # Local forwarded-request tracking for request-window reconciliation.
+        # Stores monotonic timestamps of each forwarded request; pruned to
+        # requests_window_seconds each tick so the count approximates the
+        # provider's rolling window.  Bounded by _REQ_TS_MAXLEN as a safety
+        # cap — at typical home-lab rates this is never hit.
+        self._request_timestamps: deque[float] = deque(maxlen=_REQ_TS_MAXLEN)
+        self._total_requests_forwarded = 0
+        self._last_local_requests_in_window: int | None = None
+        self._last_request_window_delta: int | None = None
 
         self._adaptive = AdaptiveSnapshot()
 
@@ -147,6 +158,18 @@ class ReconciliationLoop:
         self._truth.record_response_headers(
             headers, status, now_monotonic=now
         )
+
+    def record_request_forwarded(self) -> None:
+        """A request was forwarded upstream (permit acquired, not fast-failed).
+
+        Called by the proxy after a successful gate acquire.  The timestamp
+        is used for request-window reconciliation: comparing how many requests
+        sluice forwarded within the provider's rolling window against the
+        provider's reported ``requests_in_window``.
+        """
+        now = self._mono()
+        self._request_timestamps.append(now)
+        self._total_requests_forwarded += 1
 
     def _prune_429s(self, now: float) -> None:
         cutoff = now - self._brk_cfg.window_seconds
@@ -230,6 +253,25 @@ class ReconciliationLoop:
         self._last_reading_cached = cached
         self._last_age = age
 
+        # Request-window reconciliation: prune local timestamps to the
+        # provider's window and compute the delta against requests_in_window.
+        window_s = reading.requests_window_seconds
+        if window_s is not None:
+            cutoff = now_mono - window_s
+            while self._request_timestamps and self._request_timestamps[0] < cutoff:
+                self._request_timestamps.popleft()
+            local_count = len(self._request_timestamps)
+            self._last_local_requests_in_window = local_count
+            if cached.ok and reading.requests_in_window is not None:
+                self._last_request_window_delta = (
+                    reading.requests_in_window - local_count
+                )
+            else:
+                self._last_request_window_delta = None
+        else:
+            self._last_local_requests_in_window = None
+            self._last_request_window_delta = None
+
         if cached.ok:
             self._first_poll_ok = True
 
@@ -255,6 +297,11 @@ class ReconciliationLoop:
                 total_429s=self._total_429s,
                 queue_depth=self._gate.queue_depth,
                 queue_timeouts=self._gate.queue_timeouts,
+                requests_in_window=reading.requests_in_window if cached.ok else None,
+                requests_limit=reading.requests_limit if cached.ok else None,
+                requests_remaining=reading.requests_remaining if cached.ok else None,
+                local_requests_in_window=self._last_local_requests_in_window,
+                request_window_delta=self._last_request_window_delta,
             )
             if self._history is not None:
                 self._history.append(entry)
@@ -322,6 +369,11 @@ class ReconciliationLoop:
             total_429s=self._total_429s,
             queue_depth=self._gate.queue_depth,
             queue_timeouts=self._gate.queue_timeouts,
+            requests_in_window=reading.requests_in_window if reading else None,
+            requests_limit=reading.requests_limit if reading else None,
+            requests_remaining=reading.requests_remaining if reading else None,
+            local_requests_in_window=self._last_local_requests_in_window,
+            request_window_delta=self._last_request_window_delta,
             tick_failed=True,
         )
         if self._history is not None:
@@ -482,6 +534,29 @@ class ReconciliationLoop:
     @property
     def poll_interval(self) -> float:
         return self._poll_interval
+
+    @property
+    def total_requests_forwarded(self) -> int:
+        """Total requests forwarded upstream since startup."""
+        return self._total_requests_forwarded
+
+    @property
+    def local_requests_in_window(self) -> int | None:
+        """Requests sluice forwarded within the provider's rolling window.
+
+        None when the provider reports no request window (e.g. Code Max
+        'unlimited' plans).
+        """
+        return self._last_local_requests_in_window
+
+    @property
+    def request_window_delta(self) -> int | None:
+        """Provider's requests_in_window minus sluice's local count.
+
+        Positive = requests made outside sluice (leakage).  None when
+        the provider reports no request window or the reading is stale.
+        """
+        return self._last_request_window_delta
 
     def gate_closed_reason(self) -> str:
         """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.

@@ -61,6 +61,43 @@ def test_history_entry_to_dict_keys():
     assert d["qd"] == 0
     assert d["qt"] == 0
     assert d["err"] is False
+    assert d["rwin"] is None
+    assert d["rlim"] is None
+    assert d["rrem"] is None
+    assert d["rlw"] is None
+    assert d["rdelta"] is None
+
+
+def test_history_entry_request_window_fields():
+    e = HistoryEntry(
+        timestamp=1700000000.0,
+        concurrent_sessions=3,
+        local_in_flight=2,
+        phantom_estimate=1,
+        effective_permits=2,
+        limit=4,
+        hard_cap=8,
+        band="normal",
+        breaker="closed",
+        priority_low=False,
+        usage_age=1.5,
+        stale=False,
+        recent_429s=0,
+        total_429s=0,
+        queue_depth=0,
+        queue_timeouts=0,
+        requests_in_window=48,
+        requests_limit=200,
+        requests_remaining=152,
+        local_requests_in_window=40,
+        request_window_delta=8,
+    )
+    d = e.to_dict()
+    assert d["rwin"] == 48
+    assert d["rlim"] == 200
+    assert d["rrem"] == 152
+    assert d["rlw"] == 40
+    assert d["rdelta"] == 8
 
 
 def test_history_entry_to_dict_roundtrip():
@@ -721,3 +758,26 @@ async def test_history_records_limit_and_hard_cap():
     entry = history.entries()[0]
     assert entry.limit == 4
     assert entry.hard_cap == 8
+
+
+async def test_history_records_request_window_fields():
+    """History entries capture request-window fields from the reading."""
+    loop, client, gate, m, w, history = _make_loop_with_history(
+        _reading(
+            concurrent_sessions=2,
+            limit=4,
+            hard_cap=8,
+            requests_limit=200,
+            requests_remaining=152,
+            requests_in_window=48,
+            requests_hard_cap=400,
+            requests_window_seconds=18000,
+        )
+    )
+    await loop.tick()
+    entry = history.entries()[0]
+    assert entry.requests_in_window == 48
+    assert entry.requests_limit == 200
+    assert entry.requests_remaining == 152
+    assert entry.local_requests_in_window == 0  # no requests forwarded yet
+    assert entry.request_window_delta == 48  # provider 48 - local 0 = 48

@@ -369,6 +369,8 @@ class ProxyApp:
             )
             return
 
+        self._reconcile.record_request_forwarded()
+
         try:
             await self._forward(scope, receive, send)
         except Exception:
@@ -790,6 +792,25 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 .qspark{width:100%;height:28px;display:block;margin-top:var(--space-2)}
 .spark-qd{stroke:var(--info,var(--accent))}
 .qfill{fill:var(--info-soft,none)}
+.req-section{margin-top:var(--space-3);display:none}
+.req-head{display:flex;justify-content:space-between;align-items:baseline;font-size:var(--fs-xs);color:var(--text-3);margin-bottom:var(--space-1)}
+.req-head .req-val{color:var(--text);font-variant-numeric:tabular-nums}
+.req-head .req-remain{color:var(--ok);font-variant-numeric:tabular-nums}
+.req-head .req-remain.low{color:var(--warn)}
+.req-head .req-remain.crit{color:var(--crit)}
+.budget{position:relative;height:18px;background:var(--inset);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
+.budget-used{position:absolute;top:0;height:100%;background:var(--accent);opacity:.55;transition:width .3s}
+.budget-used.low{background:var(--warn)}
+.budget-used.crit{background:var(--crit)}
+.budget-hc{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px solid var(--crit);opacity:.5}
+.budget-lim{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--text-3);opacity:.4}
+.rspark{width:100%;height:50px;display:block;margin-top:var(--space-2)}
+.spark-rwin{stroke:var(--accent)}.spark-rlw{stroke:var(--warn);stroke-dasharray:2,1}
+.rspark-grid{stroke:var(--border);stroke-dasharray:2,2}
+.rspark-lim{stroke:var(--text-3);stroke-width:0.5;stroke-dasharray:1,1}
+.rgap{fill:var(--warn);opacity:.12}
+.rleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
+.rleg .rdelta{color:var(--warn)}
 </style>
 </head>
 <body>
@@ -833,6 +854,20 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <span><span class="dot" style="background:var(--warn)"></span> timeout</span>
       <span><span class="dot" style="background:var(--crit)"></span> 429</span>
     </div>
+    <div id="req-section" class="req-section">
+      <div class="req-head">
+        <span>Request Budget <span id="req-window" style="color:var(--text-3)"></span></span>
+        <span><span class="req-val" id="req-used">-</span> / <span id="req-limit">-</span> &middot; <span class="req-remain" id="req-remain">-</span> remaining</span>
+      </div>
+      <div class="budget" id="budget-bar"></div>
+      <svg class="rspark" id="rspark" viewBox="0 0 200 50" preserveAspectRatio="none"></svg>
+      <div class="rleg">
+        <span><span class="dot" style="background:var(--accent)"></span> provider</span>
+        <span><span class="dot" style="background:var(--warn)"></span> sluice</span>
+        <span class="rdelta" id="rdelta-text"></span>
+        <span id="rspark-info" style="color:var(--text-3)"></span>
+      </div>
+    </div>
     <div class="tip" id="spark-tip">
       <table>
         <tr><th>time</th><td id="tip-ts" colspan="5">-</td></tr>
@@ -868,7 +903,8 @@ function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocale
 
 function fromHistEntry(e){
   return {ts:e.ts,obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep,lim:e.lim,hc:e.hc,
-          band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429};
+          band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429,
+          rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta};
 }
 
 async function initHistory(){
@@ -919,7 +955,10 @@ async function doPoll(){
                ph:d.phantom_estimate,ep:d.effective_permits,
                lim:d.limit,hc:d.hard_cap,band:d.band,brk:d.breaker,
                stl:d.stale,age:d.usage_age,qd:d.queue_depth,
-               qt:d.queue_timeouts,t429:d.total_429s});
+               qt:d.queue_timeouts,t429:d.total_429s,
+               rwin:d.requests_in_window,rlim:d.requests_limit,
+               rrem:d.requests_remaining,rlw:d.local_requests_in_window,
+               rdelta:d.request_window_delta});
     if(hist.length>HIST_MAX) hist.shift();
     if(viewRange==='5m'){renderSparks();}
     else{fetchLong(false);}
@@ -1029,6 +1068,45 @@ function render(d){
   }
   // Active = anything moving
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
+  renderBudget(d);
+}
+
+function renderBudget(d){
+  var sec=document.getElementById('req-section');
+  var rlim=d.requests_limit;
+  if(rlim==null){
+    sec.style.display='none';
+    return;
+  }
+  sec.style.display='block';
+  var rwin=d.requests_in_window!=null?d.requests_in_window:0;
+  var rrem=d.requests_remaining!=null?d.requests_remaining:(rlim-rwin);
+  var rhc=d.requests_hard_cap;
+  var ws=d.requests_window_seconds;
+  var pct=Math.min(100,Math.max(0,(rwin/rlim)*100));
+  var cls='';
+  if(rwin/rlim>=0.9) cls=' crit';
+  else if(rwin/rlim>=0.75) cls=' low';
+  var h='<div class="budget-used'+cls+'" style="width:'+pct+'%"></div>';
+  if(rhc!=null&&rhc>rlim){
+    var hcP=Math.min(100,(rhc/Math.max(rhc,rlim))*100);
+    h+='<div class="budget-hc" style="left:'+hcP+'%"></div>';
+  }
+  var limP=Math.min(100,(rlim/Math.max(rhc||rlim,rlim))*100);
+  h+='<div class="budget-lim" style="left:'+limP+'%"></div>';
+  document.getElementById('budget-bar').innerHTML=h;
+  document.getElementById('req-used').textContent=rwin;
+  document.getElementById('req-limit').textContent=rlim;
+  var remEl=document.getElementById('req-remain');
+  remEl.textContent=rrem;
+  remEl.className='req-remain'+cls;
+  var wEl=document.getElementById('req-window');
+  if(ws!=null){
+    var h=Math.floor(ws/3600);
+    wEl.textContent='('+h+'h window)';
+  }else{
+    wEl.textContent='';
+  }
 }
 
 const SEV={normal:0,low:1,reject:2,boxed:3};
@@ -1042,7 +1120,8 @@ function withIncs(samples){
     var p=i>0?samples[i-1]:null;
     return {ts:s.ts,obs:s.obs,loc:s.loc,ph:s.ph,ep:s.ep,lim:s.lim,hc:s.hc,
             qd:s.qd||0,band:s.band||'normal',brk:s.brk||'closed',stl:!!s.stl,age:s.age||0,
-            qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429)};
+            qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429),
+            rwin:s.rwin,rlim:s.rlim,rrem:s.rrem,rlw:s.rlw,rdelta:s.rdelta};
   });
 }
 
@@ -1055,7 +1134,8 @@ function bucketize(samples,n){
   var k=Math.ceil(samples.length/n),out=[];
   for(var i=0;i<samples.length;i+=k){
     var b={ts:0,obs:null,loc:0,ph:0,ep:0,lim:null,hc:null,qd:0,
-           band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false};
+           band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false,
+           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null};
     for(var j=i;j<Math.min(i+k,samples.length);j++){
       var s=samples[j];
       b.ts=s.ts||b.ts;
@@ -1071,6 +1151,11 @@ function bucketize(samples,n){
       b.stl=b.stl||s.stl;
       b.qtInc=b.qtInc||s.qtInc;
       b.t429Inc=b.t429Inc||s.t429Inc;
+      if(s.rwin!=null&&(b.rwin==null||s.rwin>b.rwin)) b.rwin=s.rwin;
+      if(s.rlim!=null&&(b.rlim==null||s.rlim>b.rlim)) b.rlim=s.rlim;
+      if(s.rrem!=null) b.rrem=s.rrem;
+      if(s.rlw!=null&&(b.rlw==null||s.rlw>b.rlw)) b.rlw=s.rlw;
+      if(s.rdelta!=null&&(b.rdelta==null||s.rdelta>b.rdelta)) b.rdelta=s.rdelta;
     }
     out.push(b);
   }
@@ -1095,6 +1180,8 @@ function renderSparks(){
     svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
     document.getElementById('ribbon').innerHTML='';
     document.getElementById('qspark').innerHTML='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
+    var rs2=document.getElementById('rspark');
+    if(rs2){rs2.innerHTML='';rs2.style.display='none';}
     return;
   }
   var W=200,pad=3,H=60,QH=28;
@@ -1171,6 +1258,59 @@ function renderSparks(){
   }
   document.getElementById('qspark').innerHTML=qs;
   info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ;
+  // -- reconciliation spark: provider requests_in_window vs sluice local count
+  var rspark=document.getElementById('rspark');
+  var rinfo=document.getElementById('rspark-info');
+  var rdeltaText=document.getElementById('rdelta-text');
+  var rvalid=samples.filter(function(h){return h.rwin!=null;});
+  if(rvalid.length<2){
+    rspark.innerHTML='';
+    rspark.style.display='none';
+    rinfo.textContent='';
+    rdeltaText.textContent='';
+  }else{
+    rspark.style.display='block';
+    var RH=50,rpad=3;
+    var rlimVal=rvalid[rvalid.length-1].rlim||rvalid[rvalid.length-1].rwin||1;
+    var rmaxV=rlimVal;
+    for(var ri=0;ri<rvalid.length;ri++){
+      if(rvalid[ri].rwin>rmaxV) rmaxV=rvalid[ri].rwin;
+      if(rvalid[ri].rlw!=null&&rvalid[ri].rlw>rmaxV) rmaxV=rvalid[ri].rlw;
+    }
+    if(rmaxV<1) rmaxV=1;
+    var rspan=Math.max(denom-1,rvalid.length-1,1);
+    function rxAt(i){return rpad+(i/rspan)*(W-2*rpad);}
+    function ryFor(v){return RH-rpad-(v/rmaxV)*(RH-2*rpad);}
+    var rs='';
+    if(rlimVal>0){
+      var limY=ryFor(rlimVal).toFixed(1);
+      rs+='<line x1="'+rpad+'" y1="'+limY+'" x2="'+(W-rpad)+'" y2="'+limY+'" class="rspark-lim"/>';
+    }
+    var rwinPts=rvalid.map(function(h,i){return rxAt(i).toFixed(1)+','+ryFor(h.rwin).toFixed(1);}).join(' ');
+    rs+='<polyline points="'+rwinPts+'" fill="none" class="spark-rwin" stroke-width="1"/>';
+    var hasRlw=false;
+    for(var ri2=0;ri2<rvalid.length;ri2++){if(rvalid[ri2].rlw!=null){hasRlw=true;break;}}
+    if(hasRlw){
+      var rlwPts=rvalid.map(function(h,i){
+        var v=h.rlw!=null?h.rlw:0;
+        return rxAt(i).toFixed(1)+','+ryFor(v).toFixed(1);
+      }).join(' ');
+      rs+='<polyline points="'+rlwPts+'" fill="none" class="spark-rlw" stroke-width="1"/>';
+      var gapPts='';
+      for(var gi=0;gi<rvalid.length;gi++){
+        gapPts+=rxAt(gi).toFixed(1)+','+ryFor(rvalid[gi].rwin).toFixed(1)+' ';
+      }
+      for(var gi2=rvalid.length-1;gi2>=0;gi2--){
+        var lv=rvalid[gi2].rlw!=null?rvalid[gi2].rlw:0;
+        gapPts+=rxAt(gi2).toFixed(1)+','+ryFor(lv).toFixed(1)+' ';
+      }
+      rs+='<polygon points="'+gapPts+'" class="rgap" stroke="none"/>';
+    }
+    rspark.innerHTML=rs;
+    var curDelta=rvalid[rvalid.length-1].rdelta;
+    rdeltaText.textContent=curDelta!=null?'\u0394 '+curDelta+(curDelta>0?' (leakage)':''):'';
+    rinfo.textContent='max '+rmaxV+' · lim '+rlimVal;
+  }
 }
 
 function onSparkHover(e){

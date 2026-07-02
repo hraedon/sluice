@@ -78,19 +78,33 @@ CREATE TABLE IF NOT EXISTS history (
     t429 INTEGER NOT NULL,
     qd   INTEGER NOT NULL,
     qt   INTEGER NOT NULL,
-    err  INTEGER NOT NULL
+    err  INTEGER NOT NULL,
+    rwin INTEGER,
+    rlim INTEGER,
+    rrem INTEGER,
+    rlw  INTEGER,
+    rdelta INTEGER
 )
 """
 
 _CREATE_INDEX = "CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)"
 
+# Migration: add request-window columns to pre-existing tables.
+_MIGRATIONS = [
+    "ALTER TABLE history ADD COLUMN rwin INTEGER",
+    "ALTER TABLE history ADD COLUMN rlim INTEGER",
+    "ALTER TABLE history ADD COLUMN rrem INTEGER",
+    "ALTER TABLE history ADD COLUMN rlw INTEGER",
+    "ALTER TABLE history ADD COLUMN rdelta INTEGER",
+]
+
 _INSERT = """\
-INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, qd, qt, err)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT = """\
-SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, qd, qt, err
+SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta
 FROM history ORDER BY ts DESC, rowid DESC LIMIT ?
 """
 
@@ -117,6 +131,11 @@ class SQLiteHistoryStore:
             self._conn.execute("PRAGMA wal_autocheckpoint=1000")
             self._conn.execute(_CREATE_TABLE)
             self._conn.execute(_CREATE_INDEX)
+            for stmt in _MIGRATIONS:
+                try:
+                    self._conn.execute(stmt)
+                except Exception:
+                    pass  # column already exists
         except Exception:
             log.exception("failed to open history store at %s — store disabled", path)
             if self._conn is not None:
@@ -156,6 +175,11 @@ class SQLiteHistoryStore:
                     entry.queue_depth,
                     entry.queue_timeouts,
                     entry.tick_failed,
+                    entry.requests_in_window,
+                    entry.requests_limit,
+                    entry.requests_remaining,
+                    entry.local_requests_in_window,
+                    entry.request_window_delta,
                 ),
             )
         except Exception:
@@ -191,6 +215,11 @@ class SQLiteHistoryStore:
                 queue_depth=row[14],
                 queue_timeouts=row[15],
                 tick_failed=bool(row[16]),
+                requests_in_window=row[17] if len(row) > 17 else None,
+                requests_limit=row[18] if len(row) > 18 else None,
+                requests_remaining=row[19] if len(row) > 19 else None,
+                local_requests_in_window=row[20] if len(row) > 20 else None,
+                request_window_delta=row[21] if len(row) > 21 else None,
             )
             for row in rows
         ]

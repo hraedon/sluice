@@ -38,8 +38,13 @@ Compact field names in ``to_dict()`` (used by /history.json):
     qd   queue_depth
     qt   queue_timeouts
     err  tick_failed (true if this entry was recorded during a tick exception)
+    rwin requests_in_window
+    rlim requests_limit
+    rrem requests_remaining
+    rlw  local_requests_in_window
+    rdelta request_window_delta
     ===  ==========================
-"""
+    """
 
 from __future__ import annotations
 
@@ -72,6 +77,12 @@ class HistoryEntry:
     total_429s: int
     queue_depth: int
     queue_timeouts: int
+    # Request-window budget (None when provider reports no request limit)
+    requests_in_window: int | None = None
+    requests_limit: int | None = None
+    requests_remaining: int | None = None
+    local_requests_in_window: int | None = None
+    request_window_delta: int | None = None
     tick_failed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,6 +104,11 @@ class HistoryEntry:
             "qd": self.queue_depth,
             "qt": self.queue_timeouts,
             "err": self.tick_failed,
+            "rwin": self.requests_in_window,
+            "rlim": self.requests_limit,
+            "rrem": self.requests_remaining,
+            "rlw": self.local_requests_in_window,
+            "rdelta": self.request_window_delta,
         }
 
 

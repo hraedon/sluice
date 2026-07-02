@@ -40,6 +40,31 @@ def test_parse_basic():
     assert r.age_seconds == 0.0
 
 
+def test_parse_request_window_fields():
+    r = parse_usage(SAMPLE_PAYLOAD)
+    assert r.requests_limit == 200
+    assert r.requests_hard_cap == 400
+    assert r.requests_window_seconds == 18000
+    assert r.requests_in_window == 48
+    assert r.requests_remaining == 152
+
+
+def test_parse_request_window_absent():
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 1,
+            "priority": {"low": False, "boxed_until": None},
+        },
+    }
+    r = parse_usage(payload)
+    assert r.requests_limit is None
+    assert r.requests_hard_cap is None
+    assert r.requests_window_seconds is None
+    assert r.requests_in_window is None
+    assert r.requests_remaining is None
+
+
 def test_parse_priority_low():
     payload: dict[str, object] = {
         "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
