@@ -130,3 +130,126 @@ def test_serve_upstream_from_env(monkeypatch):
             main(["serve"])
         except (KeyboardInterrupt, SystemExit):
             pass
+
+
+# ---------------------------------------------------------------------------
+# SLUICE_LOG_LEVEL validation
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_log_level_env_falls_back(monkeypatch):
+    """An invalid SLUICE_LOG_LEVEL falls back to INFO instead of crashing."""
+    monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
+    monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
+    monkeypatch.setenv("SLUICE_LOG_LEVEL", "BOGUS")
+    monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+
+    from sluice.cli import main
+
+    with patch("uvicorn.run", side_effect=KeyboardInterrupt):
+        try:
+            main(["serve"])
+        except (KeyboardInterrupt, SystemExit):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# --singleton-guard flag precedence
+# ---------------------------------------------------------------------------
+
+
+def test_singleton_guard_flag_overrides_env(monkeypatch):
+    """The --singleton-guard flag takes precedence over the env var."""
+    monkeypatch.setenv("SLUICE_SINGLETON_GUARD", "noop")
+
+    args = _make_args(singleton_guard="kube-lease")
+    assert _resolve("singleton_guard", args) == "kube-lease"
+
+
+def test_singleton_guard_env_when_no_flag(monkeypatch):
+    """The env var is used when the flag is not set."""
+    monkeypatch.setenv("SLUICE_SINGLETON_GUARD", "kube-lease")
+
+    args = _make_args()
+    assert _resolve("singleton_guard", args) == "kube-lease"
+
+
+def test_singleton_guard_default_when_nothing_set(monkeypatch):
+    """The default is noop when neither flag nor env is set."""
+    monkeypatch.delenv("SLUICE_SINGLETON_GUARD", raising=False)
+
+    args = _make_args()
+    assert _resolve("singleton_guard", args) == "noop"
+
+
+# ---------------------------------------------------------------------------
+# IPv6 listen address parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_listen_ipv6_bracketed():
+    """[::1]:8800 parses to host=::1, port=8800."""
+    from sluice.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--listen", "[::1]:8800"])
+    assert args.listen == "[::1]:8800"
+
+
+def test_parse_listen_ipv4():
+    """0.0.0.0:8800 still works."""
+    from sluice.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--listen", "0.0.0.0:8800"])
+    assert args.listen == "0.0.0.0:8800"
+
+
+def test_listen_ipv6_bracketed_parses_host_port(monkeypatch):
+    """Verify _cmd_serve extracts host=::1 port=8800 from [::1]:8800."""
+    monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
+    monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
+    monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+
+    captured = {}
+
+    def fake_run(app, *, host, port, **kwargs):
+        captured["host"] = host
+        captured["port"] = port
+        raise KeyboardInterrupt
+
+    from sluice.cli import main
+
+    with patch("uvicorn.run", side_effect=fake_run):
+        try:
+            main(["serve", "--listen", "[::1]:8800"])
+        except (KeyboardInterrupt, SystemExit):
+            pass
+
+    assert captured["host"] == "::1"
+    assert captured["port"] == 8800
+
+
+def test_listen_ipv4_parses_host_port(monkeypatch):
+    """Verify _cmd_serve extracts host=0.0.0.0 port=8800 from 0.0.0.0:8800."""
+    monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
+    monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
+    monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+
+    captured = {}
+
+    def fake_run(app, *, host, port, **kwargs):
+        captured["host"] = host
+        captured["port"] = port
+        raise KeyboardInterrupt
+
+    from sluice.cli import main
+
+    with patch("uvicorn.run", side_effect=fake_run):
+        try:
+            main(["serve", "--listen", "0.0.0.0:8800"])
+        except (KeyboardInterrupt, SystemExit):
+            pass
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 8800

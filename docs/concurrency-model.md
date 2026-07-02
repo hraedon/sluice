@@ -180,3 +180,30 @@ Closing the window entirely would require a non-blocking `receive()` poll (which
 spec does not provide) or a more complex two-channel design. The cost of the fix exceeds
 the benefit of closing a window whose consequence is one wasted `send()`. The current
 behaviour is pinned by `test_body_done_disconnect_watcher_handoff` in `tests/test_proxy.py`.
+
+## 9. Multi-provider: reduced guarantee off umans
+
+sluice supports four providers via the `--provider` flag: `umans` (default),
+`anthropic`, `openai`, and `generic`. Each bundles a truth source and a
+controller strategy (see `sluice.providers`).
+
+**`umans`** uses the `concurrency_reconcile` controller — the full truth-based
+model described in §1–§5. It polls `/v1/usage` for `concurrent_sessions`, which
+is ground truth including phantoms. This is what makes phantom absorption
+(§5) possible: when the provider sees more sessions than sluice holds, the gate
+shrinks to let the phantoms age out.
+
+**Anthropic, OpenAI, and generic** use the `adaptive` (AIMD) controller. These
+providers have no concurrency ground-truth endpoint — there is no
+`/v1/usage`-equivalent that reports in-flight sessions. sluice can only react
+to 429s and parse ratelimit headers (Anthropic/OpenAI); the `generic` provider
+has no external truth at all and runs purely off local signals (breaker state,
+429 counts). AIMD multiplicatively decreases permits on 429 and additively
+increases on success, but it cannot absorb phantoms because it has no way to
+observe them.
+
+The fail-safe guarantee (§3, AGENTS.md rule 1) still holds: uncertainty
+tightens the gate. But precision is reduced off umans — sluice reacts to
+429s *after* they happen rather than preventing them via ground-truth
+reconciliation. Phantom absorption is umans-specific and requires
+`concurrent_sessions` from `/v1/usage`.

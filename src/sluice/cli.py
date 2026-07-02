@@ -50,6 +50,7 @@ _DEFAULTS: dict[str, Any] = {
     "history_size": 2880,
     "history_store": None,
     "history_ttl": 604800.0,
+    "singleton_guard": "noop",
 }
 
 
@@ -123,6 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--history-size", type=int, default=None, help="number of tick snapshots to retain for trend analysis (default: 2880, ~4h at 5s poll; 0 disables)")
     serve.add_argument("--history-store", default=None, help="path to SQLite file for history persistence (default: none — in-memory only). Survives restarts; enables crash forensics.")
     serve.add_argument("--history-ttl", type=float, default=None, help="seconds to retain entries in the SQLite store before pruning (default: 604800 = 7 days)")
+    serve.add_argument("--singleton-guard", default=None, choices=["noop", "kube-lease"], help="singleton guard mode (default: noop; env: SLUICE_SINGLETON_GUARD)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -165,6 +167,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     usage_key_env = _resolve("usage_key_env", args)
     usage_auth_header = _resolve("usage_auth_header", args)
     log_level = _resolve("log_level", args)
+    resolved_level = getattr(logging, log_level.upper(), None) if isinstance(log_level, str) else None
+    if not isinstance(resolved_level, int):
+        log.warning("invalid log level %r — falling back to INFO", log_level)
+        log_level = "INFO"
+    else:
+        log_level = log_level.upper()
     admin_token = _resolve("admin_token", args)
     reserve_raw = _resolve("reserve", args)
     history_size = _resolve("history_size", args)
@@ -197,14 +205,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     usage_key = os.environ.get(usage_key_env) or ""
 
-    host, _, port_str = listen.rpartition(":")
+    if listen.startswith("["):
+        host, _, port_str = listen.rpartition("]")
+        host = host.lstrip("[")
+        port_str = port_str.lstrip(":")
+    else:
+        host, _, port_str = listen.rpartition(":")
+        host = host.strip("[]")
     if not host or not port_str:
         print(f"sluice: error: --listen must be host:port, got '{listen}'", file=sys.stderr)
         return 2
     port = int(port_str)
 
     guard: SingletonGuard
-    guard_mode = os.environ.get(_ENV_PREFIX + "SINGLETON_GUARD", "noop")
+    guard_mode = _resolve("singleton_guard", args) or "noop"
     if guard_mode == "kube-lease":
         pod_name = os.environ.get("POD_NAME", "sluice")
         pod_ns = os.environ.get("POD_NAMESPACE", "default")
@@ -223,11 +237,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print("       set it to the API key used for /v1/usage polling", file=sys.stderr)
         return 2
 
+    adaptive_config = AdaptiveConfig(target=target) if provider.controller == "adaptive" else None
+
     truth_source = make_truth_source(
         provider,
         base_url=upstream,
         api_key=usage_key,
         auth_header=usage_auth_header,
+        fresh_ttl=adaptive_config.fresh_ttl if adaptive_config is not None else AdaptiveConfig.fresh_ttl,
     )
 
     gate = PermitGate(
@@ -259,7 +276,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         poll_interval=poll_interval,
         guard=guard,
         controller=provider.controller,
-        adaptive_config=AdaptiveConfig(target=target) if provider.controller == "adaptive" else None,
+        adaptive_config=adaptive_config,
         history=history,
         history_store=history_store,
         history_ttl=history_ttl,
@@ -299,7 +316,13 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port, log_level=log_level.lower())
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        timeout_graceful_shutdown=30,
+    )
     return 0
 
 

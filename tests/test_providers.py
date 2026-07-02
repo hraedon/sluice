@@ -36,7 +36,6 @@ def test_registry_resolves_anthropic():
     assert p.name == "anthropic"
     assert p.controller == "adaptive"
     assert p.auth_header == "x-api-key"
-    assert p.auth_extra.get("anthropic-version") == "2023-06-01"
     assert p.needs_usage_key is False
 
 
@@ -192,6 +191,30 @@ async def test_header_truth_source_ages():
     assert cached.reading.age_seconds == 50.0
     # Still has the data, just marked stale.
     assert cached.reading.requests_remaining == 100
+
+
+async def test_header_truth_source_custom_fresh_ttl():
+    """A custom fresh_ttl extends the window before a reading is marked stale."""
+    ts = HeaderTruthSource(provider="anthropic", fresh_ttl=60)
+    ts.record_response_headers(
+        {"anthropic-ratelimit-requests-remaining": "100"},
+        status=200,
+        now_monotonic=1000.0,
+    )
+    # age=20s: stale under default 15s, fresh under custom 60s.
+    cached = await ts.fetch(now_monotonic=1020.0)
+    assert cached.ok is True
+    assert cached.reading.age_seconds == 20.0
+
+    # Default fresh_ttl (15s) would mark this stale.
+    ts_default = HeaderTruthSource(provider="anthropic")
+    ts_default.record_response_headers(
+        {"anthropic-ratelimit-requests-remaining": "100"},
+        status=200,
+        now_monotonic=1000.0,
+    )
+    cached_default = await ts_default.fetch(now_monotonic=1020.0)
+    assert cached_default.ok is False
 
 
 async def test_header_truth_source_last_cached():

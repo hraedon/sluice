@@ -339,7 +339,10 @@ class KubeLeaseGuard(SingletonGuard):
         while True:
             try:
                 await asyncio.sleep(self._renew_interval)
-                await self.renew()
+                if self._held:
+                    await self.renew()
+                else:
+                    await self.acquire()
             except asyncio.CancelledError:
                 raise
             except Exception:

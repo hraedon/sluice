@@ -343,22 +343,36 @@ async def run_soak(duration: float, n_streamers: int) -> int:
     from sluice.usage import CachedReading
 
     class _SoakUsageClient:
-        """Usage client that returns a healthy reading."""
+        """TruthSource that returns a healthy reading for soak testing."""
+        def __init__(self) -> None:
+            self._cached: CachedReading | None = None
+
         async def fetch(self, *, now_monotonic: float) -> CachedReading:
-            return CachedReading(
+            self._cached = CachedReading(
                 reading=UsageReading(
                     concurrent_sessions=0, limit=4, hard_cap=8
                 ),
                 fetched_at_monotonic=now_monotonic,
                 ok=True,
             )
+            return self._cached
+
+        @property
+        def last_cached(self) -> CachedReading | None:
+            return self._cached
+
         async def close(self) -> None:
+            pass
+
+        def record_response_headers(
+            self, headers: dict[str, str], status: int, *, now_monotonic: float
+        ) -> None:
             pass
 
     gate = PermitGate(initial_capacity=3, release_cooldown=0.5)
     usage = _SoakUsageClient()
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,
         gate=gate,
         controller_config=ControllerConfig(target=3),
         breaker_config=BreakerConfig(threshold=10, cooldown_seconds=2.0),

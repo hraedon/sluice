@@ -593,3 +593,40 @@ async def test_concurrent_429_during_tick_does_not_lose_event():
     assert gate.capacity == 0, (
         f"gate should be closed when breaker is OPEN, got capacity={gate.capacity}"
     )
+
+
+# --- retry_after_seconds uses math.ceil (not int truncation) -------------------
+
+
+async def test_retry_after_seconds_boxed_uses_ceil():
+    """ceil(resets_at - now) must round up, not truncate.
+
+    resets_at - now_wall = 30.9 → int() gives 30, math.ceil() gives 31.
+    """
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            concurrent_sessions=0,
+            boxed_until_epoch=1_000_030.9,
+            resets_at_epoch=1_000_030.9,
+        )
+    )
+    await loop.tick()
+    assert loop.retry_after_seconds() == 31
+
+
+async def test_retry_after_seconds_breaker_uses_ceil():
+    """Breaker cooldown_remaining is ceiled, not truncated."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    loop._brk_cfg = BreakerConfig(
+        threshold=3, window_seconds=300.0, cooldown_seconds=60.0
+    )
+
+    await loop.tick()
+    for _ in range(3):
+        loop.record_429()
+    await loop.tick()
+
+    # Advance 29.5s → cooldown_remaining = 60 - 29.5 = 30.5 → ceil = 31
+    m[0] += 29.5
+    ra = loop.retry_after_seconds()
+    assert ra == 31

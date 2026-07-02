@@ -305,3 +305,28 @@ async def test_reserve_resize_does_not_break_invariant():
     assert await gate.acquire(timeout=0.01, reserved=False) is False
     # Reserved: can use the reserved slot
     assert await gate.acquire(timeout=0.1, reserved=True) is True
+
+
+async def test_release_double_release_reserved_no_negative():
+    """Double-release with reserved=True must not drive counters negative."""
+    gate = PermitGate(initial_capacity=2, reserve=1)
+
+    await gate.acquire(timeout=0.1, reserved=False)
+    await gate.acquire(timeout=0.1, reserved=True)
+    await gate.release(reserved=False)
+    await gate.release(reserved=True)
+    assert gate.held == 0
+    assert gate.held_reserved == 0
+
+    await gate.release(reserved=True)
+    assert gate.held >= 0
+    assert gate.held_reserved >= 0
+
+
+async def test_acquire_timeout_zero_fast_path():
+    """timeout <= 0 returns False immediately when no permit is available."""
+    gate = PermitGate(initial_capacity=1)
+
+    assert await gate.acquire(timeout=0.1) is True
+    assert await gate.acquire(timeout=0) is False
+    assert gate.held == 1

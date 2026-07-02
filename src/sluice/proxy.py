@@ -453,6 +453,11 @@ class ProxyApp:
                     await entry_task
                 except (asyncio.CancelledError, Exception):
                     pass
+                finally:
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
                 return
 
             # Entry completed (or raised) — cancel the disconnect wait.
@@ -468,17 +473,16 @@ class ProxyApp:
             response = entry_task.result()
 
             try:
-                # WI-014: disconnect may have occurred during body upload
-                # (body_stream returned early after setting disconnect).
-                if disconnect.is_set():
-                    return
-
-                # 429 is an upstream signal — but only concurrency 429s should
-                # trip the breaker (WI-019).  Heuristic: concurrency 429s (the
-                # kind that accumulate toward the box) do not include a
-                # retry-after header; rate-limit 429s (request-count window
-                # exhausted) do.  We inspect headers only (never the body) to
-                # classify.
+                # 429 and rate-limit headers must be recorded before the
+                # disconnect check — the upstream signal is the same whether
+                # or not the client is still connected, and dropping it would
+                # prevent the breaker from tripping (WI-019 fail-open).
+                #
+                # Only concurrency 429s should trip the breaker (WI-019).
+                # Heuristic: concurrency 429s (the kind that accumulate toward
+                # the box) do not include a retry-after header; rate-limit 429s
+                # (request-count window exhausted) do.  We inspect headers only
+                # (never the body) to classify.
                 #
                 # Edge case: retry-after: 0 (or "00", " 0 ", etc.) means
                 # "retry immediately" — a transient concurrency signal, not a
@@ -506,6 +510,11 @@ class ProxyApp:
                 self._reconcile.record_response_headers(
                     dict(response.headers), response.status_code
                 )
+
+                # WI-014: disconnect may have occurred during body upload
+                # (body_stream returned early after setting disconnect).
+                if disconnect.is_set():
+                    return
 
                 try:
                     await send(
