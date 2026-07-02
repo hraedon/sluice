@@ -69,14 +69,14 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   Legend entries and every Reading/Config row carry hover explanations
   (native tooltips) of what the value means.
 
-![sluice live dashboard during a deliberate fleet overload: local in-flight pinned at the limit of 4, provider-observed sessions below it, deep queue, zero 429s](docs/dashboard.png)
+![sluice live dashboard under real team load: local in-flight repeatedly touching the effective-permits line of 4, queue depth rising to 3 behind it, zero 429s](docs/dashboard.png)
 
-*The dashboard mid-way through a deliberate fleet overload (~4× oversubscribed): local
-in-flight (yellow) rides the limit of 4 and never crosses it, the excess demand shows up
-as queue wait instead of provider 429s — `total_429s: 0` — and the gap between the
-provider's observed count (blue) and local truth is exactly the kind of divergence the
-reconciliation loop exists to watch. (Screenshot predates the 2026-07 full-width chart
-layout; the series and semantics are unchanged.)*
+*The dashboard under real team load: local in-flight (yellow) repeatedly touches the
+effective-permits line of 4 and never crosses it, the excess demand shows up as queue
+wait (depth up to 3, `9.71s avg / 20.11s p95`) instead of provider 429s —
+`total_429s: 0`, `queue_timeouts: 0` — and the gap between the provider's observed
+count (blue) and local truth is exactly the kind of divergence the reconciliation loop
+exists to watch.*
 
 ## Quickstart
 
