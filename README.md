@@ -52,6 +52,11 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   until `resets_at`, instead of hammering a locked account toward a longer pause.
 - **Both API surfaces.** Transparent streaming passthrough for the Anthropic
   (`/v1/messages`) and OpenAI (`/v1/chat/completions`) routes.
+- **Remembers the trend.** Every tick lands in a bounded in-memory history
+  (dashboard sparkline + `/history.json`), optionally persisted to SQLite
+  (`--history-store`) so a restart doesn't wipe the picture of what led up to it.
+
+![sluice live dashboard: concurrency gauge against limit and hard cap, sparkline, current reading, and config](docs/dashboard.png)
 
 ## Quickstart
 

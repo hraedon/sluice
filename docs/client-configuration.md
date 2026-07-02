@@ -1,5 +1,9 @@
 # Configuring clients to route through sluice
 
+> **Note:** the `sluice.k8s.hraedon.com` URLs throughout this document are the author's
+> own deployment, kept concrete as a worked example. Substitute wherever your sluice
+> instance is reachable (e.g. `http://127.0.0.1:8800` for a local run).
+
 sluice only works if **every** client points at it instead of at umans directly. The
 concurrency invariant is account-wide; a single client that still talks to
 `api.code.umans.ai` is invisible to sluice and silently breaks the global count — that one
