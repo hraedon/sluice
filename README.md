@@ -63,8 +63,11 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   (`--history-store`) so a restart doesn't wipe the picture of what led up to it.
   Depth and retention are tunable (`--history-size`, default 2880 ticks ≈ 4h at the
   5s cadence; `--history-ttl` for the SQLite store, default 7 days).
-  The dashboard renders it at 5m/1h/4h ranges: concurrency series, queue depth,
-  a band ribbon, and tick marks where queue timeouts or 429s actually happened.
+  The dashboard renders it at 5m/1h/4h ranges: a full-width concurrency chart,
+  queue depth, a band ribbon, and tick marks where queue timeouts or 429s
+  actually happened, with the Reading and Config tables side by side below.
+  Legend entries and every Reading/Config row carry hover explanations
+  (native tooltips) of what the value means.
 
 ![sluice live dashboard during a deliberate fleet overload: local in-flight pinned at the limit of 4, provider-observed sessions below it, deep queue, zero 429s](docs/dashboard.png)
 
@@ -72,7 +75,8 @@ sluice is that shared choke point, and it closes the loop against upstream truth
 in-flight (yellow) rides the limit of 4 and never crosses it, the excess demand shows up
 as queue wait instead of provider 429s — `total_429s: 0` — and the gap between the
 provider's observed count (blue) and local truth is exactly the kind of divergence the
-reconciliation loop exists to watch.*
+reconciliation loop exists to watch. (Screenshot predates the 2026-07 full-width chart
+layout; the series and semantics are unchanged.)*
 
 ## Quickstart
 

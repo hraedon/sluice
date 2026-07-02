@@ -763,7 +763,7 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 .gl .gl-limit{color:var(--accent)}
 .gl .gl-hardcap{color:var(--crit)}
 .card{position:relative}
-.spark{width:100%;height:60px;display:block}
+.spark{width:100%;height:240px;display:block}
 .sleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
 .sleg span{display:flex;align-items:center;gap:var(--space-1)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
@@ -789,7 +789,9 @@ font-family:var(--font-mono);font-size:var(--fs-xs);padding:0 var(--space-2);
 border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing:0}
 .rbtn:hover,.rbtn.active{border-color:var(--accent);color:var(--accent)}
 .ribbon{width:100%;height:4px;display:block;margin-top:2px}
-.qspark{width:100%;height:28px;display:block;margin-top:var(--space-2)}
+.qspark{width:100%;height:56px;display:block;margin-top:var(--space-2)}
+.help{cursor:help;text-decoration:underline dotted;text-decoration-color:var(--border-2);text-underline-offset:3px}
+.sleg span[title],.rleg span[title]{cursor:help}
 .spark-qd{stroke:var(--info,var(--accent))}
 .qfill{fill:var(--info-soft,none)}
 .req-section{margin-top:var(--space-3);display:none}
@@ -804,7 +806,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 .budget-used.crit{background:var(--crit)}
 .budget-hc{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px solid var(--crit);opacity:.5}
 .budget-lim{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--text-3);opacity:.4}
-.rspark{width:100%;height:50px;display:block;margin-top:var(--space-2)}
+.rspark{width:100%;height:64px;display:block;margin-top:var(--space-2)}
 .spark-rwin{stroke:var(--accent)}.spark-rlw{stroke:var(--warn);stroke-dasharray:2,1}
 .rspark-grid{stroke:var(--border);stroke-dasharray:2,2}
 .rspark-lim{stroke:var(--text-3);stroke-width:0.5;stroke-dasharray:1,1}
@@ -842,17 +844,17 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
         <button class="rbtn" id="r-1h" onclick="setRange('1h')">1h</button>
         <button class="rbtn" id="r-4h" onclick="setRange('4h')">4h</button>
       </span></h2>
-    <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="60"/></svg>
+    <svg class="spark" id="spark" viewBox="0 0 200 120" preserveAspectRatio="none"><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/></svg>
     <svg class="ribbon" id="ribbon" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
     <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/></svg>
     <div class="sleg">
-      <span><span class="dot" style="background:var(--accent)"></span> observed</span>
-      <span><span class="dot" style="background:var(--warn)"></span> local</span>
-      <span><span class="dot" style="background:var(--text-3)"></span> phantom</span>
-      <span><span class="dash" style="border-top-color:var(--ok)"></span> effective</span>
-      <span><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
-      <span><span class="dot" style="background:var(--warn)"></span> timeout</span>
-      <span><span class="dot" style="background:var(--crit)"></span> 429</span>
+      <span title="concurrent_sessions from the provider usage endpoint - ground truth, includes phantoms"><span class="dot" style="background:var(--accent)"></span> observed</span>
+      <span title="local_in_flight - requests sluice is holding a permit for"><span class="dot" style="background:var(--warn)"></span> local</span>
+      <span title="phantom_estimate - sustained provider-observed excess over local; only drawn when above zero"><span class="dot" style="background:var(--text-3)"></span> phantom</span>
+      <span title="effective_permits - the controller ceiling, drawn as a step line"><span class="dash" style="border-top-color:var(--ok)"></span> effective</span>
+      <span title="queue_depth on the lower spark, on its own scale"><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
+      <span title="tick where queue_timeouts incremented between samples"><span class="dot" style="background:var(--warn)"></span> timeout</span>
+      <span title="tick where total_429s incremented between samples"><span class="dot" style="background:var(--crit)"></span> 429</span>
     </div>
     <div id="req-section" class="req-section">
       <div class="req-head">
@@ -862,9 +864,9 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <div class="budget" id="budget-bar"></div>
       <svg class="rspark" id="rspark" viewBox="0 0 200 50" preserveAspectRatio="none"></svg>
       <div class="rleg">
-        <span><span class="dot" style="background:var(--accent)"></span> provider</span>
-        <span><span class="dot" style="background:var(--warn)"></span> sluice</span>
-        <span class="rdelta" id="rdelta-text"></span>
+        <span title="requests_in_window as reported by the provider"><span class="dot" style="background:var(--accent)"></span> provider</span>
+        <span title="requests sluice itself forwarded within the provider window"><span class="dot" style="background:var(--warn)"></span> sluice</span>
+        <span class="rdelta" id="rdelta-text" title="provider count minus sluice count; positive means requests reached the provider outside sluice"></span>
         <span id="rspark-info" style="color:var(--text-3)"></span>
       </div>
     </div>
@@ -878,12 +880,12 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       </table>
     </div>
   </div>
+</div>
+<div class="row">
   <div class="card">
     <h2>Reading</h2>
     <table id="stats"></table>
   </div>
-</div>
-<div class="row">
   <div class="card">
     <h2>Config</h2>
     <table id="config-table"></table>
@@ -1017,39 +1019,51 @@ function render(d){
     document.getElementById('gauge-labels').innerHTML=
       '<span>0</span><span class="gl-limit">limit='+limit+'</span><span class="gl-hardcap">hard_cap='+hc+'</span>';
   }
-  // Stats table
+  // Stats table — third element is the hover explanation (title attribute)
   var rows=[
-    ['band',d.band],['effective_permits',d.effective_permits],
-    ['concurrent_sessions',obs],['local_in_flight',loc],
-    ['cooling_down',d.cooling_down],
-    ['phantom_estimate',d.phantom_estimate],
-    ['breaker',d.breaker],
+    ['band',d.band,'Provider enforcement band: normal, low (deprioritized), reject, or boxed'],
+    ['effective_permits',d.effective_permits,'Permits the controller currently grants: target minus phantom absorption and band/breaker backoff'],
+    ['concurrent_sessions',obs,'Sessions the provider reports as running - ground truth, includes phantoms sluice cannot see'],
+    ['local_in_flight',loc,'Requests sluice is holding a permit for right now'],
+    ['cooling_down',d.cooling_down,'Recently released permits still cooling down before they can be re-acquired'],
+    ['phantom_estimate',d.phantom_estimate,'Sustained excess of provider-observed sessions over local in-flight (windowed min) - sessions the provider still counts but sluice is not running'],
+    ['breaker',d.breaker,'Circuit breaker on upstream 429s: closed (normal), open (backing off), half_open (probing)'],
     ['breaker_half_open_age',
       d.breaker_half_open_age_seconds!=null
         ? d.breaker_half_open_age_seconds+'s'
-        : null],
-    ['recent_429s',d.recent_429s],
-    ['total_429s',d.total_429s],['queue_depth',d.queue_depth],
-    ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95'],
-    ['queue_timeouts',d.queue_timeouts],
-    ['gate_closed',d.gate_closed_reason],['ready',d.ready],
-    ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':'')],
+        : null,
+      'Seconds since the breaker went half_open and began probing'],
+    ['recent_429s',d.recent_429s,'Upstream 429s within the breaker window'],
+    ['total_429s',d.total_429s,'Upstream 429s since startup'],
+    ['queue_depth',d.queue_depth,'Requests currently waiting for a permit'],
+    ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95','Wait time of recently granted requests that had to queue: mean and 95th percentile'],
+    ['queue_timeouts',d.queue_timeouts,'Requests that gave up waiting for a permit, since startup'],
+    ['gate_closed',d.gate_closed_reason,'Why the gate refuses new work: open means it is not closed; otherwise boxed, breaker, or saturated'],
+    ['ready',d.ready,'True once the first usage poll succeeded and this instance holds the singleton lock'],
+    ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':''),'Age of the newest usage reading; stale means the last poll failed'],
   ];
+  function kvRow(r){
+    var t=r[2]?' class="help" title="'+esc(r[2])+'"':'';
+    return '<tr><th'+t+'>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';
+  }
   document.getElementById('stats').innerHTML=rows
     .filter(function(r){return r[1]!=null;})
-    .map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
+    .map(kvRow).join('');
   // Config table
   var c=d.config||{};
   var crows=[
-    ['target',c.target],['min_floor',c.min_floor],
-    ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null],
-    ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null],
-    ['phantom_window',c.phantom_window],
-    ['breaker_threshold',c.breaker_threshold],
-    ['breaker_window',c.breaker_window_seconds!=null?c.breaker_window_seconds+'s':null],
-    ['breaker_cooldown',c.breaker_cooldown_seconds!=null?c.breaker_cooldown_seconds+'s':null],
+    ['target',c.target,'Steady-state concurrency sluice aims to keep in flight'],
+    ['min_floor',c.min_floor,'Effective permits never drop below this'],
+    ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null,'How often the provider usage endpoint is polled'],
+    ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null,'Maximum age of a usage reading before the controller stops trusting it'],
+    ['phantom_window',c.phantom_window,'Number of polls in the windowed-min phantom estimate; higher is slower but surer absorption'],
+    ['breaker_threshold',c.breaker_threshold,'Recent 429s that trip the breaker open'],
+    ['breaker_window',c.breaker_window_seconds!=null?c.breaker_window_seconds+'s':null,'Sliding window over which recent 429s are counted'],
+    ['breaker_cooldown',c.breaker_cooldown_seconds!=null?c.breaker_cooldown_seconds+'s':null,'How long the breaker stays open before probing half_open'],
+    ['provider',c.provider,'Usage-truth provider adapter in use'],
+    ['controller',c.controller,'Permit controller strategy in use'],
   ].filter(function(r){return r[1]!=null;});
-  document.getElementById('config-table').innerHTML=crows.map(function(r){return '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';}).join('');
+  document.getElementById('config-table').innerHTML=crows.map(kvRow).join('');
   // Banners
   var bb=document.getElementById('banner-boxed');
   if(d.band==='boxed'){
@@ -1177,14 +1191,14 @@ function renderSparks(){
     : viewRange+' · '+raw.length+' ticks';
   info.textContent=infoBase;
   if(valid.length<2){
-    svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
+    svg.innerHTML='<text x="100" y="62" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
     document.getElementById('ribbon').innerHTML='';
     document.getElementById('qspark').innerHTML='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
     var rs2=document.getElementById('rspark');
     if(rs2){rs2.innerHTML='';rs2.style.display='none';}
     return;
   }
-  var W=200,pad=3,H=60,QH=28;
+  var W=200,pad=3,H=120,QH=28;
   var span=Math.max(denom-1,valid.length-1,1);
   function xAt(i){return pad+(i/span)*(W-2*pad);}
   function yFor(v){return H-pad-(v/maxV)*(H-2*pad);}
@@ -1227,12 +1241,12 @@ function renderSparks(){
   // Breaker / stale tick marks at the top of the spark
   for(var b=0;b<valid.length;b++){
     var x=xAt(b).toFixed(1);
-    if(valid[b].brk==='open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="8" class="tick-brk-open" stroke-width="1.5"/>';
-    else if(valid[b].brk==='half_open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="5" class="tick-brk-half" stroke-width="1.2"/>';
-    else if(valid[b].stl) s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="4" class="tick-stale" stroke-width="1"/>';
+    if(valid[b].brk==='open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="13" class="tick-brk-open" stroke-width="1.5"/>';
+    else if(valid[b].brk==='half_open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="8" class="tick-brk-half" stroke-width="1.2"/>';
+    else if(valid[b].stl) s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="6" class="tick-stale" stroke-width="1"/>';
   }
   // Keep crosshair line on top and off-canvas by default
-  s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="60"/>';
+  s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/>';
   svg.innerHTML=s;
   // -- band ribbon: one segment per non-normal sample
   var rb='';

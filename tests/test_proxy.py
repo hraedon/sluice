@@ -720,6 +720,44 @@ async def test_dashboard_sparkline_depth_elements():
     assert "crosshair" in html
 
 
+async def test_dashboard_layout_and_help_titles():
+    """Full-width sparkline layout + hover explanations.
+
+    The sparkline card sits in its own row (its height is no longer coupled to
+    the Reading table), Reading and Config share the row below it, and the
+    legend / Reading / Config entries carry title-attribute explanations with
+    the .help affordance.
+    """
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    html = response.text
+    # Order: gauge, then spark card, then Reading, then Config.
+    gauge_at = html.index("Concurrency Gauge")
+    spark_at = html.index('id="spark-card"')
+    reading_at = html.index("<h2>Reading</h2>")
+    config_at = html.index("<h2>Config</h2>")
+    assert gauge_at < spark_at < reading_at < config_at
+    # Reading and Config share a row: no row boundary between them.
+    assert '<div class="row">' not in html[reading_at:config_at]
+    # The spark card's row closes before Reading opens (spark is alone in it).
+    assert '<div class="row">' in html[spark_at:reading_at]
+    # Taller main spark: 120-unit viewBox and matching crosshair extent.
+    assert 'viewBox="0 0 200 120"' in html
+    # Legend hover explanations.
+    assert 'title="concurrent_sessions from the provider usage endpoint' in html
+    assert 'title="effective_permits - the controller ceiling' in html
+    # Reading/Config rows render title attributes via the shared kvRow helper.
+    assert "kvRow" in html
+    assert 'class="help" title=' in html
+    assert "'Requests currently waiting for a permit'" in html
+    # Config now surfaces provider/controller (present in the payload all along).
+    assert "['provider',c.provider," in html
+    assert "['controller',c.controller," in html
+
+
 async def test_static_css_served():
     """GET /static/css/tokens.css serves the vendored patina tokens."""
     app, _, _ = _make_app()
