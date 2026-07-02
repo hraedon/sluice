@@ -630,3 +630,85 @@ async def test_retry_after_seconds_breaker_uses_ceil():
     m[0] += 29.5
     ra = loop.retry_after_seconds()
     assert ra == 31
+
+
+# --- request-window tracking & reconciliation -------------------------------
+
+
+async def test_record_request_forwarded_increments_counter():
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.total_requests_forwarded == 0
+
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+    assert loop.total_requests_forwarded == 2
+
+
+async def test_request_window_reconciliation():
+    """Local count is pruned to the provider's window; delta is computed."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            concurrent_sessions=0,
+            requests_limit=200,
+            requests_in_window=50,
+            requests_remaining=150,
+            requests_window_seconds=100,
+        )
+    )
+
+    # Forward 10 requests at t=1000.
+    for _ in range(10):
+        loop.record_request_forwarded()
+    await loop.tick()
+
+    assert loop.local_requests_in_window == 10
+    assert loop.request_window_delta == 40  # provider 50 - local 10
+
+    # Advance past the window — local timestamps should be pruned to 0.
+    m[0] += 200  # window is 100s, so all are now outside
+    client.set_reading(
+        _reading(
+            concurrent_sessions=0,
+            requests_limit=200,
+            requests_in_window=5,
+            requests_remaining=195,
+            requests_window_seconds=100,
+        )
+    )
+    await loop.tick()
+
+    assert loop.local_requests_in_window == 0
+    assert loop.request_window_delta == 5  # provider 5 - local 0
+
+
+async def test_request_window_no_window_seconds():
+    """Without requests_window_seconds, local count and delta are None."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=0, requests_limit=200)
+    )
+    loop.record_request_forwarded()
+    await loop.tick()
+
+    assert loop.local_requests_in_window is None
+    assert loop.request_window_delta is None
+
+
+async def test_request_window_delta_stale_reading():
+    """Delta is None when the reading is stale (ok=False)."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            concurrent_sessions=0,
+            requests_limit=200,
+            requests_in_window=50,
+            requests_window_seconds=100,
+        )
+    )
+    await loop.tick()
+    assert loop.request_window_delta == 50  # provider 50 - local 0
+
+    # Make the next fetch fail — delta should be None (stale reading).
+    client.set_fail(True)
+    m[0] += 5
+    await loop.tick()
+    assert loop.request_window_delta is None

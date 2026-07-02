@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 
@@ -46,6 +47,16 @@ def _parse_iso_to_epoch(value: str | None) -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def _safe_int_or_none(value: Any) -> int | None:
+    """Parse a value as int, returning None if missing or unparseable."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
 
 
 def parse_usage(data: dict[str, object]) -> UsageReading:
@@ -82,6 +93,17 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
         boxed_until_epoch = _parse_iso_to_epoch(priority.get("boxed_until"))
         resets_at_epoch = _parse_iso_to_epoch(priority.get("resets_at"))
 
+        # Request-window fields (umans Code Pro: limits.requests + usage.requests_in_window).
+        # These are optional — Code Max reports "unlimited" with no requests block.
+        requests_block = limits.get("requests")
+        if not isinstance(requests_block, dict):
+            requests_block = {}
+        requests_limit = _safe_int_or_none(requests_block.get("limit"))
+        requests_hard_cap = _safe_int_or_none(requests_block.get("hard_cap"))
+        requests_window_seconds = _safe_int_or_none(requests_block.get("window_seconds"))
+        requests_in_window = _safe_int_or_none(usage.get("requests_in_window"))
+        remaining_requests = _safe_int_or_none(usage.get("remaining_requests"))
+
         return UsageReading(
             concurrent_sessions=concurrent_sessions,
             limit=limit,
@@ -89,6 +111,11 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
             priority_low=priority_low,
             boxed_until_epoch=boxed_until_epoch,
             resets_at_epoch=resets_at_epoch,
+            requests_limit=requests_limit,
+            requests_remaining=remaining_requests,
+            requests_in_window=requests_in_window,
+            requests_hard_cap=requests_hard_cap,
+            requests_window_seconds=requests_window_seconds,
             age_seconds=0.0,
         )
     except UsageParseError:

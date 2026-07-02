@@ -72,6 +72,69 @@ async def test_snapshot_fields():
     assert d["config"]["poll_interval"] == 5.0
 
 
+async def test_snapshot_request_window_fields():
+    reading = UsageReading(
+        concurrent_sessions=1,
+        limit=4,
+        hard_cap=8,
+        requests_limit=200,
+        requests_remaining=152,
+        requests_in_window=48,
+        requests_hard_cap=400,
+        requests_window_seconds=18000,
+    )
+    loop = _make_reconcile(reading)
+    await loop.tick()
+
+    snap = snapshot(loop)
+    d = snap.to_dict()
+
+    assert d["requests_in_window"] == 48
+    assert d["requests_limit"] == 200
+    assert d["requests_remaining"] == 152
+    assert d["requests_hard_cap"] == 400
+    assert d["requests_window_seconds"] == 18000
+    assert d["local_requests_in_window"] == 0  # no requests forwarded yet
+    assert d["request_window_delta"] == 48  # provider 48 - local 0
+    assert d["total_requests_forwarded"] == 0
+
+
+async def test_snapshot_request_window_fields_absent():
+    loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))
+    await loop.tick()
+
+    snap = snapshot(loop)
+    d = snap.to_dict()
+
+    assert d["requests_in_window"] is None
+    assert d["requests_limit"] is None
+    assert d["requests_remaining"] is None
+    assert d["local_requests_in_window"] is None
+    assert d["request_window_delta"] is None
+
+
+async def test_prometheus_request_window_metrics():
+    reading = UsageReading(
+        concurrent_sessions=1,
+        limit=4,
+        hard_cap=8,
+        requests_limit=200,
+        requests_remaining=152,
+        requests_in_window=48,
+        requests_window_seconds=18000,
+    )
+    loop = _make_reconcile(reading)
+    await loop.tick()
+
+    snap = snapshot(loop)
+    text = to_prometheus(snap)
+
+    assert "sluice_requests_in_window 48" in text
+    assert "sluice_requests_limit 200" in text
+    assert "sluice_requests_remaining 152" in text
+    assert "sluice_total_requests_forwarded 0" in text
+
+
 async def test_snapshot_queue_wait_reflects_gate():
     """avg/p95 queue wait and timeouts in the snapshot read the gate's counters."""
     gate = PermitGate(initial_capacity=0)  # no permits → acquire times out

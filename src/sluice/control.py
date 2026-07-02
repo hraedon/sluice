@@ -62,9 +62,13 @@ class LimitState:
     boxed_until_epoch: float | None = None  # seconds since epoch, or None
     resets_at_epoch: float | None = None  # when the box lifts (epoch seconds), or None
 
-    # Token-bucket fields (Anthropic/OpenAI: in-band response headers)
+    # Token-bucket fields (Anthropic/OpenAI: in-band response headers;
+    # umans: polled from /v1/usage limits.requests + usage.requests_in_window)
     requests_limit: int | None = None
     requests_remaining: int | None = None
+    requests_in_window: int | None = None  # umans: usage.requests_in_window
+    requests_hard_cap: int | None = None  # umans: limits.requests.hard_cap
+    requests_window_seconds: int | None = None  # umans: limits.requests.window_seconds
     tokens_limit: int | None = None
     tokens_remaining: int | None = None
     bucket_reset_epoch: float | None = None  # when the bucket resets (epoch seconds)
