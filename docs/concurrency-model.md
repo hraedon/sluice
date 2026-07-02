@@ -114,8 +114,16 @@ gate's size. Admission is always the synchronous semaphore; truth only adjusts i
 ### Release cooldown
 
 Borrowed from ai-concurrency-shaper: a freed permit is not immediately reusable; it rests
-for `release_cooldown` so umans' own accounting can decrement before sluice fills the slot
-again. This blunts the lag race that turns a clean release into an apparent overshoot.
+for `release_cooldown` (CLI: `--release-cooldown`; env: `SLUICE_RELEASE_COOLDOWN`; default
+**2.0s**) so umans' own accounting can decrement before sluice fills the slot again. This
+blunts the lag race that turns a clean release into an apparent overshoot.
+
+The cooldown is what makes the dashboard sometimes show queued requests alongside
+"free" slots — the slots are freed (`local_in_flight` decremented) but still resting
+(`cooling_down` > 0, not yet acquirable). Override with `--release-cooldown 0` to disable
+it entirely for maximally aggressive slot reuse, at the cost of transient overshoots when
+umans' lagged accounting hasn't caught up. Raise it (e.g. `--release-cooldown 5`) if phantom
+estimates climb after burst-and-drain churn.
 
 ## 5. Phantom handling: prevent first, absorb second
 

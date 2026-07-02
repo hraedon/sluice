@@ -953,6 +953,7 @@ function render(d){
   var rows=[
     ['band',d.band],['effective_permits',d.effective_permits],
     ['concurrent_sessions',obs],['local_in_flight',loc],
+    ['cooling_down',d.cooling_down],
     ['phantom_estimate',d.phantom_estimate],
     ['breaker',d.breaker],
     ['breaker_half_open_age',

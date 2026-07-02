@@ -95,10 +95,88 @@ docker run --rm -p 8800:8800 -e SLUICE_USAGE_KEY=sk-... sluice:local \
 ```
 
 Then point your clients (opencode, open-webui, …) at `http://127.0.0.1:8800` instead of the
-provider, and open `http://127.0.0.1:8800/` for the dashboard. `--target` is the concurrency
-sluice aims to hold (default **3**, one below umans Code Max's limit of 4 — pass `--target 4`
-to use the full limit, trading the safety buffer). See `docs/client-configuration.md` for
-per-client setup and `deploy/` for the Kubernetes / ArgoCD manifests.
+provider, and open `http://127.0.0.1:8800/` for the dashboard. See
+`docs/client-configuration.md` for per-client setup and `deploy/` for the Kubernetes / ArgoCD
+manifests.
+
+## Tuning
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--target N` | `3` | Concurrency sluice aims to hold (one below umans Code Max's limit of 4). Pass `--target 4` to use the full limit, trading the safety buffer. |
+| `--release-cooldown SECS` | `2.0` | How long a freed permit rests before reuse. Prevents the lag race where umans hasn't decremented its counter yet. Set to `0` to disable (maximally aggressive slot reuse, at the cost of transient overshoots on the provider's side). Raise if phantom estimates climb after burst-and-drain churn. |
+| `--queue-timeout SECS` | `30.0` | Max seconds a request waits for a permit before receiving a `503`. |
+| `--poll-interval SECS` | `5.0` | Seconds between `/v1/usage` polls — the reconciliation loop's cadence. |
+| `--reserve LABEL=N` | _(none)_ | Reserves N permit slots for a QoS class (e.g. `interactive=1`). See [QoS reserve](#qos-reserve) below. |
+
+The release cooldown is what makes the dashboard sometimes show queued requests alongside
+"free" slots — the slots are freed (`local_in_flight` decremented) but still resting
+(`cooling_down` > 0, not yet acquirable). The `cooling_down` count is visible in the
+dashboard's stats table and in `/status.json` / `/metrics`.
+
+All flags can also be set via environment variables (`SLUICE_TARGET`,
+`SLUICE_RELEASE_COOLDOWN`, etc.) or a TOML config file (`--config path.toml`).
+
+### QoS reserve
+
+By default, sluice uses a single FIFO queue — first come, first served. Under saturation
+(all permits held), a short interactive request (e.g. a chat turn in open-webui) can queue
+behind long-running agent requests and wait up to `--queue-timeout` (30s) before receiving
+a 503. This is known and expected at home-lab scale.
+
+`--reserve interactive=1` sets aside 1 permit slot that only requests tagged with the
+`interactive` class may use. Non-interactive requests can use the shared pool only, so a
+flood of agent traffic cannot drive the interactive class to zero. Below saturation the
+reserve is invisible — it only bites when the shared pool is exhausted.
+
+Clients tag themselves by sending the `x-sluice-client-label: interactive` header. sluice
+strips this header before forwarding (cache-transparency, Rule 7), so the upstream never
+sees it.
+
+### Other providers
+
+sluice is built first for umans Code, but supports other providers via `--provider`:
+
+| Provider | `--provider` | Truth source | Controller |
+|---|---|---|---|
+| umans Code (default) | `umans` | `/v1/usage` polled every 5s | Concurrency reconciliation (phantom absorption, box awareness) |
+| Anthropic | `anthropic` | In-band response headers (`anthropic-ratelimit-*`) | AIMD (reactive — no phantom absorption) |
+| OpenAI | `openai` | In-band response headers (`x-ratelimit-*`) | AIMD |
+| Generic | `generic` | None (local signals only) | AIMD |
+
+The key difference: umans exposes a live `concurrent_sessions` reading, so sluice can
+**prevent** overshoots by reconciling against ground truth. Other providers don't expose
+in-flight session counts — sluice can only **react** to 429s and parse ratelimit headers
+after the fact. The fail-safe guarantee (uncertainty tightens the gate) still holds, but
+precision is reduced off umans. See `docs/concurrency-model.md` §9 for details.
+
+```sh
+# Anthropic example — no usage key needed (truth comes from response headers)
+sluice serve --provider anthropic --upstream https://api.anthropic.com
+```
+
+### Securing the dashboard
+
+By default, the dashboard (`/`), `/status.json`, `/metrics`, and `/history.json` are
+unauthenticated. Pass `--admin-token SECRET` (or `SLUICE_ADMIN_TOKEN`) to gate them.
+Clients authenticate with either a Bearer token (`Authorization: Bearer SECRET`) or HTTP
+Basic auth (password = token, username ignored). The token is stripped from proxied
+requests so it never reaches the upstream.
+
+```sh
+docker run --rm -p 8800:8800 \
+  -e SLUICE_USAGE_KEY=sk-... \
+  -e SLUICE_ADMIN_TOKEN=your-secret \
+  sluice:local serve --upstream https://api.code.umans.ai
+```
+
+### High availability
+
+The concurrency invariant only holds if there is **one** sluice instance admitting traffic.
+In a Kubernetes deployment, `--singleton-guard kube-lease` uses a coordination.k8s.io Lease
+so that only one pod is leader at a time. Non-leader pods fast-fail with 503 and retry lease
+acquisition. The pod needs `POD_NAME` and `POD_NAMESPACE` env vars (set by the Kubernetes
+downward API). See `deploy/` for the manifest.
 
 ## Why not LiteLLM (or nginx, or a Redis semaphore)?
 
