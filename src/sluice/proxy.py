@@ -757,6 +757,17 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .spark-obs{stroke:var(--accent)}.spark-loc{stroke:var(--warn)}.spark-ph{stroke:var(--text-3)}
 .spark-grid{stroke:var(--border);stroke-dasharray:2,2}
+.ranges{float:right;display:inline-flex;gap:var(--space-1)}
+.rbtn{background:none;border:1px solid var(--border-2);color:var(--text-3);
+font-family:var(--font-mono);font-size:var(--fs-xs);padding:0 var(--space-2);
+border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing:0}
+.rbtn:hover,.rbtn.active{border-color:var(--accent);color:var(--accent)}
+.ribbon{width:100%;height:4px;display:block;margin-top:2px}
+.qspark{width:100%;height:28px;display:block;margin-top:var(--space-2)}
+.spark-qd{stroke:var(--info,var(--accent))}
+.qfill{fill:var(--info-soft,none)}
+.tick-qt{stroke:var(--warn)}
+.tick-429{stroke:var(--crit)}
 </style>
 </head>
 <body>
@@ -782,12 +793,22 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 </div>
 <div class="row">
   <div class="card">
-    <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span></h2>
+    <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span>
+      <span class="ranges">
+        <button class="rbtn active" id="r-5m" onclick="setRange('5m')">5m</button>
+        <button class="rbtn" id="r-1h" onclick="setRange('1h')">1h</button>
+        <button class="rbtn" id="r-4h" onclick="setRange('4h')">4h</button>
+      </span></h2>
     <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"></svg>
+    <svg class="ribbon" id="ribbon" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
+    <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
     <div class="sleg">
       <span><span class="dot" style="background:var(--accent)"></span> observed</span>
       <span><span class="dot" style="background:var(--warn)"></span> local</span>
       <span><span class="dot" style="background:var(--text-3)"></span> phantom</span>
+      <span><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
+      <span><span class="dot" style="background:var(--warn)"></span> timeout</span>
+      <span><span class="dot" style="background:var(--crit)"></span> 429</span>
     </div>
   </div>
   <div class="card">
@@ -804,9 +825,16 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 <script>
 let paused=false,isActive=false,timer=null,fetching=false;
 const HIST_MAX=60;
-let hist=[];
+// Long ranges pull from /history.json (5s tick cadence): 720 ticks = 1h, 2880 = 4h.
+const RANGES={'5m':{limit:HIST_MAX},'1h':{limit:720},'4h':{limit:2880}};
+const BUCKETS=120,LONG_REFRESH_MS=15000;
+let hist=[],viewRange='5m',longHist=[],lastLongFetch=0,lastD=null;
 
 function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
+
+function fromHistEntry(e){
+  return {obs:e.obs,loc:e.loc,ph:e.ph,qd:e.qd,band:e.band,qt:e.qt,t429:e.t429};
+}
 
 async function initHistory(){
   try{
@@ -814,9 +842,28 @@ async function initHistory(){
     if(!r.ok) return;
     const d=await r.json();
     if(!d.entries||!d.entries.length) return;
-    hist=d.entries.map(function(e){
-      return {obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep};
-    });
+    hist=d.entries.map(fromHistEntry);
+  }catch(e){}
+}
+
+function setRange(rg){
+  viewRange=rg;
+  ['5m','1h','4h'].forEach(function(k){
+    document.getElementById('r-'+k).className='rbtn'+(k===rg?' active':'');
+  });
+  if(rg==='5m'){renderSparks();}
+  else{fetchLong(true);}
+}
+
+async function fetchLong(force){
+  if(!force&&Date.now()-lastLongFetch<LONG_REFRESH_MS) return;
+  lastLongFetch=Date.now();
+  try{
+    const r=await fetch('/history.json?limit='+RANGES[viewRange].limit,{credentials:'include'});
+    if(!r.ok) return;
+    const d=await r.json();
+    longHist=(d.entries||[]).map(fromHistEntry);
+    renderSparks();
   }catch(e){}
 }
 
@@ -830,12 +877,14 @@ async function doPoll(){
       return;
     }
     const d=await r.json();
+    lastD=d;
     document.getElementById('build').textContent='v'+d.version+(d.build?' @ '+d.build:'');
     render(d);
     hist.push({obs:d.concurrent_sessions,loc:d.local_in_flight,ph:d.phantom_estimate,
-               ep:d.effective_permits,limit:d.limit});
+               qd:d.queue_depth,band:d.band,qt:d.queue_timeouts,t429:d.total_429s});
     if(hist.length>HIST_MAX) hist.shift();
-    renderSpark(d);
+    if(viewRange==='5m'){renderSparks();}
+    else{fetchLong(false);}
   }catch(e){
     document.getElementById('stats').innerHTML='<tr><th>error</th><td>'+esc(e.message)+'</td></tr>';
   }finally{
@@ -856,6 +905,7 @@ async function poll(){
 function refresh(){
   if(timer) clearTimeout(timer);
   doPoll();
+  if(viewRange!=='5m') fetchLong(true);
   schedule(paused?5000:(isActive?1000:5000));
 }
 
@@ -942,26 +992,74 @@ function render(d){
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
 }
 
-function renderSpark(d){
+const SEV={normal:0,low:1,reject:2,boxed:3};
+const SEV_COLOR={1:'var(--warn)',2:'var(--crit)',3:'var(--crit)'};
+
+// Mark samples where the cumulative counters advanced vs the previous sample.
+function withIncs(samples){
+  return samples.map(function(s,i){
+    var p=i>0?samples[i-1]:null;
+    return {obs:s.obs,loc:s.loc,ph:s.ph,qd:s.qd||0,band:s.band||'normal',
+            qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429)};
+  });
+}
+
+// Downsample to <=n buckets. Max for numeric series (mean would erase the
+// spikes worth seeing), worst for band, any for event ticks.
+function bucketize(samples,n){
+  if(samples.length<=n) return samples;
+  var k=Math.ceil(samples.length/n),out=[];
+  for(var i=0;i<samples.length;i+=k){
+    var b={obs:null,loc:0,ph:0,qd:0,band:'normal',qtInc:false,t429Inc:false};
+    for(var j=i;j<Math.min(i+k,samples.length);j++){
+      var s=samples[j];
+      if(s.obs!=null&&(b.obs==null||s.obs>b.obs)) b.obs=s.obs;
+      if(s.loc>b.loc) b.loc=s.loc;
+      if(s.ph>b.ph) b.ph=s.ph;
+      if(s.qd>b.qd) b.qd=s.qd;
+      if((SEV[s.band]||0)>(SEV[b.band]||0)) b.band=s.band;
+      b.qtInc=b.qtInc||s.qtInc;
+      b.t429Inc=b.t429Inc||s.t429Inc;
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+function renderSparks(){
+  var d=lastD||{};
+  var hc=d.hard_cap??8,limit=d.limit??4;
+  var raw=viewRange==='5m'?hist:longHist;
+  var samples=bucketize(withIncs(raw),BUCKETS);
+  var denom=viewRange==='5m'?HIST_MAX:samples.length;
   var svg=document.getElementById('spark');
   var info=document.getElementById('spark-info');
-  var hc=d.hard_cap??8,limit=d.limit??4;
-  var valid=hist.filter(function(h){return h.obs!=null;});
-  info.textContent=valid.length+'/'+HIST_MAX+' samples';
+  var valid=samples.filter(function(h){return h.obs!=null;});
+  var infoBase=viewRange==='5m'
+    ? valid.length+'/'+denom+' samples'
+    : viewRange+' · '+raw.length+' ticks';
+  info.textContent=infoBase;
   if(valid.length<2){
     svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
+    document.getElementById('ribbon').innerHTML='';
+    document.getElementById('qspark').innerHTML='';
     return;
   }
-  var W=200,H=60,pad=3;
+  var W=200,pad=3,span=Math.max(denom-1,valid.length-1,1);
+  function xAt(i){return pad+(i/span)*(W-2*pad);}
+  // -- main spark: observed / local / phantom against the limit line
+  var H=60;
   var maxV=hc;
-  for(var i=0;i<valid.length;i++){if(valid[i].obs>maxV) maxV=valid[i].obs;}
+  for(var i=0;i<valid.length;i++){
+    if(valid[i].obs>maxV) maxV=valid[i].obs;
+    if(valid[i].loc>maxV) maxV=valid[i].loc;
+  }
   if(maxV<1) maxV=1;
   function pts(key){
     return valid.map(function(h,i){
-      var x=pad+(i/(HIST_MAX-1))*(W-2*pad);
       var v=h[key]||0;
       var y=H-pad-(v/maxV)*(H-2*pad);
-      return x.toFixed(1)+','+y.toFixed(1);
+      return xAt(i).toFixed(1)+','+y.toFixed(1);
     }).join(' ');
   }
   var limitY=(H-pad-(limit/maxV)*(H-2*pad)).toFixed(1);
@@ -973,6 +1071,30 @@ function renderSpark(d){
   for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
   if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" class="spark-ph" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
   svg.innerHTML=s;
+  // -- band ribbon: one segment per non-normal sample
+  var rb='';
+  var segW=(W-2*pad)/Math.max(valid.length,1);
+  for(var m=0;m<valid.length;m++){
+    var sev=SEV[valid[m].band]||0;
+    if(sev>0) rb+='<rect x="'+xAt(m).toFixed(1)+'" y="0" width="'+Math.max(segW,1).toFixed(1)+'" height="4" fill="'+SEV_COLOR[sev]+'"/>';
+  }
+  document.getElementById('ribbon').innerHTML=rb;
+  // -- queue spark: depth area + event ticks, own scale
+  var QH=28;
+  var maxQ=1;
+  for(var q=0;q<valid.length;q++){if(valid[q].qd>maxQ) maxQ=valid[q].qd;}
+  function qy(v){return QH-pad-(v/maxQ)*(QH-2*pad);}
+  var qpts=valid.map(function(h,i){return xAt(i).toFixed(1)+','+qy(h.qd||0).toFixed(1);}).join(' ');
+  var first=xAt(0).toFixed(1),last=xAt(valid.length-1).toFixed(1),base=(QH-pad).toFixed(1);
+  var qs='<polygon points="'+first+','+base+' '+qpts+' '+last+','+base+'" class="qfill" stroke="none"/>';
+  qs+='<polyline points="'+qpts+'" fill="none" class="spark-qd" stroke-width="1"/>';
+  for(var t=0;t<valid.length;t++){
+    var x=xAt(t).toFixed(1);
+    if(valid[t].t429Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-429" stroke-width="1"/>';
+    else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
+  }
+  document.getElementById('qspark').innerHTML=qs;
+  info.textContent=infoBase+' · y max '+maxV+' · queue max '+maxQ;
 }
 
 initHistory().then(poll);

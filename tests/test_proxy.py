@@ -656,6 +656,35 @@ async def test_dashboard_renders_half_open_age():
     assert "probing" in html
 
 
+async def test_dashboard_sparkline_depth_elements():
+    """Plan 009: the sparkline card carries the queue spark, band ribbon, and
+    time-horizon toggle.
+
+    Static-content assertions against the inline dashboard (same approach as
+    the half-open-age test): the HTML must contain the three range buttons
+    wired to setRange, the ribbon and queue-spark SVGs, the long-range fetch
+    limits (720 = 1h, 2880 = 4h at the 5s tick cadence), and the bucketing +
+    event-tick code paths.
+    """
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    html = response.text
+    for element_id in ('id="r-5m"', 'id="r-1h"', 'id="r-4h"', 'id="ribbon"', 'id="qspark"'):
+        assert element_id in html
+    assert "setRange" in html
+    assert "'1h':{limit:720}" in html
+    assert "'4h':{limit:2880}" in html
+    assert "bucketize" in html
+    assert "tick-429" in html and "tick-qt" in html
+    # Live buffer must now carry the queue/band/counter fields the new
+    # surfaces render from.
+    assert "qd:d.queue_depth" in html
+    assert "t429:d.total_429s" in html
+
+
 async def test_static_css_served():
     """GET /static/css/tokens.css serves the vendored patina tokens."""
     app, _, _ = _make_app()
