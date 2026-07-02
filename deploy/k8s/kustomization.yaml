@@ -1,8 +1,14 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: sluice
-commonLabels:
-  app.kubernetes.io/name: sluice
+# NOTE: `labels` (not `commonLabels`) — commonLabels rewrites *selectors* too,
+# including NetworkPolicy ingress from.podSelector, which clobbered the traefik
+# pod match (app.kubernetes.io/name: traefik → sluice) and blocked all ingress
+# traffic (502 at the edge). `labels` without includeSelectors only stamps
+# metadata.labels, which is all the ServiceMonitor needs to match the Service.
+labels:
+- pairs:
+    app.kubernetes.io/name: sluice
 # ingress-external.yaml is intentionally NOT included — sluice is internal-only
 # for now. To expose externally, add it here AND gate the admin routes (see the
 # SLUICE_ADMIN_TOKEN block in deployment.yaml + deploy/README.md).

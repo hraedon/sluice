@@ -91,6 +91,9 @@ plans/                     # numbered implementation plans
   bounded TTL, then tighten — never assume zero phantoms.
 - Don't add response caching, prompt logging, or model routing. Those are out of scope and
   break the "inert in-path" guarantee.
+- Don't use kustomize `commonLabels` in `deploy/k8s/` — it rewrites selectors too,
+  including the NetworkPolicy's `from.podSelector` for traefik, which blocks all ingress
+  traffic (prod 502, 2026-07-02). Use `labels` (pairs, no `includeSelectors`) instead.
 - Don't add, rename, reorder, or buffer anything on the wire to the upstream — not headers,
   not body bytes. The upstream's prompt cache keys off the exact request; a body sluice
   re-serialised (even with identical JSON, different key order/whitespace) is a different
