@@ -26,7 +26,13 @@ enforcement ladder is:
 | ≤ `limit` (4) | normal |
 | `limit`..`hard_cap` (4–8) | `priority.low` — deprioritised routing |
 | > `hard_cap` (~8) | HTTP 429 concurrency errors |
-| > 10 concurrency-429s **in a day** | **boxed** — 5-hour pause (`boxed_until`), self-reactivate ≤ 5×/week |
+| daily concurrency-429 allowance exceeded | **boxed** — 5-hour pause (`boxed_until`), limited self-reactivations |
+
+Ladder and numbers per the [official usage docs](https://app.umans.ai/offers/code/docs#usage).
+The exact thresholds drift (the docs say the box trips past 10 concurrency-429s a day;
+the dashboard currently shows a 20-hit daily allowance) — sluice doesn't hard-code any of
+them. It reacts to what `/v1/usage` itself reports (`priority.low`, `boxed_until`), so the
+ladder can move without a code change.
 
 Two facts make a naive limiter insufficient:
 
