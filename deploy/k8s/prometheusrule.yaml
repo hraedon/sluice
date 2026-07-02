@@ -1,0 +1,65 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: sluice
+      rules:
+        - alert: SluiceBreakerOpen
+          expr: sluice_breaker{state="open"} == 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sluice circuit breaker is OPEN"
+            description: "The circuit breaker has been open for more than 1 minute. The upstream is returning sustained 429s."
+
+        - alert: SluiceGateClosed
+          expr: sluice_gate_closed_reason{state!="open"} == 1
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sluice gate is closed"
+            description: "The gate has been closed (boxed, breaker, or saturated) for more than 30 seconds. All requests are being rejected."
+
+        - alert: SluiceBoxed
+          expr: sluice_band{state="boxed"} == 1
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sluice is boxed by provider"
+            description: "The provider has boxed the account. The gate is closed until the box period expires."
+
+        - alert: SluiceQueueWaitP95High
+          expr: sluice_queue_wait_p95_seconds > 10
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sluice queue wait p95 is high"
+            description: "The 95th percentile queue wait has exceeded 10 seconds for more than 1 minute. Clients may be experiencing timeouts."
+
+        - alert: SluiceUnreachable
+          expr: up{job="sluice"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sluice is unreachable"
+            description: "Prometheus has been unable to scrape the sluice /metrics endpoint for more than 1 minute."
+
+        - alert: SluicePermitLeak
+          expr: sluice_in_flight > 0 and on() (delta(sluice_in_flight[5m]) == 0)
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sluice permit leak detected"
+            description: "In-flight permits have been non-zero and unchanged for more than 5 minutes. This indicates a truly stuck permit, not active streaming traffic."

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -318,3 +319,44 @@ def test_kube_renew_interval_greater_than_lease_duration_rejected():
             lease_duration_seconds=30,
             renew_interval=31.0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Renew-loop recovery: re-acquire after renew failure flips _held back to True
+# ---------------------------------------------------------------------------
+
+
+async def test_kube_renew_loop_reacquires_after_loss():
+    """When renew() fails and _held goes False, _renew_loop re-acquires."""
+    now = datetime.now(timezone.utc)
+    api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
+
+    original_handler = api.handler
+    put_failing = [True]
+
+    def flaky_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT" and put_failing[0]:
+            put_failing[0] = False
+            return httpx.Response(409, json={"error": "conflict"})
+        return original_handler(request)
+
+    guard = KubeLeaseGuard(
+        lease_name="sluice",
+        namespace="default",
+        identity="pod-1",
+        renew_interval=0.01,
+        client=httpx.AsyncClient(
+            base_url="https://kubernetes.default.svc",
+            transport=httpx.MockTransport(flaky_handler),
+        ),
+    )
+    assert await guard.acquire() is True
+    assert guard.is_held() is True
+
+    await guard.start_renewer()
+    await asyncio.sleep(0.05)
+
+    # After the failing renew, _held should have gone False then re-acquired.
+    assert guard.is_held() is True
+
+    await guard.stop_renewer()

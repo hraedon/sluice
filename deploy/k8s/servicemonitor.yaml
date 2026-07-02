@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sluice
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sluice
+  namespaceSelector:
+    matchNames:
+      - sluice
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

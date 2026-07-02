@@ -281,11 +281,7 @@ def breaker_on_429(
         )
 
     if snap.state is BreakerState.OPEN:
-        # A 429 while OPEN resets the cooldown so tick() doesn't prematurely
-        # transition to HALF_OPEN (WI-016).  Without this, a 429 arriving
-        # during the fetch would be invisible to breaker_on_tick, which would
-        # see the old opened_at and transition OPEN→HALF_OPEN.
-        return BreakerSnapshot(state=BreakerState.OPEN, opened_at=now, half_opened_at=None)
+        return snap
 
     if snap.state is BreakerState.CLOSED:
         if _count_recent(recent_429s, now=now, window=config.window_seconds) >= config.threshold:
@@ -320,6 +316,7 @@ class AdaptiveConfig:
     backoff_factor: float = 0.5  # multiply permits by this on a bad signal
     fresh_ttl: float = 15.0  # headers older than this are "stale"
     low_remaining_fraction: float = 0.2  # below this → backoff
+    min_decrease_interval: float = 30.0  # minimum seconds between multiplicative decreases
 
 
 @dataclass(frozen=True)
@@ -332,6 +329,7 @@ class AdaptiveSnapshot:
 
     current_permits: int = 1  # start conservative
     last_decrease_at: float | None = None
+    last_decrease_monotonic: float = 0.0
 
 
 def adaptive_effective_permits(
@@ -414,21 +412,25 @@ def adaptive_effective_permits(
         decrease = True
 
     if decrease:
-        new_permits = min(
-            config.target,
-            max(
-                config.min_floor,
-                int(adaptive.current_permits * config.backoff_factor),
-            ),
-        )
-        return new_permits, AdaptiveSnapshot(
-            current_permits=new_permits,
-            last_decrease_at=now,
-        )
+        if now - adaptive.last_decrease_monotonic >= config.min_decrease_interval:
+            new_permits = min(
+                config.target,
+                max(
+                    config.min_floor,
+                    int(adaptive.current_permits * config.backoff_factor),
+                ),
+            )
+            return new_permits, AdaptiveSnapshot(
+                current_permits=new_permits,
+                last_decrease_at=now,
+                last_decrease_monotonic=now,
+            )
+        return adaptive.current_permits, adaptive
 
     # Healthy → additive increase toward target.
     new_permits = min(config.target, adaptive.current_permits + config.additive_step)
     return new_permits, AdaptiveSnapshot(
         current_permits=new_permits,
         last_decrease_at=adaptive.last_decrease_at,
+        last_decrease_monotonic=adaptive.last_decrease_monotonic,
     )

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Callable
@@ -199,7 +200,7 @@ class ReconciliationLoop:
                 recent_429_count=len(self._recent_429s),
             )
             permits, self._adaptive = adaptive_effective_permits(
-                state, self._adaptive, self._adaptive_cfg, now=now_wall
+                state, self._adaptive, self._adaptive_cfg, now=now_mono
             )
         else:
             # Concurrency reconciler — the umans path (regression gate).
@@ -445,6 +446,43 @@ class ReconciliationLoop:
             return self._last_reading_cached.reading.provider
         return "unknown"
 
+    @property
+    def last_reading(self) -> CachedReading | None:
+        """The last cached truth-source reading, or None before the first tick."""
+        return self._last_reading_cached
+
+    @property
+    def target(self) -> int:
+        return self._ctrl_cfg.target
+
+    @property
+    def min_floor(self) -> int:
+        return self._ctrl_cfg.min_floor
+
+    @property
+    def usage_fresh_ttl(self) -> float:
+        return self._ctrl_cfg.usage_fresh_ttl
+
+    @property
+    def phantom_window(self) -> int:
+        return self._ctrl_cfg.phantom_window
+
+    @property
+    def breaker_threshold(self) -> int:
+        return self._brk_cfg.threshold
+
+    @property
+    def breaker_window_seconds(self) -> float:
+        return self._brk_cfg.window_seconds
+
+    @property
+    def breaker_cooldown_seconds(self) -> float:
+        return self._brk_cfg.cooldown_seconds
+
+    @property
+    def poll_interval(self) -> float:
+        return self._poll_interval
+
     def gate_closed_reason(self) -> str:
         """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.
 
@@ -478,7 +516,7 @@ class ReconciliationLoop:
             if self._last_reading_cached is not None:
                 r = self._last_reading_cached.reading
                 if r.resets_at_epoch is not None:
-                    remaining = int(r.resets_at_epoch - self._wall())
+                    remaining = math.ceil(r.resets_at_epoch - self._wall())
                     result = max(30, remaining)
                     if not self._last_reading_cached.ok:
                         return min(result, _RETRY_AFTER_STALE_CAP)
@@ -488,6 +526,6 @@ class ReconciliationLoop:
             if self._breaker.opened_at is not None:
                 elapsed = self._mono() - self._breaker.opened_at
                 cooldown_remaining = self._brk_cfg.cooldown_seconds - elapsed
-                return max(1, int(cooldown_remaining))
+                return max(1, math.ceil(cooldown_remaining))
             return 5
         return 5  # saturated or open

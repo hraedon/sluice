@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import httpx
@@ -101,8 +101,9 @@ class HeaderTruthSource:
     Like the umans cache, a header reading ages and, once stale, tightens.
     """
 
-    def __init__(self, *, provider: str = "anthropic") -> None:
+    def __init__(self, *, provider: str = "anthropic", fresh_ttl: float = 15.0) -> None:
         self._provider = provider
+        self._fresh_ttl = fresh_ttl
         self._cached: CachedReading | None = None
 
     async def fetch(self, *, now_monotonic: float) -> CachedReading:
@@ -129,7 +130,7 @@ class HeaderTruthSource:
             )
         age = now_monotonic - self._cached.fetched_at_monotonic
         reading = dataclasses.replace(self._cached.reading, age_seconds=age)
-        ok = age <= 15.0  # headers are considered ok if recent
+        ok = age <= self._fresh_ttl
         return CachedReading(
             reading=reading,
             fetched_at_monotonic=self._cached.fetched_at_monotonic,
@@ -274,26 +275,6 @@ def parse_ratelimit_headers(
 
 
 # ---------------------------------------------------------------------------
-# 429 classifier
-# ---------------------------------------------------------------------------
-
-
-def default_429_classifier(retry_after: str | None) -> bool:
-    """Default 429 classifier: a 429 without retry-after is a concurrency signal.
-
-    Same logic as :func:`sluice.proxy._is_concurrency_429` but lives here so
-    providers can override it.  Returns ``True`` when the 429 should be
-    recorded in the breaker.
-    """
-    if retry_after is None:
-        return True
-    try:
-        return int(retry_after.strip()) <= 0
-    except (ValueError, TypeError):
-        return True
-
-
-# ---------------------------------------------------------------------------
 # Provider bundle + registry
 # ---------------------------------------------------------------------------
 
@@ -306,7 +287,6 @@ class Provider:
         name: Provider identifier (``umans``, ``anthropic``, ``openai``, ``generic``).
         default_base_url: Default upstream base URL (overridable by ``--upstream``).
         auth_header: Auth header shape (``authorization`` or ``x-api-key``).
-        auth_extra: Extra headers to send on usage polls (e.g. ``anthropic-version``).
         controller: Controller strategy (``concurrency_reconcile`` or ``adaptive``).
         needs_usage_key: Whether the provider requires a usage API key.
     """
@@ -314,7 +294,6 @@ class Provider:
     name: str
     default_base_url: str
     auth_header: str
-    auth_extra: dict[str, str] = field(default_factory=dict)
     controller: str = "concurrency_reconcile"
     needs_usage_key: bool = True
 
@@ -324,7 +303,6 @@ _PROVIDERS: dict[str, Provider] = {
         name="umans",
         default_base_url="https://api.code.umans.ai",
         auth_header="authorization",
-        auth_extra={},
         controller="concurrency_reconcile",
         needs_usage_key=True,
     ),
@@ -332,7 +310,6 @@ _PROVIDERS: dict[str, Provider] = {
         name="anthropic",
         default_base_url="https://api.anthropic.com",
         auth_header="x-api-key",
-        auth_extra={"anthropic-version": "2023-06-01"},
         controller="adaptive",
         needs_usage_key=False,
     ),
@@ -340,7 +317,6 @@ _PROVIDERS: dict[str, Provider] = {
         name="openai",
         default_base_url="https://api.openai.com",
         auth_header="authorization",
-        auth_extra={},
         controller="adaptive",
         needs_usage_key=False,
     ),
@@ -348,7 +324,6 @@ _PROVIDERS: dict[str, Provider] = {
         name="generic",
         default_base_url="",
         auth_header="authorization",
-        auth_extra={},
         controller="adaptive",
         needs_usage_key=False,
     ),
@@ -370,6 +345,7 @@ def make_truth_source(
     base_url: str,
     api_key: str,
     auth_header: str | None = None,
+    fresh_ttl: float = 15.0,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> TruthSource:
     """Construct the appropriate :class:`TruthSource` for a provider.
@@ -387,4 +363,4 @@ def make_truth_source(
         )
     if provider.name == "generic":
         return NullTruthSource(provider=provider.name)
-    return HeaderTruthSource(provider=provider.name)
+    return HeaderTruthSource(provider=provider.name, fresh_ttl=fresh_ttl)

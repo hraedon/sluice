@@ -86,8 +86,8 @@ class StatusSnapshot:
 def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None) -> StatusSnapshot:
     """Build a :class:`StatusSnapshot` from the reconciliation loop's current state."""
     reading = None
-    if reconcile._last_reading_cached is not None:
-        reading = reconcile._last_reading_cached.reading
+    if reconcile.last_reading is not None:
+        reading = reconcile.last_reading.reading
 
     ready = reconcile.ready
     if guard is not None:
@@ -109,7 +109,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         breaker_half_open_age_seconds=reconcile.breaker_half_open_age_seconds,
         recent_429s=reconcile.recent_429_count,
         total_429s=reconcile.total_429s,
-        target=reconcile._ctrl_cfg.target,
+        target=reconcile.target,
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
         cooling_down=reconcile.cooling_down,
@@ -119,14 +119,14 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
         config={
-            "target": reconcile._ctrl_cfg.target,
-            "min_floor": reconcile._ctrl_cfg.min_floor,
-            "poll_interval": reconcile._poll_interval,
-            "usage_fresh_ttl": reconcile._ctrl_cfg.usage_fresh_ttl,
-            "phantom_window": reconcile._ctrl_cfg.phantom_window,
-            "breaker_threshold": reconcile._brk_cfg.threshold,
-            "breaker_window_seconds": reconcile._brk_cfg.window_seconds,
-            "breaker_cooldown_seconds": reconcile._brk_cfg.cooldown_seconds,
+            "target": reconcile.target,
+            "min_floor": reconcile.min_floor,
+            "poll_interval": reconcile.poll_interval,
+            "usage_fresh_ttl": reconcile.usage_fresh_ttl,
+            "phantom_window": reconcile.phantom_window,
+            "breaker_threshold": reconcile.breaker_threshold,
+            "breaker_window_seconds": reconcile.breaker_window_seconds,
+            "breaker_cooldown_seconds": reconcile.breaker_cooldown_seconds,
             "provider": reconcile.provider_name,
             "controller": reconcile.controller_name,
         },
@@ -140,8 +140,7 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     def gauge(name: str, help_text: str, value: int | float | None) -> None:
         lines.append(f"# HELP {name} {help_text}")
         lines.append(f"# TYPE {name} gauge")
-        if value is not None:
-            lines.append(f"{name} {value}")
+        lines.append(f"{name} {value if value is not None else float('nan')}")
 
     def enum_gauge(name: str, help_text: str, value: str, *states: str) -> None:
         lines.append(f"# HELP {name} {help_text}")

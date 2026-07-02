@@ -13,6 +13,8 @@ from sluice.control import (
     ControllerState,
     LimitState,
     UsageReading,
+    AdaptiveConfig,
+    AdaptiveSnapshot,
     classify_band,
     effective_permits,
     phantom_estimate,
@@ -20,6 +22,7 @@ from sluice.control import (
     breaker_on_429,
     breaker_on_success,
     breaker_on_tick,
+    adaptive_effective_permits,
 )
 
 NOW = 1_000_000.0
@@ -61,6 +64,13 @@ def test_classify_band(sessions, low, boxed, expected):
 def test_box_elapsed_is_not_boxed():
     r = reading(boxed_until_epoch=NOW - 1)
     assert classify_band(r, now=NOW) != Band.BOXED
+
+
+def test_classify_band_boundary_at_hard_cap():
+    assert classify_band(reading(concurrent_sessions=8), now=NOW) is Band.LOW
+    assert classify_band(reading(concurrent_sessions=9), now=NOW) is Band.REJECT
+    assert classify_band(reading(concurrent_sessions=4), now=NOW) is Band.NORMAL
+    assert classify_band(reading(concurrent_sessions=3), now=NOW) is Band.NORMAL
 
 
 # --- phantom estimate (instant) -------------------------------------------
@@ -260,30 +270,55 @@ def test_half_open_caps_at_one_even_when_base_higher():
     assert effective_permits(s, CFG, now=NOW) == 1
 
 
-# --- WI-016: breaker_on_429 resets opened_at when OPEN ------------------------
+def test_effective_permits_phantom_exceeds_target_floors_at_min_floor():
+    """When phantoms exceed target in CLOSED state, _clamp floors at min_floor."""
+    r = reading(concurrent_sessions=10)
+    s = state(r, in_flight=0, phantom=10)
+    result = effective_permits(s, CFG, now=NOW)
+    assert result == CFG.min_floor
+    assert result > 0
 
 
-def test_breaker_on_429_open_resets_opened_at():
-    """A 429 while OPEN resets opened_at so tick() doesn't prematurely go HALF_OPEN."""
+# --- Breaker OPEN does not extend cooldown on 429 ---------------------------
+
+
+def test_breaker_on_429_open_does_not_extend_cooldown():
+    """A 429 while OPEN must NOT reset opened_at.
+
+    Under a sustained trickle of 429s the breaker would never reach HALF_OPEN
+    if each 429 reset the cooldown timer.  The fix returns the snapshot
+    unchanged so the cooldown elapses and a probe can eventually go out.
+    """
     snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 100)
     result = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
     assert result.state is BreakerState.OPEN
-    assert result.opened_at == NOW  # reset, not the old value
+    assert result.opened_at == NOW - 100  # unchanged
 
 
-def test_breaker_on_429_open_prevents_premature_half_open():
-    """A 429 during OPEN prevents the next tick from transitioning to HALF_OPEN.
+def test_breaker_transitions_to_half_open_despite_ongoing_429s():
+    """Even with 429s trickling in while OPEN, the breaker reaches HALF_OPEN
+    after cooldown_seconds because opened_at is not reset."""
+    cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+    opened_at = NOW - 100
+    snap = _snap(state=BreakerState.OPEN, opened_at=opened_at)
 
-    Without the fix, breaker_on_429 returned snap unchanged when OPEN, so
-    breaker_on_tick would see the old opened_at and transition to HALF_OPEN.
-    """
-    snap = _snap(state=BreakerState.OPEN, opened_at=NOW - 100)
-    # Simulate a 429 arriving during the fetch
-    snap = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
-    assert snap.opened_at == NOW
-    # Now tick — cooldown is 60s, only 0s elapsed → stays OPEN
-    result = breaker_on_tick(snap, [NOW], now=NOW, config=BCFG)
+    # Simulate a trickle of 429s while OPEN — opened_at must not change.
+    for t in [NOW - 80, NOW - 40, NOW - 10, NOW]:
+        snap = breaker_on_429(snap, [t], now=t, config=cfg)
+        assert snap.opened_at == opened_at
+
+    # After cooldown elapses, breaker_on_tick transitions to HALF_OPEN.
+    result = breaker_on_tick(snap, [NOW], now=NOW, config=cfg)
+    assert result.state is BreakerState.HALF_OPEN
+
+
+def test_breaker_half_open_429_reopens_with_fresh_opened_at():
+    """A 429 while HALF_OPEN (probe failed) reopens with a fresh opened_at."""
+    snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=NOW - 10)
+    result = breaker_on_429(snap, [NOW], now=NOW, config=BCFG)
     assert result.state is BreakerState.OPEN
+    assert result.opened_at == NOW
+    assert result.half_opened_at is None
 
 
 # --- WI-020: HALF_OPEN → OPEN on probe timeout --------------------------------
@@ -312,6 +347,16 @@ def test_breaker_half_open_no_half_opened_at_stays_half_open():
     snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=None)
     result = breaker_on_tick(snap, [], now=NOW, config=BCFG)
     assert result.state is BreakerState.HALF_OPEN
+
+
+def test_breaker_open_with_none_opened_at_stays_open():
+    """A corrupted/legacy snapshot with opened_at=None in OPEN state must not
+    transition to HALF_OPEN — the condition guards on opened_at is not None,
+    so the breaker stays OPEN (fail-safe)."""
+    snap = BreakerSnapshot(state=BreakerState.OPEN, opened_at=None)
+    result = breaker_on_tick(snap, [], now=NOW + 999_999, config=BCFG)
+    assert result.state is BreakerState.OPEN
+    assert result.opened_at is None
 
 
 # --- Plan 006 WI-001: LimitState normalization -------------------------------
@@ -378,3 +423,74 @@ def test_limit_state_is_frozen():
         assert False, "should have raised FrozenInstanceError"
     except Exception:
         pass
+
+
+# --- AIMD adaptive controller: rate-limited multiplicative decrease ------------
+
+
+def test_adaptive_decrease_rate_limited():
+    """Multiplicative decrease only fires once per min_decrease_interval."""
+    cfg = AdaptiveConfig(
+        target=8, min_floor=1, backoff_factor=0.5, min_decrease_interval=30.0
+    )
+    snap = AdaptiveSnapshot(current_permits=8, last_decrease_monotonic=0.0)
+    r = UsageReading()
+    st = ControllerState(reading=r, local_in_flight=0, recent_429_count=1)
+
+    now = 100.0
+    # First call: 100 - 0 >= 30 → decrease applies (8 * 0.5 = 4).
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now)
+    assert permits == 4
+    assert snap.last_decrease_monotonic == now
+
+    # Second call at the same `now`: rate-limited → permits held at 4.
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now)
+    assert permits == 4
+
+    # Third call 31s later: 131 - 100 = 31 >= 30 → decrease applies (4 * 0.5 = 2).
+    now2 = now + 31
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now2)
+    assert permits == 2
+    assert snap.last_decrease_monotonic == now2
+
+
+def test_adaptive_additive_increase_still_every_tick():
+    """When healthy (no bad signal), permits increase every tick."""
+    cfg = AdaptiveConfig(target=4, min_floor=1, additive_step=1, min_decrease_interval=30.0)
+    snap = AdaptiveSnapshot(current_permits=1, last_decrease_monotonic=0.0)
+    r = UsageReading()
+    st = ControllerState(reading=r, local_in_flight=0)
+
+    now = 10.0
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now)
+    assert permits == 2
+
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now + 1)
+    assert permits == 3
+
+    permits, snap = adaptive_effective_permits(st, snap, cfg, now=now + 2)
+    assert permits == 4  # capped at target
+
+
+def test_adaptive_healthy_tick_preserves_decrease_timestamp():
+    """A healthy tick between two decrease ticks must not reset the
+    rate-limit timestamp — otherwise the second decrease fires too soon,
+    causing steady-state oscillation.
+    """
+    cfg = AdaptiveConfig(
+        target=8, min_floor=1, backoff_factor=0.5, min_decrease_interval=30.0
+    )
+    snap = AdaptiveSnapshot(current_permits=8, last_decrease_monotonic=0.0)
+    r = UsageReading()
+    bad = ControllerState(reading=r, local_in_flight=0, recent_429_count=1)
+    good = ControllerState(reading=r, local_in_flight=0, recent_429_count=0)
+
+    permits, snap = adaptive_effective_permits(bad, snap, cfg, now=100.0)
+    assert permits == 4
+    assert snap.last_decrease_monotonic == 100.0
+
+    permits, snap = adaptive_effective_permits(good, snap, cfg, now=110.0)
+    assert permits == 5
+
+    permits, snap = adaptive_effective_permits(bad, snap, cfg, now=115.0)
+    assert permits == 5

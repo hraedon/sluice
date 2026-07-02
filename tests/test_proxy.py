@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from collections.abc import AsyncIterator
 
 import httpx
@@ -637,23 +638,43 @@ async def test_dashboard():
 async def test_dashboard_renders_half_open_age():
     """WI-021: dashboard JS includes logic to render breaker_half_open_age_seconds.
 
-    The dashboard's render() function must conditionally display the half-open
-    probe age when the breaker is HALF_OPEN.  This test verifies the HTML
-    contains the JS code path for that rendering — a static-content assertion
-    since the dashboard is pre-rendered inline JS, not server-side templated.
+    Verifies both that /status.json carries a non-null age when the breaker is
+    HALF_OPEN, and that the dashboard's inline JS has a conditional that checks
+    for half_open state, references breaker_half_open_age_seconds within that
+    conditional, and uses the age value in the banner text construction.
     """
-    app, _, _ = _make_app()
+    import time as time_mod
+    from sluice.control import BreakerSnapshot, BreakerState
+
+    app, _, reconcile = _make_app()
+    reconcile._breaker = BreakerSnapshot(
+        state=BreakerState.HALF_OPEN,
+        opened_at=0.0,
+        half_opened_at=time_mod.monotonic() - 5.0,
+    )
 
     async with _asgi_client(app) as client:
-        response = await client.get("/")
+        status_resp = await client.get("/status.json")
 
-    html = response.text
-    # The render function must reference breaker_half_open_age_seconds and
-    # conditionally display it when breaker is half_open.
-    assert "breaker_half_open_age_seconds" in html
-    assert "half_open" in html
-    # The banner text must include the probing age display.
-    assert "probing" in html
+    status_data = status_resp.json()
+    assert status_data["breaker"] == "half_open"
+    assert status_data["breaker_half_open_age_seconds"] is not None
+    assert isinstance(status_data["breaker_half_open_age_seconds"], (int, float))
+
+    async with _asgi_client(app) as client:
+        dash_resp = await client.get("/")
+
+    html = dash_resp.text
+
+    assert re.search(r"if\s*\([^)]*['\"]half_open['\"]", html), (
+        "JS must have a conditional checking for half_open breaker state"
+    )
+    assert re.search(
+        r"['\"]half_open['\"].*?breaker_half_open_age_seconds", html, re.DOTALL
+    ), "half_open conditional must reference breaker_half_open_age_seconds"
+    assert re.search(r"breaker_half_open_age_seconds\s*\+\s*['\"]s", html), (
+        "banner text must include breaker_half_open_age_seconds value in construction"
+    )
 
 
 async def test_dashboard_sparkline_depth_elements():
@@ -2147,3 +2168,460 @@ async def test_body_done_disconnect_watcher_handoff():
     )
 
     assert gate.held == 0
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: 429 recorded even when client disconnects after response headers
+# ---------------------------------------------------------------------------
+
+
+async def test_429_recorded_on_disconnect_after_headers():
+    """A 429 from upstream must be recorded even when the client disconnects
+    in the same event-loop turn.  Before the fix, the disconnect check ran
+    before the 429 recording, silently dropping the signal and preventing
+    the breaker from tripping.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "overloaded"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put({"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": True})
+    await receive_queue.put({"type": "http.disconnect"})
+
+    await app(scope, receive, send)
+
+    assert reconcile.total_429s == 1, "429 must be recorded even on disconnect"
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: stream context closed on disconnect-during-entry
+# ---------------------------------------------------------------------------
+
+
+class _TrackableByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.aclose_called = False
+
+    async def __aiter__(self):
+        yield b"response"
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+
+
+class _CancelSurvivingTransport(httpx.AsyncBaseTransport):
+    """Transport that catches CancelledError and returns a response anyway.
+
+    Simulates the edge case where __aenter__ completes (response obtained)
+    despite a cancel request — the stream context is entered but __aexit__
+    must still be called to close it.
+    """
+
+    def __init__(self) -> None:
+        self.stream: _TrackableByteStream | None = None
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        async for chunk in request.stream:
+            pass
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        self.stream = _TrackableByteStream()
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=self.stream,
+        )
+
+
+async def test_stream_closed_on_disconnect_during_entry():
+    """When the client disconnects during __aenter__ but the entry task
+    completes despite cancellation (e.g. the transport caught CancelledError),
+    __aexit__ must still be called to close the stream context.  Without this,
+    the upstream stream leaks.
+    """
+    transport = _CancelSurvivingTransport()
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(transport=transport, timeout=None)
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+    )
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+    await receive_queue.put({"type": "http.disconnect"})
+
+    await app(scope, receive, send)
+
+    assert transport.stream is not None, "transport should have created a response"
+    assert transport.stream.aclose_called, "stream must be closed via __aexit__"
+
+
+class _CancelThenErrorTransport(httpx.AsyncBaseTransport):
+    """Transport that catches CancelledError but raises a different exception.
+
+    Simulates the edge case where __aenter__ is cancelled but the transport
+    catches CancelledError and raises httpx.ConnectError instead — the stream
+    context's __aexit__ must still be called.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        async for chunk in request.stream:
+            pass
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            raise httpx.ConnectError("different error after cancellation")
+
+
+class _StreamCMTracker:
+    """Wraps a stream context manager to track __aexit__ calls."""
+
+    def __init__(self, cm) -> None:
+        self._cm = cm
+        self.aexit_called = False
+
+    async def __aenter__(self):
+        return await self._cm.__aenter__()
+
+    async def __aexit__(self, *args):
+        self.aexit_called = True
+        return await self._cm.__aexit__(*args)
+
+
+async def test_stream_aexit_called_on_exception_after_cancellation():
+    """When __aenter__ catches CancelledError but raises a different exception,
+    __aexit__ must still be called to close the stream context.
+
+    Regression guard for the else→finally fix in the disconnect-during-entry
+    path: previously, if the entry task caught CancelledError but then raised
+    httpx.RequestError, the except block swallowed it and the else branch
+    (which calls __aexit__) was skipped, leaking the stream context.
+    """
+    transport = _CancelThenErrorTransport()
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(transport=transport, timeout=None)
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+    )
+
+    tracker_holder: list[_StreamCMTracker] = []
+    original_stream = app._client.stream
+
+    def tracking_stream(*args, **kwargs):
+        cm = original_stream(*args, **kwargs)
+        tracker = _StreamCMTracker(cm)
+        tracker_holder.append(tracker)
+        return tracker
+
+    app._client.stream = tracking_stream  # type: ignore[assignment]
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    sent_events: list[dict] = []
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+    await receive_queue.put({"type": "http.disconnect"})
+
+    await app(scope, receive, send)
+
+    assert len(tracker_holder) == 1, "stream context manager should have been created"
+    assert tracker_holder[0].aexit_called, (
+        "__aexit__ must be called even when entry raises after cancellation"
+    )
+    assert gate.held == 0
+
+
+# ---------------------------------------------------------------------------
+# 502 error path: httpx.RequestError before response starts
+# ---------------------------------------------------------------------------
+
+
+async def test_502_on_upstream_request_error():
+    """When httpx.RequestError is raised during stream.__aenter__, a 502 is sent."""
+
+    class _ErrorTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async for chunk in request.stream:
+                pass
+            raise httpx.ConnectError("connection refused")
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(transport=_ErrorTransport(), timeout=None)
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        upstream_client=upstream_client,
+    )
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 502
+    assert "error" in response.json()
+
+
+# ---------------------------------------------------------------------------
+# Query string forwarding
+# ---------------------------------------------------------------------------
+
+
+async def test_query_string_forwarded():
+    """The query string from the incoming request reaches the upstream intact."""
+    captured_url: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_url.append(str(request.url))
+        return _resp(200)
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/v1/messages",
+            params={"stream": "true", "model": "claude-3"},
+            json={"prompt": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert len(captured_url) == 1
+    url = captured_url[0]
+    assert "stream=true" in url
+    assert "model=claude-3" in url
+
+
+# ---------------------------------------------------------------------------
+# Response hop-by-hop header stripping
+# ---------------------------------------------------------------------------
+
+
+async def test_response_hop_by_hop_headers_stripped():
+    """Hop-by-hop headers are stripped from the response; normal headers pass through."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(
+            200,
+            json_data={"ok": True},
+            headers={
+                "connection": "keep-alive",
+                "transfer-encoding": "chunked",
+                "keep-alive": "timeout=120",
+                "x-custom": "test-value",
+            },
+        )
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    sent_events: list[dict] = []
+    receive_queue: asyncio.Queue = asyncio.Queue()
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+
+    await receive_queue.put(
+        {"type": "http.request", "body": b'{"prompt":"hi"}', "more_body": False}
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/messages",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await app(scope, receive, send)
+
+    start_events = [e for e in sent_events if e["type"] == "http.response.start"]
+    assert len(start_events) == 1
+    header_keys = {k.decode("latin-1").lower() for k, _ in start_events[0]["headers"]}
+    assert "connection" not in header_keys
+    assert "transfer-encoding" not in header_keys
+    assert "keep-alive" not in header_keys
+    assert "content-type" in header_keys
+    assert "x-custom" in header_keys
+
+
+# ---------------------------------------------------------------------------
+# ASGI lifespan: graceful startup and shutdown
+# ---------------------------------------------------------------------------
+
+
+async def test_lifespan_startup_and_shutdown():
+    """ProxyApp._handle_lifespan starts/stops the reconcile loop and closes owned client."""
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+    )
+    assert app._owns_client is True
+
+    sent_events: list[dict] = []
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    startup_done = asyncio.Event()
+
+    async def receive() -> dict:
+        return await receive_queue.get()
+
+    async def send(event: dict) -> None:
+        sent_events.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    scope = {"type": "lifespan"}
+    lifespan_task = asyncio.create_task(app(scope, receive, send))
+
+    await receive_queue.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    assert reconcile._task is not None
+
+    await receive_queue.put({"type": "lifespan.shutdown"})
+    await asyncio.wait_for(lifespan_task, timeout=5.0)
+
+    startup_complete = [e for e in sent_events if e["type"] == "lifespan.startup.complete"]
+    assert len(startup_complete) == 1
+    shutdown_complete = [e for e in sent_events if e["type"] == "lifespan.shutdown.complete"]
+    assert len(shutdown_complete) == 1
+    assert reconcile._task is None
+    assert app._client.is_closed
+
+
+# ---------------------------------------------------------------------------
+# Concurrent load: gate handles sustained contention
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_load():
+    """The gate correctly handles sustained contention with 10 requests over 3 permits."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def gen():
+            await asyncio.sleep(0.05)
+            yield b'{"ok": true}'
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    app, gate, _ = _make_app(gate_capacity=3, queue_timeout=10.0, upstream_handler=handler)
+
+    max_queue_depth = 0
+
+    async def track_depth():
+        nonlocal max_queue_depth
+        while True:
+            max_queue_depth = max(max_queue_depth, gate.queue_depth)
+            await asyncio.sleep(0.005)
+
+    tracker = asyncio.create_task(track_depth())
+
+    async with _asgi_client(app) as client:
+        responses = await asyncio.gather(
+            *[client.post("/v1/messages", json={"prompt": "hi"}) for _ in range(10)]
+        )
+
+    tracker.cancel()
+    try:
+        await tracker
+    except asyncio.CancelledError:
+        pass
+
+    assert all(r.status_code == 200 for r in responses), "all requests should succeed"
+    assert gate.held == 0, "all permits released after completion"
+    assert gate.queue_timeouts == 0, "no queue timeouts expected"
+    assert max_queue_depth > 0, "queue depth should have reached > 0 at some point"
