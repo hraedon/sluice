@@ -35,6 +35,11 @@ RUN groupadd -r sluice && useradd -r -g sluice -d /tmp sluice
 
 COPY --from=builder /opt/venv /opt/venv
 
+# Short git sha of the commit this image was built from (surfaced in
+# /status.json and the dashboard header). Empty for local builds.
+ARG GIT_SHA=""
+ENV SLUICE_BUILD_SHA=$GIT_SHA
+
 USER sluice
 EXPOSE 8800
 

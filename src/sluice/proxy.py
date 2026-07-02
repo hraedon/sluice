@@ -18,6 +18,7 @@ import base64
 import hmac
 import json
 import logging
+import os
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -25,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from sluice import __version__
 from sluice.gate import PermitGate
 from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import SingletonGuard
@@ -126,6 +128,7 @@ class ProxyApp:
         self._admin_token = admin_token
         self._guard_acquired = False
         self._retry_interval = retry_interval
+        self._build_sha = os.environ.get("SLUICE_BUILD_SHA") or None
         self._acquire_retry_task: asyncio.Task[None] | None = None
         self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
 
@@ -620,7 +623,10 @@ class ProxyApp:
 
     async def _send_status_json(self, send: Send) -> None:
         snap = status_snapshot(self._reconcile, self._guard)
-        await self._send_json(send, 200, snap.to_dict())
+        payload = snap.to_dict()
+        payload["version"] = __version__
+        payload["build"] = self._build_sha
+        await self._send_json(send, 200, payload)
 
     async def _send_prometheus(self, send: Send) -> None:
         snap = status_snapshot(self._reconcile, self._guard)
@@ -755,7 +761,7 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 </head>
 <body>
 <div class="header">
-  <h1>sluice</h1>
+  <h1>sluice <span id="build" style="color:var(--text-3);font-size:.55em;font-weight:normal"></span></h1>
   <div class="controls">
     <button id="btn-pause" onclick="togglePause()">pause</button>
     <button onclick="refresh()">refresh</button>
@@ -824,6 +830,7 @@ async function doPoll(){
       return;
     }
     const d=await r.json();
+    document.getElementById('build').textContent='v'+d.version+(d.build?' @ '+d.build:'');
     render(d);
     hist.push({obs:d.concurrent_sessions,loc:d.local_in_flight,ph:d.phantom_estimate,
                ep:d.effective_permits,limit:d.limit});

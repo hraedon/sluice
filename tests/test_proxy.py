@@ -579,6 +579,30 @@ async def test_metrics():
     assert "breaker_half_open_age_seconds" in data
 
 
+async def test_status_json_reports_version_and_build(monkeypatch):
+    """/status.json carries the package version and the image's git sha.
+
+    The sha comes from SLUICE_BUILD_SHA (baked into the image via the release
+    workflow's GIT_SHA build-arg); absent that env var, build is null rather
+    than a fabricated value.
+    """
+    from sluice import __version__
+
+    monkeypatch.setenv("SLUICE_BUILD_SHA", "abc1234")
+    app, _, _ = _make_app()
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+    data = response.json()
+    assert data["version"] == __version__
+    assert data["build"] == "abc1234"
+
+    monkeypatch.delenv("SLUICE_BUILD_SHA")
+    app2, _, _ = _make_app()
+    async with _asgi_client(app2) as client:
+        response = await client.get("/status.json")
+    assert response.json()["build"] is None
+
+
 async def test_prometheus_metrics():
     """GET /metrics returns OpenMetrics text exposition."""
     app, _, _ = _make_app()
