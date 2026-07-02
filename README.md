@@ -59,8 +59,10 @@ sluice is that shared choke point, and it closes the loop against upstream truth
 - **Both API surfaces.** Transparent streaming passthrough for the Anthropic
   (`/v1/messages`) and OpenAI (`/v1/chat/completions`) routes.
 - **Remembers the trend.** Every tick lands in a bounded in-memory history
-  (dashboard sparkline + `/history.json`), optionally persisted to SQLite
+  (dashboard sparklines + `/history.json`), optionally persisted to SQLite
   (`--history-store`) so a restart doesn't wipe the picture of what led up to it.
+  The dashboard renders it at 5m/1h/4h ranges: concurrency series, queue depth,
+  a band ribbon, and tick marks where queue timeouts or 429s actually happened.
 
 ![sluice live dashboard during a deliberate fleet overload: local in-flight pinned at the limit of 4, provider-observed sessions below it, deep queue, zero 429s](docs/dashboard.png)
 
