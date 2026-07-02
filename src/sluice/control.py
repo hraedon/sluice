@@ -35,16 +35,47 @@ class BreakerState(str, Enum):
 
 
 @dataclass(frozen=True)
-class UsageReading:
-    """A parsed snapshot of the provider's usage endpoint."""
+class LimitState:
+    """A normalized snapshot of the provider's limit state.
 
-    concurrent_sessions: int
-    limit: int
-    hard_cap: int
+    Different providers expose different signals.  umans polls a live concurrency
+    count; Anthropic/OpenAI surface token/request buckets via response headers;
+    a generic compatible endpoint may expose neither.  This dataclass unions all
+    fields so any controller strategy can consume a single type.
+
+    *Concurrency fields* (umans ``/v1/usage``):
+        ``concurrent_sessions``, ``limit``, ``hard_cap``, ``priority_low``,
+        ``boxed_until_epoch``, ``resets_at_epoch``.
+
+    *Token-bucket fields* (Anthropic/OpenAI response headers):
+        ``requests_remaining``, ``tokens_remaining``, ``bucket_reset_epoch``.
+
+    Only the fields the provider supplies are populated; the rest keep their
+    defaults.  Controller strategies read only the fields relevant to them.
+    """
+
+    # Concurrency fields (umans: polled /v1/usage)
+    concurrent_sessions: int = 0
+    limit: int = 4
+    hard_cap: int = 8
     priority_low: bool = False
     boxed_until_epoch: float | None = None  # seconds since epoch, or None
     resets_at_epoch: float | None = None  # when the box lifts (epoch seconds), or None
+
+    # Token-bucket fields (Anthropic/OpenAI: in-band response headers)
+    requests_limit: int | None = None
+    requests_remaining: int | None = None
+    tokens_limit: int | None = None
+    tokens_remaining: int | None = None
+    bucket_reset_epoch: float | None = None  # when the bucket resets (epoch seconds)
+
+    # Metadata
     age_seconds: float = 0.0  # how stale this reading is, at decision time
+    provider: str = "umans"
+
+
+# Backward-compatible alias so Plans 001/003 code and tests don't churn.
+UsageReading = LimitState
 
 
 @dataclass(frozen=True)
@@ -63,10 +94,11 @@ class ControllerConfig:
 class ControllerState:
     """Everything the decision needs, assembled by the shell each tick."""
 
-    reading: UsageReading
+    reading: LimitState
     local_in_flight: int
     breaker: BreakerState = BreakerState.CLOSED
     phantom_estimate: int = 0  # pre-computed windowed estimate (Plan 003)
+    recent_429_count: int = 0  # windowed 429 count for AIMD backoff (Plan 006)
 
 
 # ---------------------------------------------------------------------------
@@ -267,3 +299,136 @@ def breaker_on_success(snap: BreakerSnapshot) -> BreakerSnapshot:
     if snap.state is BreakerState.HALF_OPEN:
         return BreakerSnapshot(state=BreakerState.CLOSED, opened_at=snap.opened_at, half_opened_at=None)
     return snap
+
+
+# ---------------------------------------------------------------------------
+# AdaptiveRateController — AIMD for header/429-driven providers (Plan 006)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdaptiveConfig:
+    """AIMD operating parameters for the adaptive rate controller.
+
+    Defaults bias toward conservative throughput: small additive step,
+    aggressive backoff factor.
+    """
+
+    target: int = 3  # aim to keep permits at/below this
+    min_floor: int = 1  # never throttle fully closed on uncertainty alone
+    additive_step: int = 1  # increase by this each tick when healthy
+    backoff_factor: float = 0.5  # multiply permits by this on a bad signal
+    fresh_ttl: float = 15.0  # headers older than this are "stale"
+    low_remaining_fraction: float = 0.2  # below this → backoff
+
+
+@dataclass(frozen=True)
+class AdaptiveSnapshot:
+    """AIMD state carried across calls (the shell holds one).
+
+    Like :class:`BreakerSnapshot`, this is pure data — the shell threads it
+    through the controller and back.
+    """
+
+    current_permits: int = 1  # start conservative
+    last_decrease_at: float | None = None
+
+
+def adaptive_effective_permits(
+    state: ControllerState,
+    adaptive: AdaptiveSnapshot,
+    config: AdaptiveConfig,
+    *,
+    now: float,
+) -> tuple[int, AdaptiveSnapshot]:
+    """AIMD controller for header/429-driven providers (Plan 006 WI-003).
+
+    Additive-increase toward ``target`` while budget headers are healthy and
+    no recent 429s; multiplicative-decrease on a 429, on
+    ``tokens_remaining``/``requests_remaining`` falling below a fraction of the
+    bucket, or on stale headers.
+
+    Guarantees (same contract as :func:`effective_permits`):
+
+    * Fail safe — every uncertain input (stale headers, low remaining, 429s,
+      breaker) can only *lower* the result.
+    * Pure — ``now`` and the reading's ``age_seconds`` are supplied; no clock
+      is read here.
+    * Monotone-safe — a bad signal never raises permits.
+
+    Returns ``(permits, new_adaptive_snapshot)`` so the shell can thread the
+    AIMD level across ticks.
+    """
+    reading = state.reading
+
+    # Hard stops (shared breaker — same as the concurrency reconciler).
+    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+        return 0, adaptive
+    if state.breaker is BreakerState.OPEN:
+        return 0, adaptive
+
+    # A half-open breaker admits at most one probe — but never *raises* the
+    # AIMD level above 1 (fail-safe, same logic as the concurrency reconciler).
+    if state.breaker is BreakerState.HALF_OPEN:
+        return max(0, min(adaptive.current_permits, 1)), adaptive
+
+    # Determine whether a bad signal calls for multiplicative decrease.
+    decrease = False
+
+    # Recent 429s → back off (even below the breaker threshold).
+    if state.recent_429_count > 0:
+        decrease = True
+
+    # Low remaining requests → back off.
+    if (
+        reading.requests_remaining is not None
+        and reading.requests_remaining <= 0
+    ):
+        decrease = True
+    elif (
+        reading.requests_remaining is not None
+        and reading.requests_limit is not None
+        and reading.requests_limit > 0
+        and reading.requests_remaining
+        <= reading.requests_limit * config.low_remaining_fraction
+    ):
+        decrease = True
+
+    # Low remaining tokens → back off.
+    if (
+        reading.tokens_remaining is not None
+        and reading.tokens_remaining <= 0
+    ):
+        decrease = True
+    elif (
+        reading.tokens_remaining is not None
+        and reading.tokens_limit is not None
+        and reading.tokens_limit > 0
+        and reading.tokens_remaining
+        <= reading.tokens_limit * config.low_remaining_fraction
+    ):
+        decrease = True
+
+    # Stale headers → tighten (don't trust the numbers).
+    if reading.age_seconds > config.fresh_ttl:
+        decrease = True
+
+    if decrease:
+        new_permits = min(
+            config.target,
+            max(
+                config.min_floor,
+                int(adaptive.current_permits * config.backoff_factor),
+            ),
+        )
+        return new_permits, AdaptiveSnapshot(
+            current_permits=new_permits,
+            last_decrease_at=now,
+        )
+
+    # Healthy → additive increase toward target.
+    new_permits = min(config.target, adaptive.current_permits + config.additive_step)
+    return new_permits, AdaptiveSnapshot(
+        current_permits=new_permits,
+        last_decrease_at=adaptive.last_decrease_at,
+    )

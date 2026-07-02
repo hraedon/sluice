@@ -493,6 +493,14 @@ class ProxyApp:
                 ):
                     self._reconcile.record_429()
 
+                # WI-004: Feed response headers to the truth source.
+                # For polled truth (umans) this is a no-op; for header truth
+                # (Anthropic/OpenAI) it parses the allowlisted ratelimit headers.
+                # Headers only — the body is never read (inert in-path, rule 7).
+                self._reconcile.record_response_headers(
+                    dict(response.headers), response.status_code
+                )
+
                 try:
                     await send(
                         {

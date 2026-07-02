@@ -127,6 +127,8 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
             "breaker_threshold": reconcile._brk_cfg.threshold,
             "breaker_window_seconds": reconcile._brk_cfg.window_seconds,
             "breaker_cooldown_seconds": reconcile._brk_cfg.cooldown_seconds,
+            "provider": reconcile.provider_name,
+            "controller": reconcile.controller_name,
         },
     )
 

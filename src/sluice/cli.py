@@ -19,12 +19,12 @@ from typing import Any
 import httpx
 
 from sluice import __version__
-from sluice.control import BreakerConfig, ControllerConfig
+from sluice.control import AdaptiveConfig, BreakerConfig, ControllerConfig
 from sluice.gate import PermitGate
+from sluice.providers import get_provider, make_truth_source
 from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import KubeLeaseGuard, NoopGuard, SingletonGuard
-from sluice.usage import UsageClient
 
 log = logging.getLogger("sluice.cli")
 
@@ -44,6 +44,7 @@ _DEFAULTS: dict[str, Any] = {
     "config": None,
     "admin_token": None,
     "reserve": None,
+    "provider": "umans",
 }
 
 
@@ -96,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- serve ---------------------------------------------------------------
     serve = sub.add_parser("serve", help="run the concurrency-metering reverse proxy")
     serve.add_argument("--upstream", default=None, help="upstream base URL, e.g. https://api.code.umans.ai")
+    serve.add_argument("--provider", default=None, choices=["umans", "anthropic", "openai", "generic"], help="upstream provider type (default: umans)")
     serve.add_argument("--listen", default=None, help="host:port to listen on (default: 127.0.0.1:8800)")
     serve.add_argument("--target", type=int, default=None, help="target max observed concurrency (default: 3)")
     serve.add_argument("--poll-interval", type=float, default=None, help="seconds between /v1/usage polls (default: 5)")
@@ -134,7 +136,14 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         config_data = _load_config_file(config_path)
     args._config_data = config_data
 
-    upstream = _resolve("upstream", args)
+    provider_name = _resolve("provider", args)
+    try:
+        provider = get_provider(provider_name)
+    except ValueError as exc:
+        print(f"sluice: error: {exc}", file=sys.stderr)
+        return 2
+
+    upstream = _resolve("upstream", args) or provider.default_base_url
     if not upstream:
         print("sluice: error: --upstream is required (flag, SLUICE_UPSTREAM env, or [serve] in config file)", file=sys.stderr)
         return 2
@@ -171,11 +180,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    usage_key = os.environ.get(usage_key_env)
-    if not usage_key:
-        print(f"sluice: error: environment variable {usage_key_env} is not set", file=sys.stderr)
-        print("       set it to the API key used for /v1/usage polling", file=sys.stderr)
-        return 2
+    usage_key = os.environ.get(usage_key_env) or ""
 
     host, _, port_str = listen.rpartition(":")
     if not host or not port_str:
@@ -198,23 +203,32 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         guard = NoopGuard()
         log.info("  singleton_guard:   noop")
 
-    usage_client = UsageClient(
+    if provider.needs_usage_key and not usage_key:
+        print(f"sluice: error: environment variable {usage_key_env} is not set", file=sys.stderr)
+        print("       set it to the API key used for /v1/usage polling", file=sys.stderr)
+        return 2
+
+    truth_source = make_truth_source(
+        provider,
         base_url=upstream,
         api_key=usage_key,
         auth_header=usage_auth_header,
     )
+
     gate = PermitGate(
         initial_capacity=0,
         release_cooldown=release_cooldown,
         reserve=reserve_count,
     )
     reconcile = ReconciliationLoop(
-        usage_client=usage_client,
+        truth_source=truth_source,
         gate=gate,
         controller_config=ControllerConfig(target=target),
         breaker_config=BreakerConfig(),
         poll_interval=poll_interval,
         guard=guard,
+        controller=provider.controller,
+        adaptive_config=AdaptiveConfig(target=target) if provider.controller == "adaptive" else None,
     )
     app = ProxyApp(
         upstream_base_url=upstream,
@@ -229,14 +243,17 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     log.info("sluice %s starting", __version__)
     log.info("  upstream:          %s", upstream)
+    log.info("  provider:          %s", provider.name)
+    log.info("  controller:        %s", provider.controller)
     log.info("  listen:            %s:%d", host, port)
     log.info("  target:            %d", target)
     log.info("  poll_interval:     %.1fs", poll_interval)
     log.info("  release_cooldown:  %.1fs", release_cooldown)
     log.info("  queue_timeout:     %.1fs", queue_timeout)
     log.info("  retry_interval:    %.1fs", retry_interval)
-    log.info("  usage_key_env:     %s", usage_key_env)
-    log.info("  usage_auth_header: %s", usage_auth_header)
+    if provider.needs_usage_key:
+        log.info("  usage_key_env:     %s", usage_key_env)
+        log.info("  usage_auth_header: %s", usage_auth_header)
     if config_path:
         log.info("  config:            %s", config_path)
     if reserve_count > 0:
@@ -281,6 +298,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"queue_wait:         {d.get('avg_wait_seconds', '?')}s avg / {d.get('p95_wait_seconds', '?')}s p95")
     print(f"queue_timeouts:     {d.get('queue_timeouts', '?')}")
     print(f"ready:              {d.get('ready', '?')}")
+    config = d.get("config", {})
+    if "provider" in config:
+        print(f"provider:           {config['provider']}")
+    if "controller" in config:
+        print(f"controller:         {config['controller']}")
     return 0
 
 

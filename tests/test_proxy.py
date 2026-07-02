@@ -40,6 +40,13 @@ class FakeUsageClient:
             ok=True,
         )
 
+    @property
+    def last_cached(self) -> CachedReading | None:
+        return None
+
+    def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
@@ -176,7 +183,7 @@ def _make_app(
         timeout=None,
     )
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
@@ -603,6 +610,28 @@ async def test_dashboard():
     assert "/static/theme.js" in response.text
 
 
+async def test_dashboard_renders_half_open_age():
+    """WI-021: dashboard JS includes logic to render breaker_half_open_age_seconds.
+
+    The dashboard's render() function must conditionally display the half-open
+    probe age when the breaker is HALF_OPEN.  This test verifies the HTML
+    contains the JS code path for that rendering — a static-content assertion
+    since the dashboard is pre-rendered inline JS, not server-side templated.
+    """
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    html = response.text
+    # The render function must reference breaker_half_open_age_seconds and
+    # conditionally display it when breaker is half_open.
+    assert "breaker_half_open_age_seconds" in html
+    assert "half_open" in html
+    # The banner text must include the probing age display.
+    assert "probing" in html
+
+
 async def test_static_css_served():
     """GET /static/css/tokens.css serves the vendored patina tokens."""
     app, _, _ = _make_app()
@@ -973,7 +1002,7 @@ def _make_app_with_guard(
         timeout=None,
     )
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
@@ -1052,7 +1081,7 @@ async def test_non_leader_does_not_poll_usage():
     gate = PermitGate(initial_capacity=3)
     usage = FakeUsageClient()
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
@@ -1593,7 +1622,7 @@ def _make_app_with_reserve(
         timeout=None,
     )
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),
@@ -1728,7 +1757,7 @@ async def test_backpressure_real():
     usage = FakeUsageClient()
     upstream_client = httpx.AsyncClient(transport=_GatedTransport(), timeout=None)
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),

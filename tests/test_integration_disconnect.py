@@ -36,6 +36,13 @@ class FakeUsageClient:
             ok=True,
         )
 
+    @property
+    def last_cached(self) -> CachedReading | None:
+        return None
+
+    def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
@@ -52,7 +59,7 @@ async def _start_proxy(
     gate = PermitGate(initial_capacity=3)
     usage = FakeUsageClient()
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),

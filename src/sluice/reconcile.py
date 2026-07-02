@@ -1,17 +1,18 @@
-"""Background reconciliation loop tying usage polling, the controller, and the gate.
+"""Background reconciliation loop tying truth polling, the controller, and the gate.
 
 Every ``poll_interval`` seconds:
 
-1. Poll ``/v1/usage`` for the provider's ``concurrent_sessions`` (ground truth).
-2. Compute ``effective_permits`` via the pure controller.
+1. Fetch the current :class:`LimitState` from the truth source (polled, header,
+   or null depending on provider).
+2. Compute permits via the selected controller strategy (concurrency-reconcile
+   or AIMD adaptive).
 3. Resize the live :class:`~sluice.gate.PermitGate`.
 4. Update breaker / box state.
 
 The loop also receives event-driven callbacks from the proxy:
-``record_429()`` (concurrency 429 received) and ``record_success()`` (request
-completed normally).  These drive the breaker's event-based transitions
-(HALF_OPEN→CLOSED on success, HALF_OPEN→OPEN on 429) immediately, without
-waiting for the next tick.
+``record_429()`` (concurrency 429 received), ``record_success()`` (request
+completed normally), and ``record_response_headers()`` (in-band ratelimit
+headers for header-driven providers).
 """
 
 from __future__ import annotations
@@ -30,7 +31,10 @@ from sluice.control import (
     BreakerState,
     ControllerConfig,
     ControllerState,
+    AdaptiveConfig,
+    AdaptiveSnapshot,
     classify_band,
+    adaptive_effective_permits,
     breaker_on_429,
     breaker_on_success,
     breaker_on_tick,
@@ -38,8 +42,9 @@ from sluice.control import (
     phantom_estimate,
 )
 from sluice.gate import PermitGate
+from sluice.providers import TruthSource
 from sluice.singleton import SingletonGuard
-from sluice.usage import CachedReading, UsageClient
+from sluice.usage import CachedReading
 
 log = logging.getLogger("sluice.reconcile")
 
@@ -52,7 +57,7 @@ class ReconciliationLoop:
     def __init__(
         self,
         *,
-        usage_client: UsageClient,
+        truth_source: TruthSource,
         gate: PermitGate,
         controller_config: ControllerConfig,
         breaker_config: BreakerConfig,
@@ -60,8 +65,10 @@ class ReconciliationLoop:
         monotonic_clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         guard: SingletonGuard | None = None,
+        controller: str = "concurrency_reconcile",
+        adaptive_config: AdaptiveConfig | None = None,
     ) -> None:
-        self._usage = usage_client
+        self._truth = truth_source
         self._gate = gate
         self._ctrl_cfg = controller_config
         self._brk_cfg = breaker_config
@@ -69,6 +76,8 @@ class ReconciliationLoop:
         self._mono = monotonic_clock
         self._wall = wall_clock
         self._guard = guard
+        self._controller = controller
+        self._adaptive_cfg = adaptive_config or AdaptiveConfig()
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
@@ -78,6 +87,8 @@ class ReconciliationLoop:
             maxlen=controller_config.phantom_window
         )
         self._last_phantom_estimate = 0
+
+        self._adaptive = AdaptiveSnapshot()
 
         self._last_permits = gate.capacity
         self._last_band: Band = Band.NORMAL
@@ -111,6 +122,20 @@ class ReconciliationLoop:
         if prev is BreakerState.HALF_OPEN and self._breaker.state is BreakerState.CLOSED:
             self._recent_429s.clear()
 
+    def record_response_headers(
+        self, headers: dict[str, str], status: int
+    ) -> None:
+        """Feed in-band response headers to the truth source (WI-004).
+
+        For polled truth (umans) this is a no-op.  For header truth
+        (Anthropic/OpenAI) it parses the allowlisted ratelimit headers into
+        the :class:`HeaderTruthSource`.
+        """
+        now = self._mono()
+        self._truth.record_response_headers(
+            headers, status, now_monotonic=now
+        )
+
     def _prune_429s(self, now: float) -> None:
         cutoff = now - self._brk_cfg.window_seconds
         while self._recent_429s and self._recent_429s[0] < cutoff:
@@ -136,7 +161,7 @@ class ReconciliationLoop:
         # corrupting the windowed estimate if we pair them mismatched.
         held_at_fetch = self._gate.held
 
-        cached = await self._usage.fetch(now_monotonic=now_mono)
+        cached = await self._truth.fetch(now_monotonic=now_mono)
         age = now_mono - cached.fetched_at_monotonic
         reading = dataclasses.replace(cached.reading, age_seconds=age)
 
@@ -152,28 +177,45 @@ class ReconciliationLoop:
         )
         self._breaker = breaker
 
-        # Record the (observed, local) pairing for windowed phantom estimation.
-        # Only record real readings — synthetic fail-safe samples would poison
-        # the window with fabricated concurrent_sessions values.
-        # Use held_at_fetch (captured before the fetch) so the pairing reflects
-        # the state at the time the provider counted the sessions (WI-017).
-        if cached.ok:
-            self._phantom_samples.append((reading.concurrent_sessions, held_at_fetch))
-        phantom_est = phantom_estimate(self._phantom_samples)
+        if self._controller == "adaptive":
+            # Prune stale 429s so the AIMD controller doesn't see 429s from
+            # outside the breaker window — otherwise a single 429 would
+            # keep the controller in permanent multiplicative-decrease.
+            self._prune_429s(now_mono)
+            # AIMD controller — no phantom absorption (no concurrency ground truth).
+            state = ControllerState(
+                reading=reading,
+                local_in_flight=self._gate.held,
+                breaker=breaker.state,
+                recent_429_count=len(self._recent_429s),
+            )
+            permits, self._adaptive = adaptive_effective_permits(
+                state, self._adaptive, self._adaptive_cfg, now=now_wall
+            )
+        else:
+            # Concurrency reconciler — the umans path (regression gate).
+            # Record the (observed, local) pairing for windowed phantom estimation.
+            # Only record real readings — synthetic fail-safe samples would poison
+            # the window with fabricated concurrent_sessions values.
+            # Use held_at_fetch (captured before the fetch) so the pairing reflects
+            # the state at the time the provider counted the sessions (WI-017).
+            if cached.ok:
+                self._phantom_samples.append((reading.concurrent_sessions, held_at_fetch))
+            phantom_est = phantom_estimate(self._phantom_samples)
 
-        state = ControllerState(
-            reading=reading,
-            local_in_flight=self._gate.held,
-            breaker=breaker.state,
-            phantom_estimate=phantom_est,
-        )
-        permits = effective_permits(state, self._ctrl_cfg, now=now_wall)
+            state = ControllerState(
+                reading=reading,
+                local_in_flight=self._gate.held,
+                breaker=breaker.state,
+                phantom_estimate=phantom_est,
+            )
+            permits = effective_permits(state, self._ctrl_cfg, now=now_wall)
+            self._last_phantom_estimate = phantom_est
 
         await self._gate.resize(permits)
 
         # Cache for metrics / status.
         self._last_permits = permits
-        self._last_phantom_estimate = phantom_est
         self._last_band = classify_band(reading, now=now_wall)
         self._last_reading_cached = cached
         self._last_age = age
@@ -202,7 +244,7 @@ class ReconciliationLoop:
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        """Cancel the background loop and close the usage client."""
+        """Cancel the background loop and close the truth source."""
         if self._task is not None:
             self._task.cancel()
             try:
@@ -210,7 +252,7 @@ class ReconciliationLoop:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        await self._usage.close()
+        await self._truth.close()
 
     # -- observability (read by /metrics, /status, etc.) ---------------------
 
@@ -281,13 +323,25 @@ class ReconciliationLoop:
 
     @property
     def ready(self) -> bool:
-        """True once the first successful usage poll has completed."""
+        """True once the first successful truth fetch has completed."""
         return self._first_poll_ok
 
     @property
     def phantom_estimate_value(self) -> int:
         """Current windowed phantom estimate (sustained excess)."""
         return self._last_phantom_estimate
+
+    @property
+    def controller_name(self) -> str:
+        """The active controller strategy name."""
+        return self._controller
+
+    @property
+    def provider_name(self) -> str:
+        """The provider tag from the last reading (or 'unknown' before first tick)."""
+        if self._last_reading_cached is not None:
+            return self._last_reading_cached.reading.provider
+        return "unknown"
 
     def gate_closed_reason(self) -> str:
         """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.

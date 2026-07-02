@@ -11,6 +11,7 @@ from sluice.control import (
     BreakerState,
     ControllerConfig,
     ControllerState,
+    LimitState,
     UsageReading,
     classify_band,
     effective_permits,
@@ -311,3 +312,69 @@ def test_breaker_half_open_no_half_opened_at_stays_half_open():
     snap = BreakerSnapshot(state=BreakerState.HALF_OPEN, opened_at=NOW - 100, half_opened_at=None)
     result = breaker_on_tick(snap, [], now=NOW, config=BCFG)
     assert result.state is BreakerState.HALF_OPEN
+
+
+# --- Plan 006 WI-001: LimitState normalization -------------------------------
+
+
+def test_usage_reading_is_alias_for_limit_state():
+    """UsageReading is a backward-compatible alias for LimitState."""
+    assert UsageReading is LimitState
+
+
+def test_concurrency_only_state_round_trips():
+    """A concurrency-only LimitState (umans) has the expected fields."""
+    ls = LimitState(
+        concurrent_sessions=3,
+        limit=4,
+        hard_cap=8,
+        priority_low=False,
+        provider="umans",
+    )
+    assert ls.concurrent_sessions == 3
+    assert ls.limit == 4
+    assert ls.hard_cap == 8
+    assert ls.requests_remaining is None
+    assert ls.tokens_remaining is None
+    assert ls.bucket_reset_epoch is None
+    assert ls.provider == "umans"
+    band = classify_band(ls, now=NOW)
+    assert band is Band.NORMAL
+
+
+def test_bucket_only_state_round_trips():
+    """A bucket-only LimitState (Anthropic/OpenAI) has the expected fields."""
+    ls = LimitState(
+        requests_remaining=100,
+        tokens_remaining=50000,
+        bucket_reset_epoch=NOW + 60,
+        provider="anthropic",
+    )
+    assert ls.requests_remaining == 100
+    assert ls.tokens_remaining == 50000
+    assert ls.bucket_reset_epoch is not None
+    assert ls.concurrent_sessions == 0  # default
+    assert ls.provider == "anthropic"
+
+
+def test_limit_state_defaults_are_fail_safe():
+    """A bare LimitState with no provider data defaults to conservative values."""
+    ls = LimitState(provider="generic")
+    assert ls.concurrent_sessions == 0
+    assert ls.limit == 4
+    assert ls.hard_cap == 8
+    assert ls.priority_low is False
+    assert ls.requests_remaining is None
+    assert ls.tokens_remaining is None
+    assert ls.age_seconds == 0.0
+    assert ls.provider == "generic"
+
+
+def test_limit_state_is_frozen():
+    """LimitState is immutable (frozen dataclass)."""
+    ls = LimitState(concurrent_sessions=3)
+    try:
+        ls.concurrent_sessions = 5  # type: ignore[misc]
+        assert False, "should have raised FrozenInstanceError"
+    except Exception:
+        pass

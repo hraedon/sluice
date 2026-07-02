@@ -25,6 +25,13 @@ class FakeUsageClient:
             ok=True,
         )
 
+    @property
+    def last_cached(self) -> CachedReading | None:
+        return None
+
+    def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
@@ -32,7 +39,7 @@ class FakeUsageClient:
 def _make_reconcile(reading: UsageReading | None = None) -> ReconciliationLoop:
     gate = PermitGate(initial_capacity=3)
     return ReconciliationLoop(
-        usage_client=FakeUsageClient(reading),  # type: ignore[arg-type]
+        truth_source=FakeUsageClient(reading),  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(target=3, phantom_window=3),
         breaker_config=BreakerConfig(),
@@ -69,7 +76,7 @@ async def test_snapshot_queue_wait_reflects_gate():
     """avg/p95 queue wait and timeouts in the snapshot read the gate's counters."""
     gate = PermitGate(initial_capacity=0)  # no permits → acquire times out
     loop = ReconciliationLoop(
-        usage_client=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        truth_source=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(target=3, phantom_window=3),
         breaker_config=BreakerConfig(),
@@ -86,7 +93,7 @@ async def test_snapshot_cooling_down_reflects_gate():
     """cooling_down in the snapshot reads the gate's actual cooldown count."""
     gate = PermitGate(initial_capacity=3, release_cooldown=999.0)
     loop = ReconciliationLoop(
-        usage_client=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        truth_source=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(target=3, phantom_window=3),
         breaker_config=BreakerConfig(),
@@ -181,7 +188,7 @@ async def test_no_request_body_in_status_payload():
         timeout=None,
     )
     reconcile = ReconciliationLoop(
-        usage_client=usage,  # type: ignore[arg-type]
+        truth_source=usage,  # type: ignore[arg-type]
         gate=gate,
         controller_config=ControllerConfig(),
         breaker_config=BreakerConfig(),

@@ -49,6 +49,13 @@ class FakeUsageClient:
     def set_fail(self, fail: bool) -> None:
         self._fail = fail
 
+    @property
+    def last_cached(self) -> CachedReading | None:
+        return CachedReading(reading=self._reading, fetched_at_monotonic=self._last_ok_mono, ok=True) if self._last_ok_mono else None
+
+    def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+        pass
+
     async def close(self) -> None:
         pass
 
@@ -65,7 +72,7 @@ def _make_loop(initial: UsageReading, *, mono: float = 1000.0, wall: float = 1_0
     client = FakeUsageClient(initial)
     gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0, clock=lambda: m[0])
     loop = ReconciliationLoop(
-        usage_client=client,
+        truth_source=client,
         gate=gate,
         controller_config=CFG,
         breaker_config=BCFG,
@@ -432,6 +439,13 @@ async def test_phantom_sample_uses_held_at_fetch_not_current():
                 reading=self._reading, fetched_at_monotonic=now_monotonic, ok=True
             )
 
+        @property
+        def last_cached(self) -> CachedReading | None:
+            return None
+
+        def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+            pass
+
         async def close(self) -> None:
             pass
 
@@ -440,7 +454,7 @@ async def test_phantom_sample_uses_held_at_fetch_not_current():
     client = SlowUsageClient(_reading(concurrent_sessions=5))
     gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0)
     loop = ReconciliationLoop(
-        usage_client=client,  # type: ignore[arg-type]
+        truth_source=client,  # type: ignore[arg-type]
         gate=gate,
         controller_config=CFG,
         breaker_config=BCFG,
@@ -529,13 +543,20 @@ async def test_concurrent_429_during_tick_does_not_lose_event():
                 reading=self._reading, fetched_at_monotonic=now_monotonic, ok=True
             )
 
+        @property
+        def last_cached(self) -> CachedReading | None:
+            return None
+
+        def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+            pass
+
         async def close(self) -> None:
             pass
 
     client = SlowUsageClient(_reading(concurrent_sessions=0))
     gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0)
     loop = ReconciliationLoop(
-        usage_client=client,  # type: ignore[arg-type]
+        truth_source=client,  # type: ignore[arg-type]
         gate=gate,
         controller_config=CFG,
         breaker_config=BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0),
