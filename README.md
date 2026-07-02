@@ -61,6 +61,8 @@ sluice is that shared choke point, and it closes the loop against upstream truth
 - **Remembers the trend.** Every tick lands in a bounded in-memory history
   (dashboard sparklines + `/history.json`), optionally persisted to SQLite
   (`--history-store`) so a restart doesn't wipe the picture of what led up to it.
+  Depth and retention are tunable (`--history-size`, default 2880 ticks ≈ 4h at the
+  5s cadence; `--history-ttl` for the SQLite store, default 7 days).
   The dashboard renders it at 5m/1h/4h ranges: concurrency series, queue depth,
   a band ribbon, and tick marks where queue timeouts or 429s actually happened.
 

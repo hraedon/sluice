@@ -76,6 +76,8 @@ src/sluice/
   history_store.py # optional fail-safe SQLite persistence for history (--history-store)
   singleton.py # single-instance guard (the semaphore only works if there's one)
   cli.py       # `sluice serve ...` entry point
+  static/      # dashboard assets (css, fonts, theme.js); the dashboard HTML/JS
+               # itself is inline in proxy.py
 tests/
   test_control.py        # pure-core unit tests, no network
   test_import_boundary.py # control imports stdlib only; shell→core one-way
