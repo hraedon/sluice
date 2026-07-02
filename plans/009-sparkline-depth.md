@@ -48,12 +48,28 @@ getting a UI expression.
 Small `max N` text in each spark so the lines have a scale. No full axes or
 gridlines beyond the existing limit line — patina minimalism stands.
 
+## Additions (Fable follow-up, 2026-07-02)
+
+These dashboard-only changes reuse fields already recorded by `HistoryEntry`:
+
+- **Effective-permits step line** — `ep` now rendered as a step-after line;
+  shows the controller decision against observed/local demand.
+- **Limit / hard-cap guide lines** — faint rules at `lim` and `hc` from the
+  current status snapshot.
+- **Breaker / stale-usage tick marks** — discrete ticks at the top of the main
+  spark for `brk` (`open` / `half_open`) and `stl`.
+- **Hover crosshair tooltip** — nearest-sample readout with `obs`, `loc`, `ep`,
+  `qd`, `band`, `age`, `lim`, `hc`, and `brk` (Plan 009 originally deferred this).
+
 ## Non-goals / deferred
 
-- **Hover tooltip** (nearest-sample readout) — useful at 4h resolution, but
-  meaningful JS surface; separate follow-up if the toggle sees real use.
 - **Queue-wait series** — `HistoryEntry` doesn't carry wait percentiles; adding
   fields is a data-model change, out of scope here.
+- **Throughput bars** — needs a new per-tick completion counter (gate releases);
+  useful for distinguishing idle vs healthy but is the only server-side change
+  in the Fable list, so deferred.
+- **Min/max envelope on 1h/4h** — the current max-only bucketing already
+  preserves spikes; envelope adds visual noise without clear operational signal.
 - **Server-side bucketing** — 2880 compact entries ≈ 400 KB on an admin-gated
   LAN endpoint; client-side downsampling is fine at this scale.
 - **Token/request/model panels** — usage-dashboard's charter, not sluice's.
@@ -61,6 +77,11 @@ gridlines beyond the existing limit line — patina minimalism stands.
 ## Done when
 
 - All five WIs render correctly against live data.
+- Additions render: effective-permits step line, guide lines, breaker/stale ticks,
+  hover crosshair.
 - Dashboard HTML contract tests cover the new elements (range buttons, queue
-  spark, ribbon) and the long-range fetch limits.
+  spark, ribbon, step line, guide lines, event ticks, hover tooltip) and the
+  long-range fetch limits.
+- **WI-021** test verifies `breaker_half_open_age_seconds` rendering in
+  `HALF_OPEN` state.
 - Full suite + mypy --strict + ruff green.

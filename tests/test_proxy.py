@@ -678,8 +678,9 @@ async def test_dashboard_renders_half_open_age():
 
 
 async def test_dashboard_sparkline_depth_elements():
-    """Plan 009: the sparkline card carries the queue spark, band ribbon, and
-    time-horizon toggle.
+    """Plan 009 + Fable additions: the sparkline card carries the queue spark,
+    band ribbon, time-horizon toggle, effective-permits step line, limit/hard-cap
+    guide lines, breaker/stale tick marks, and the hover crosshair tooltip.
 
     Static-content assertions against the inline dashboard (same approach as
     the half-open-age test): the HTML must contain the three range buttons
@@ -701,9 +702,22 @@ async def test_dashboard_sparkline_depth_elements():
     assert "bucketize" in html
     assert "tick-429" in html and "tick-qt" in html
     # Live buffer must now carry the queue/band/counter fields the new
-    # surfaces render from.
+    # surfaces render from, plus the fields surfaced by the hover tooltip.
     assert "qd:d.queue_depth" in html
     assert "t429:d.total_429s" in html
+    # Effective-permits line and guide lines.
+    assert "stepPts('ep')" in html
+    assert "spark-ep" in html
+    assert "spark-lim" in html
+    assert "spark-hc" in html
+    # Breaker / stale ticks.
+    assert "tick-brk-open" in html
+    assert "tick-brk-half" in html
+    assert "tick-stale" in html
+    # Hover crosshair + tooltip container.
+    assert "spark-tip" in html
+    assert "onSparkHover" in html
+    assert "crosshair" in html
 
 
 async def test_static_css_served():

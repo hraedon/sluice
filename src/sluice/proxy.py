@@ -760,12 +760,27 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 .gl{display:flex;justify-content:space-between;font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1)}
 .gl .gl-limit{color:var(--accent)}
 .gl .gl-hardcap{color:var(--crit)}
+.card{position:relative}
 .spark{width:100%;height:60px;display:block}
-.sleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1)}
+.sleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
 .sleg span{display:flex;align-items:center;gap:var(--space-1)}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dash{width:12px;height:0;border-top:2px dashed var(--ok);display:inline-block}
 .spark-obs{stroke:var(--accent)}.spark-loc{stroke:var(--warn)}.spark-ph{stroke:var(--text-3)}
+.spark-ep{stroke:var(--ok);stroke-dasharray:2,1}
 .spark-grid{stroke:var(--border);stroke-dasharray:2,2}
+.spark-lim,.spark-hc{stroke:var(--border-2);stroke-width:0.5}
+.spark-hc{stroke:var(--crit);stroke-opacity:.35}
+.tick-qt{stroke:var(--warn)}
+.tick-429{stroke:var(--crit)}
+.tick-brk-open{stroke:var(--crit)}
+.tick-brk-half{stroke:var(--warn)}
+.tick-stale{stroke:var(--text-3)}
+.crosshair{stroke:var(--border-2);stroke-width:0.5;pointer-events:none}
+.tip{position:absolute;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-2);font-size:var(--fs-xs);color:var(--text);pointer-events:none;display:none;z-index:10;box-shadow:var(--shadow);font-variant-numeric:tabular-nums}
+.tip th{color:var(--text-3);text-align:left;padding-right:var(--space-2);font-weight:400}
+.tip td{padding-right:var(--space-3)}
+.tip .stale{color:var(--crit)}
 .ranges{float:right;display:inline-flex;gap:var(--space-1)}
 .rbtn{background:none;border:1px solid var(--border-2);color:var(--text-3);
 font-family:var(--font-mono);font-size:var(--fs-xs);padding:0 var(--space-2);
@@ -775,8 +790,6 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 .qspark{width:100%;height:28px;display:block;margin-top:var(--space-2)}
 .spark-qd{stroke:var(--info,var(--accent))}
 .qfill{fill:var(--info-soft,none)}
-.tick-qt{stroke:var(--warn)}
-.tick-429{stroke:var(--crit)}
 </style>
 </head>
 <body>
@@ -801,23 +814,33 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
   </div>
 </div>
 <div class="row">
-  <div class="card">
+  <div class="card" id="spark-card">
     <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span>
       <span class="ranges">
         <button class="rbtn active" id="r-5m" onclick="setRange('5m')">5m</button>
         <button class="rbtn" id="r-1h" onclick="setRange('1h')">1h</button>
         <button class="rbtn" id="r-4h" onclick="setRange('4h')">4h</button>
       </span></h2>
-    <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"></svg>
+    <svg class="spark" id="spark" viewBox="0 0 200 60" preserveAspectRatio="none"><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="60"/></svg>
     <svg class="ribbon" id="ribbon" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
-    <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+    <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/></svg>
     <div class="sleg">
       <span><span class="dot" style="background:var(--accent)"></span> observed</span>
       <span><span class="dot" style="background:var(--warn)"></span> local</span>
       <span><span class="dot" style="background:var(--text-3)"></span> phantom</span>
+      <span><span class="dash" style="border-top-color:var(--ok)"></span> effective</span>
       <span><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
       <span><span class="dot" style="background:var(--warn)"></span> timeout</span>
       <span><span class="dot" style="background:var(--crit)"></span> 429</span>
+    </div>
+    <div class="tip" id="spark-tip">
+      <table>
+        <tr><th>time</th><td id="tip-ts" colspan="5">-</td></tr>
+        <tr><th>obs</th><td id="tip-obs">-</td><th>loc</th><td id="tip-loc">-</td><th>ep</th><td id="tip-ep">-</td></tr>
+        <tr><th>qd</th><td id="tip-qd">-</td><th>band</th><td id="tip-band" colspan="3">-</td></tr>
+        <tr><th>age</th><td id="tip-age">-</td><th>lim</th><td id="tip-lim">-</td><th>hc</th><td id="tip-hc">-</td></tr>
+        <tr><th>brk</th><td id="tip-brk" colspan="5">-</td></tr>
+      </table>
     </div>
   </div>
   <div class="card">
@@ -833,6 +856,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 </div>
 <script>
 let paused=false,isActive=false,timer=null,fetching=false;
+let lastValid=[];
 const HIST_MAX=60;
 // Long ranges pull from /history.json (5s tick cadence): 720 ticks = 1h, 2880 = 4h.
 const RANGES={'5m':{limit:HIST_MAX},'1h':{limit:720},'4h':{limit:2880}};
@@ -840,9 +864,11 @@ const BUCKETS=120,LONG_REFRESH_MS=15000;
 let hist=[],viewRange='5m',longHist=[],lastLongFetch=0,lastD=null;
 
 function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
+function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 
 function fromHistEntry(e){
-  return {obs:e.obs,loc:e.loc,ph:e.ph,qd:e.qd,band:e.band,qt:e.qt,t429:e.t429};
+  return {ts:e.ts,obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep,lim:e.lim,hc:e.hc,
+          band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429};
 }
 
 async function initHistory(){
@@ -889,8 +915,11 @@ async function doPoll(){
     lastD=d;
     document.getElementById('build').textContent='v'+d.version+(d.build?' @ '+d.build:'');
     render(d);
-    hist.push({obs:d.concurrent_sessions,loc:d.local_in_flight,ph:d.phantom_estimate,
-               qd:d.queue_depth,band:d.band,qt:d.queue_timeouts,t429:d.total_429s});
+    hist.push({ts:Date.now()/1000,obs:d.concurrent_sessions,loc:d.local_in_flight,
+               ph:d.phantom_estimate,ep:d.effective_permits,
+               lim:d.limit,hc:d.hard_cap,band:d.band,brk:d.breaker,
+               stl:d.stale,age:d.usage_age,qd:d.queue_depth,
+               qt:d.queue_timeouts,t429:d.total_429s});
     if(hist.length>HIST_MAX) hist.shift();
     if(viewRange==='5m'){renderSparks();}
     else{fetchLong(false);}
@@ -1004,30 +1033,42 @@ function render(d){
 
 const SEV={normal:0,low:1,reject:2,boxed:3};
 const SEV_COLOR={1:'var(--warn)',2:'var(--crit)',3:'var(--crit)'};
+const BRKSEV={closed:0,half_open:1,open:2};
 
-// Mark samples where the cumulative counters advanced vs the previous sample.
+// Mark samples where the cumulative counters advanced vs the previous sample,
+// and flag discrete state values the spark overlays need.
 function withIncs(samples){
   return samples.map(function(s,i){
     var p=i>0?samples[i-1]:null;
-    return {obs:s.obs,loc:s.loc,ph:s.ph,qd:s.qd||0,band:s.band||'normal',
+    return {ts:s.ts,obs:s.obs,loc:s.loc,ph:s.ph,ep:s.ep,lim:s.lim,hc:s.hc,
+            qd:s.qd||0,band:s.band||'normal',brk:s.brk||'closed',stl:!!s.stl,age:s.age||0,
             qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429)};
   });
 }
 
 // Downsample to <=n buckets. Max for numeric series (mean would erase the
-// spikes worth seeing), worst for band, any for event ticks.
+// spikes worth seeing), worst for band and breaker, any for event ticks.
+// Effective permits uses the last value of the bucket (controller decision
+// is piecewise-constant; last value is most representative).
 function bucketize(samples,n){
   if(samples.length<=n) return samples;
   var k=Math.ceil(samples.length/n),out=[];
   for(var i=0;i<samples.length;i+=k){
-    var b={obs:null,loc:0,ph:0,qd:0,band:'normal',qtInc:false,t429Inc:false};
+    var b={ts:0,obs:null,loc:0,ph:0,ep:0,lim:null,hc:null,qd:0,
+           band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false};
     for(var j=i;j<Math.min(i+k,samples.length);j++){
       var s=samples[j];
+      b.ts=s.ts||b.ts;
       if(s.obs!=null&&(b.obs==null||s.obs>b.obs)) b.obs=s.obs;
       if(s.loc>b.loc) b.loc=s.loc;
       if(s.ph>b.ph) b.ph=s.ph;
+      if(s.ep!==undefined) b.ep=s.ep;
+      if(s.lim!=null&&(b.lim==null||s.lim>b.lim)) b.lim=s.lim;
+      if(s.hc!=null&&(b.hc==null||s.hc>b.hc)) b.hc=s.hc;
       if(s.qd>b.qd) b.qd=s.qd;
       if((SEV[s.band]||0)>(SEV[b.band]||0)) b.band=s.band;
+      if((BRKSEV[s.brk]||0)>(BRKSEV[b.brk]||0)) b.brk=s.brk;
+      b.stl=b.stl||s.stl;
       b.qtInc=b.qtInc||s.qtInc;
       b.t429Inc=b.t429Inc||s.t429Inc;
     }
@@ -1038,13 +1079,14 @@ function bucketize(samples,n){
 
 function renderSparks(){
   var d=lastD||{};
-  var hc=d.hard_cap??8,limit=d.limit??4;
+  var curHc=d.hard_cap??8,curLimit=d.limit??4;
   var raw=viewRange==='5m'?hist:longHist;
   var samples=bucketize(withIncs(raw),BUCKETS);
   var denom=viewRange==='5m'?HIST_MAX:samples.length;
   var svg=document.getElementById('spark');
   var info=document.getElementById('spark-info');
   var valid=samples.filter(function(h){return h.obs!=null;});
+  lastValid=valid;
   var infoBase=viewRange==='5m'
     ? valid.length+'/'+denom+' samples'
     : viewRange+' · '+raw.length+' ticks';
@@ -1052,34 +1094,58 @@ function renderSparks(){
   if(valid.length<2){
     svg.innerHTML='<text x="100" y="32" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
     document.getElementById('ribbon').innerHTML='';
-    document.getElementById('qspark').innerHTML='';
+    document.getElementById('qspark').innerHTML='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
     return;
   }
-  var W=200,pad=3,span=Math.max(denom-1,valid.length-1,1);
+  var W=200,pad=3,H=60,QH=28;
+  var span=Math.max(denom-1,valid.length-1,1);
   function xAt(i){return pad+(i/span)*(W-2*pad);}
-  // -- main spark: observed / local / phantom against the limit line
-  var H=60;
-  var maxV=hc;
+  function yFor(v){return H-pad-(v/maxV)*(H-2*pad);}
+  // -- main spark: observed / local / phantom / effective-permits against guide lines
+  var maxV=curHc;
   for(var i=0;i<valid.length;i++){
     if(valid[i].obs>maxV) maxV=valid[i].obs;
     if(valid[i].loc>maxV) maxV=valid[i].loc;
+    if(valid[i].ep>maxV) maxV=valid[i].ep;
   }
   if(maxV<1) maxV=1;
   function pts(key){
     return valid.map(function(h,i){
       var v=h[key]||0;
-      var y=H-pad-(v/maxV)*(H-2*pad);
+      var y=yFor(v);
       return xAt(i).toFixed(1)+','+y.toFixed(1);
     }).join(' ');
   }
-  var limitY=(H-pad-(limit/maxV)*(H-2*pad)).toFixed(1);
+  function stepPts(key){
+    var out=[];
+    for(var i=0;i<valid.length;i++){
+      var y=yFor(valid[i][key]||0).toFixed(1);
+      var x=xAt(i).toFixed(1);
+      out.push(x+','+y);
+      if(i<valid.length-1) out.push(xAt(i+1).toFixed(1)+','+y);
+    }
+    return out.join(' ');
+  }
+  var limitY=yFor(curLimit).toFixed(1),hcY=yFor(curHc).toFixed(1);
   var s='';
-  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" class="spark-grid" stroke-width="0.5"/>';
+  // Guide lines: limit and hard cap
+  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" class="spark-lim" />';
+  s+='<line x1="'+pad+'" y1="'+hcY+'" x2="'+(W-pad)+'" y2="'+hcY+'" class="spark-hc" />';
   s+='<polyline points="'+pts('obs')+'" fill="none" class="spark-obs" stroke-width="1"/>';
   s+='<polyline points="'+pts('loc')+'" fill="none" class="spark-loc" stroke-width="1"/>';
+  s+='<polyline points="'+stepPts('ep')+'" fill="none" class="spark-ep" stroke-width="1.2"/>';
   var hasPh=false;
   for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
   if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" class="spark-ph" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
+  // Breaker / stale tick marks at the top of the spark
+  for(var b=0;b<valid.length;b++){
+    var x=xAt(b).toFixed(1);
+    if(valid[b].brk==='open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="8" class="tick-brk-open" stroke-width="1.5"/>';
+    else if(valid[b].brk==='half_open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="5" class="tick-brk-half" stroke-width="1.2"/>';
+    else if(valid[b].stl) s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="4" class="tick-stale" stroke-width="1"/>';
+  }
+  // Keep crosshair line on top and off-canvas by default
+  s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="60"/>';
   svg.innerHTML=s;
   // -- band ribbon: one segment per non-normal sample
   var rb='';
@@ -1090,13 +1156,13 @@ function renderSparks(){
   }
   document.getElementById('ribbon').innerHTML=rb;
   // -- queue spark: depth area + event ticks, own scale
-  var QH=28;
   var maxQ=1;
   for(var q=0;q<valid.length;q++){if(valid[q].qd>maxQ) maxQ=valid[q].qd;}
   function qy(v){return QH-pad-(v/maxQ)*(QH-2*pad);}
   var qpts=valid.map(function(h,i){return xAt(i).toFixed(1)+','+qy(h.qd||0).toFixed(1);}).join(' ');
   var first=xAt(0).toFixed(1),last=xAt(valid.length-1).toFixed(1),base=(QH-pad).toFixed(1);
-  var qs='<polygon points="'+first+','+base+' '+qpts+' '+last+','+base+'" class="qfill" stroke="none"/>';
+  var qs='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
+  qs+='<polygon points="'+first+','+base+' '+qpts+' '+last+','+base+'" class="qfill" stroke="none"/>';
   qs+='<polyline points="'+qpts+'" fill="none" class="spark-qd" stroke-width="1"/>';
   for(var t=0;t<valid.length;t++){
     var x=xAt(t).toFixed(1);
@@ -1104,8 +1170,64 @@ function renderSparks(){
     else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
   }
   document.getElementById('qspark').innerHTML=qs;
-  info.textContent=infoBase+' · y max '+maxV+' · queue max '+maxQ;
+  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ;
 }
+
+function onSparkHover(e){
+  var v=lastValid;
+  if(!lastD||v.length<2) return;
+  var svg=e.currentTarget;
+  var rect=svg.getBoundingClientRect();
+  var x=e.clientX-rect.left;
+  var W=200,pad=3;
+  var xView=Math.max(pad,Math.min(W-pad,(x/rect.width)*W));
+  var denom=viewRange==='5m'?HIST_MAX:v.length;
+  var span=Math.max(denom-1,v.length-1,1);
+  var idx=Math.round(((xView-pad)/(W-2*pad))*span);
+  idx=Math.max(0,Math.min(v.length-1,idx));
+  var s=v[idx];
+  document.getElementById('tip-ts').textContent=fmtTime(s.ts);
+  document.getElementById('tip-obs').textContent=s.obs!=null?s.obs:'-';
+  document.getElementById('tip-loc').textContent=s.loc;
+  document.getElementById('tip-ep').textContent=s.ep;
+  document.getElementById('tip-qd').textContent=s.qd;
+  document.getElementById('tip-band').textContent=s.band;
+  var ageEl=document.getElementById('tip-age');
+  ageEl.textContent=(s.age!=null?s.age+'s':'-')+(s.stl?' stale':'');
+  ageEl.className=s.stl?'stale':'';
+  document.getElementById('tip-lim').textContent=s.lim!=null?s.lim:'-';
+  document.getElementById('tip-hc').textContent=s.hc!=null?s.hc:'-';
+  var brkText=s.brk;
+  if(s.brk==='half_open'&&lastD.breaker_half_open_age_seconds!=null)
+    brkText+=' ('+lastD.breaker_half_open_age_seconds+'s)';
+  document.getElementById('tip-brk').textContent=brkText;
+  var tip=document.getElementById('spark-tip');
+  tip.style.display='block';
+  var card=document.getElementById('spark-card');
+  var cRect=card.getBoundingClientRect();
+  var left=e.clientX-cRect.left+12;
+  var top=e.clientY-cRect.top+12;
+  if(left+tip.offsetWidth>cRect.width-8) left=cRect.width-tip.offsetWidth-8;
+  if(top+tip.offsetHeight>cRect.height-8) top=cRect.height-tip.offsetHeight-8;
+  tip.style.left=left+'px';
+  tip.style.top=top+'px';
+  var cx=(pad+(idx/span)*(W-2*pad)).toFixed(1);
+  var cm=document.getElementById('crosshair-main');
+  if(cm){cm.setAttribute('x1',cx);cm.setAttribute('x2',cx);}
+  var cq=document.getElementById('crosshair-q');
+  if(cq){cq.setAttribute('x1',cx);cq.setAttribute('x2',cx);}
+}
+function hideSparkTip(){
+  document.getElementById('spark-tip').style.display='none';
+  var cm=document.getElementById('crosshair-main');
+  if(cm){cm.setAttribute('x1',-10);cm.setAttribute('x2',-10);}
+  var cq=document.getElementById('crosshair-q');
+  if(cq){cq.setAttribute('x1',-10);cq.setAttribute('x2',-10);}
+}
+document.getElementById('spark').addEventListener('mousemove',onSparkHover);
+document.getElementById('spark').addEventListener('mouseleave',hideSparkTip);
+document.getElementById('qspark').addEventListener('mousemove',onSparkHover);
+document.getElementById('qspark').addEventListener('mouseleave',hideSparkTip);
 
 initHistory().then(poll);
 </script>
