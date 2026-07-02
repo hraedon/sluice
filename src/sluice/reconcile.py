@@ -42,6 +42,8 @@ from sluice.control import (
     phantom_estimate,
 )
 from sluice.gate import PermitGate
+from sluice.history import History, HistoryEntry
+from sluice.history_store import HistoryStore
 from sluice.providers import TruthSource
 from sluice.singleton import SingletonGuard
 from sluice.usage import CachedReading
@@ -49,6 +51,8 @@ from sluice.usage import CachedReading
 log = logging.getLogger("sluice.reconcile")
 
 _RETRY_AFTER_STALE_CAP = 300
+_PRUNE_INTERVAL_TICKS = 60
+_DEFAULT_HISTORY_TTL = 604800.0
 
 
 class ReconciliationLoop:
@@ -67,6 +71,9 @@ class ReconciliationLoop:
         guard: SingletonGuard | None = None,
         controller: str = "concurrency_reconcile",
         adaptive_config: AdaptiveConfig | None = None,
+        history: History | None = None,
+        history_store: HistoryStore | None = None,
+        history_ttl: float = _DEFAULT_HISTORY_TTL,
     ) -> None:
         self._truth = truth_source
         self._gate = gate
@@ -78,6 +85,10 @@ class ReconciliationLoop:
         self._guard = guard
         self._controller = controller
         self._adaptive_cfg = adaptive_config or AdaptiveConfig()
+        self._history = history
+        self._history_store = history_store
+        self._history_ttl = history_ttl
+        self._tick_count = 0
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
@@ -153,6 +164,8 @@ class ReconciliationLoop:
         now_mono = self._mono()
         now_wall = self._wall()
 
+        self._prune_429s(now_mono)
+
         # Capture local_in_flight *before* the fetch so the (observed, local)
         # pair in the phantom sample is aligned in time.  The provider's
         # concurrent_sessions reflects the moment the request was served, not
@@ -178,10 +191,6 @@ class ReconciliationLoop:
         self._breaker = breaker
 
         if self._controller == "adaptive":
-            # Prune stale 429s so the AIMD controller doesn't see 429s from
-            # outside the breaker window — otherwise a single 429 would
-            # keep the controller in permanent multiplicative-decrease.
-            self._prune_429s(now_mono)
             # AIMD controller — no phantom absorption (no concurrency ground truth).
             state = ControllerState(
                 reading=reading,
@@ -223,20 +232,101 @@ class ReconciliationLoop:
         if cached.ok:
             self._first_poll_ok = True
 
+        # Record this tick's state for trend analysis.  The entry is frozen at
+        # capture time so the history forms an immutable time series.  Recorded
+        # when either the in-memory buffer or the persistent store is configured.
+        if self._history is not None or self._history_store is not None:
+            obs = reading.concurrent_sessions if cached.ok else None
+            entry = HistoryEntry(
+                timestamp=now_wall,
+                concurrent_sessions=obs,
+                local_in_flight=self._gate.held,
+                phantom_estimate=self._last_phantom_estimate,
+                effective_permits=permits,
+                limit=reading.limit if cached.ok else None,
+                hard_cap=reading.hard_cap if cached.ok else None,
+                band=self._last_band.value,
+                breaker=breaker.state.value,
+                priority_low=reading.priority_low,
+                usage_age=age,
+                stale=not cached.ok,
+                recent_429s=len(self._recent_429s),
+                total_429s=self._total_429s,
+                queue_depth=self._gate.queue_depth,
+                queue_timeouts=self._gate.queue_timeouts,
+            )
+            if self._history is not None:
+                self._history.append(entry)
+            if self._history_store is not None:
+                self._history_store.append(entry)
+
     async def run(self) -> None:
         """Run the reconciliation loop forever (until cancelled)."""
         while True:
             try:
                 await self.tick()
+                self._tick_count += 1
+                if (
+                    self._history_store is not None
+                    and self._tick_count % _PRUNE_INTERVAL_TICKS == 0
+                ):
+                    try:
+                        self._history_store.prune(
+                            ttl_seconds=self._history_ttl, now=self._wall()
+                        )
+                    except Exception:
+                        log.warning("history store prune failed", exc_info=True)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("reconciliation tick failed — closing gate (fail-safe)")
+                self._last_permits = 0
                 try:
                     await self._gate.resize(0)
                 except Exception:
                     log.critical("failed to close gate after tick exception")
+                if self._history is not None or self._history_store is not None:
+                    try:
+                        self._record_failed_tick()
+                    except Exception:
+                        log.warning("_record_failed_tick failed", exc_info=True)
             await asyncio.sleep(self._poll_interval)
+
+    def _record_failed_tick(self) -> None:
+        """Record a fail-safe history entry when tick() raises.
+
+        Uses the last-known state (which may be stale) and marks
+        ``effective_permits=0``, ``stale=True``, ``tick_failed=True`` so the
+        trend shows the gap rather than silently skipping it.
+        """
+        if self._history is None and self._history_store is None:
+            return
+        reading = None
+        if self._last_reading_cached is not None:
+            reading = self._last_reading_cached.reading
+        entry = HistoryEntry(
+            timestamp=self._wall(),
+            concurrent_sessions=reading.concurrent_sessions if reading else None,
+            local_in_flight=self._gate.held,
+            phantom_estimate=self._last_phantom_estimate,
+            effective_permits=0,
+            limit=reading.limit if reading else None,
+            hard_cap=reading.hard_cap if reading else None,
+            band=self._last_band.value,
+            breaker=self._breaker.state.value,
+            priority_low=reading.priority_low if reading else False,
+            usage_age=self._last_age,
+            stale=True,
+            recent_429s=len(self._recent_429s),
+            total_429s=self._total_429s,
+            queue_depth=self._gate.queue_depth,
+            queue_timeouts=self._gate.queue_timeouts,
+            tick_failed=True,
+        )
+        if self._history is not None:
+            self._history.append(entry)
+        if self._history_store is not None:
+            self._history_store.append(entry)
 
     async def start(self) -> None:
         """Start the background loop as a task."""
@@ -244,7 +334,7 @@ class ReconciliationLoop:
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        """Cancel the background loop and close the truth source."""
+        """Cancel the background loop and close the truth source + store."""
         if self._task is not None:
             self._task.cancel()
             try:
@@ -253,6 +343,8 @@ class ReconciliationLoop:
                 pass
             self._task = None
         await self._truth.close()
+        if self._history_store is not None:
+            self._history_store.close()
 
     # -- observability (read by /metrics, /status, etc.) ---------------------
 
@@ -335,6 +427,16 @@ class ReconciliationLoop:
     def controller_name(self) -> str:
         """The active controller strategy name."""
         return self._controller
+
+    @property
+    def history(self) -> History | None:
+        """The history ring buffer, if configured."""
+        return self._history
+
+    @property
+    def history_store(self) -> HistoryStore | None:
+        """The optional SQLite persistence store, if configured."""
+        return self._history_store
 
     @property
     def provider_name(self) -> str:

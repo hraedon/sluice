@@ -21,6 +21,8 @@ import httpx
 from sluice import __version__
 from sluice.control import AdaptiveConfig, BreakerConfig, ControllerConfig
 from sluice.gate import PermitGate
+from sluice.history import History
+from sluice.history_store import SQLiteHistoryStore
 from sluice.providers import get_provider, make_truth_source
 from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
@@ -45,6 +47,9 @@ _DEFAULTS: dict[str, Any] = {
     "admin_token": None,
     "reserve": None,
     "provider": "umans",
+    "history_size": 2880,
+    "history_store": None,
+    "history_ttl": 604800.0,
 }
 
 
@@ -63,9 +68,9 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 
 
 def _coerce(env_val: str, key: str) -> Any:
-    if key in ("target",):
+    if key in ("target", "history_size"):
         return int(env_val)
-    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval"):
+    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl"):
         return float(env_val)
     return env_val
 
@@ -115,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
     serve.add_argument("--admin-token", default=None, help="token for admin routes (/, /status.json, /metrics) — sent as Bearer header or Basic auth password")
     serve.add_argument("--reserve", default=None, help="reserve permits for a QoS class, e.g. 'interactive=1' (default: none → pure FIFO)")
+    serve.add_argument("--history-size", type=int, default=None, help="number of tick snapshots to retain for trend analysis (default: 2880, ~4h at 5s poll; 0 disables)")
+    serve.add_argument("--history-store", default=None, help="path to SQLite file for history persistence (default: none — in-memory only). Survives restarts; enables crash forensics.")
+    serve.add_argument("--history-ttl", type=float, default=None, help="seconds to retain entries in the SQLite store before pruning (default: 604800 = 7 days)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -159,6 +167,13 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     log_level = _resolve("log_level", args)
     admin_token = _resolve("admin_token", args)
     reserve_raw = _resolve("reserve", args)
+    history_size = _resolve("history_size", args)
+    history_store_path = _resolve("history_store", args)
+    history_ttl = _resolve("history_ttl", args)
+
+    if history_store_path and history_ttl is not None and history_ttl <= 0:
+        print("sluice: error: --history-ttl must be positive", file=sys.stderr)
+        return 2
 
     reserve_count = 0
     reserved_labels: set[str] = set()
@@ -220,6 +235,22 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         release_cooldown=release_cooldown,
         reserve=reserve_count,
     )
+    history: History | None = None
+    if history_size and history_size > 0:
+        history = History(maxlen=history_size)
+    history_store: SQLiteHistoryStore | None = None
+    if history_store_path:
+        history_store = SQLiteHistoryStore(history_store_path)
+        if not history_store.is_available:
+            log.warning("history store at %s failed to open — persistence disabled, in-memory buffer only", history_store_path)
+        elif history is not None:
+            warmed = history_store.load_recent(history_size)
+            for entry in warmed:
+                history.append(entry)
+            if warmed:
+                log.info("  history warmed:    %d entries from store", len(warmed))
+        elif history is None:
+            log.warning("  --history-store given but --history-size is 0 — store will persist but /history.json is disabled")
     reconcile = ReconciliationLoop(
         truth_source=truth_source,
         gate=gate,
@@ -229,6 +260,9 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         guard=guard,
         controller=provider.controller,
         adaptive_config=AdaptiveConfig(target=target) if provider.controller == "adaptive" else None,
+        history=history,
+        history_store=history_store,
+        history_ttl=history_ttl,
     )
     app = ProxyApp(
         upstream_base_url=upstream,
@@ -258,6 +292,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         log.info("  config:            %s", config_path)
     if reserve_count > 0:
         log.info("  reserve:           %s=%d", next(iter(reserved_labels)), reserve_count)
+    log.info("  history_size:      %s", history_size if history_size and history_size > 0 else "disabled")
+    if history_store_path:
+        log.info("  history_store:     %s", history_store_path)
+        log.info("  history_ttl:       %.0fs", history_ttl)
 
     import uvicorn
 

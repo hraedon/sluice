@@ -204,7 +204,7 @@ class ProxyApp:
         # (/) is included so the browser prompts for Basic auth on first
         # visit; the cached credentials then authorize the JS fetch to
         # /status.json.  Without gating /, the dashboard's fetch would 401.
-        if path in ("/", "/status.json", "/metrics"):
+        if path in ("/", "/status.json", "/metrics", "/history.json"):
             if not self._check_admin_auth(scope):
                 await self._send_text(
                     send,
@@ -222,6 +222,9 @@ class ProxyApp:
                 return
             if path == "/metrics":
                 await self._send_prometheus(send)
+                return
+            if path == "/history.json":
+                await self._send_history_json(send, scope)
                 return
 
         await self._proxy_request(scope, receive, send)
@@ -624,6 +627,32 @@ class ProxyApp:
         text = to_prometheus(snap)
         await self._send_text(send, 200, text, content_type="text/plain; version=0.0.4; charset=utf-8")
 
+    async def _send_history_json(self, send: Send, scope: Scope) -> None:
+        history = self._reconcile.history
+        if history is not None:
+            qs = scope.get("query_string", b"").decode("latin-1")
+            limit: int | None = None
+            if qs:
+                for pair in qs.split("&"):
+                    k, _, v = pair.partition("=")
+                    if k == "limit":
+                        try:
+                            limit = max(0, int(v))
+                        except ValueError:
+                            pass
+            entries = history.to_dict_list(limit=limit)
+        else:
+            entries = []
+        body = json.dumps({"entries": entries, "count": len(entries), "enabled": history is not None})
+        payload = body.encode()
+        headers: list[tuple[bytes, bytes]] = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+            (b"cache-control", b"no-store"),
+        ]
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+        await send({"type": "http.response.body", "body": payload, "more_body": False})
+
     async def _send_dashboard(self, send: Send) -> None:
         await self._send_text(send, 200, _DASHBOARD_HTML, content_type="text/html; charset=utf-8")
 
@@ -772,6 +801,18 @@ const HIST_MAX=60;
 let hist=[];
 
 function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
+
+async function initHistory(){
+  try{
+    const r=await fetch('/history.json?limit='+HIST_MAX,{credentials:'include'});
+    if(!r.ok) return;
+    const d=await r.json();
+    if(!d.entries||!d.entries.length) return;
+    hist=d.entries.map(function(e){
+      return {obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep};
+    });
+  }catch(e){}
+}
 
 async function doPoll(){
   if(fetching) return;
@@ -927,7 +968,7 @@ function renderSpark(d){
   svg.innerHTML=s;
 }
 
-poll();
+initHistory().then(poll);
 </script>
 </body>
 </html>
