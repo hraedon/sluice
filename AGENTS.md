@@ -67,7 +67,14 @@ silently dropped.
 src/sluice/
   control.py   # PURE deterministic core: bands, permit math, reconciliation, breaker
   usage.py     # /v1/usage client + parser (borrows usage-dashboard's umans logic)
+  providers.py # provider registry: truth sources + controller choice per upstream
   proxy.py     # async reverse proxy shell (streaming, both routes, disconnect→cancel)
+  gate.py      # resizable permit gate (FIFO queue, optional QoS reserve)
+  reconcile.py # background loop: fetch truth → core decides → resize gate
+  status.py    # point-in-time snapshot for /status.json and /metrics
+  history.py   # bounded ring buffer of per-tick snapshots (/history.json, sparkline)
+  history_store.py # optional fail-safe SQLite persistence for history (--history-store)
+  singleton.py # single-instance guard (the semaphore only works if there's one)
   cli.py       # `sluice serve ...` entry point
 tests/
   test_control.py        # pure-core unit tests, no network
