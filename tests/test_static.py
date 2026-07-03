@@ -1,14 +1,27 @@
-"""Encoding integrity of static assets.
+"""Encoding integrity and JS validation of static assets.
 
 The dashboard moved from an inline Python string to a static file in
 294b2d2, which took it out of Python-source linting; that same commit
 introduced double-encoded UTF-8 (mojibake) in six spots — middots
-rendered as 'Â·' and em dashes as invisible-control junk in the banner
+rendered as 'ÃÂ·' and em dashes as invisible-control junk in the banner
 strings. These tests pin the failure mode: a UTF-8 file misread as
-Latin-1 and re-encoded leaves C1 control characters (U+0080–U+009F)
-and Â/â artifact pairs that valid text never contains.
+Latin-1 and re-encoded leaves C1 control characters (U+0080âU+009F)
+and Ã/Ã¢ artifact pairs that valid text never contains.
+
+Additionally, the dashboard's inline JavaScript is now validated for
+syntax (``node --check``) and exercised with mock data via a Node.js
+harness.  The syntax test would have caught the ternary-colon syntax
+error in commit ea03cde that broke the dashboard entirely.
 """
 
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,6 +30,16 @@ _STATIC_DIR = Path(__file__).parent.parent / "src" / "sluice" / "static"
 _TEXT_ASSETS = sorted(
     p for p in _STATIC_DIR.rglob("*") if p.suffix in {".html", ".css", ".js", ".txt"}
 )
+_DASHBOARD = _STATIC_DIR / "dashboard.html"
+_NODE = shutil.which("node")
+
+
+def _extract_dashboard_js() -> str:
+    """Return the contents of the first ``<script>`` tag in dashboard.html."""
+    html = _DASHBOARD.read_text(encoding="utf-8")
+    m = re.search(r"<script>(.*?)</script>", html, re.DOTALL)
+    assert m, "dashboard.html must contain a <script> block"
+    return m.group(1)
 
 
 @pytest.mark.parametrize("asset", _TEXT_ASSETS, ids=lambda p: p.name)
@@ -28,8 +51,8 @@ def test_static_asset_is_valid_utf8_without_mojibake(asset: Path) -> None:
     ]
     assert not c1_controls, f"C1 control chars (double-encode residue): {c1_controls}"
 
-    # 'Â' or 'â' followed by another non-ASCII char is the signature of
-    # UTF-8 → Latin-1 → UTF-8 round-tripped punctuation (·, —, etc.).
+    # 'Ã' or 'Ã¢' followed by another non-ASCII char is the signature of
+    # UTF-8 â Latin-1 â UTF-8 round-tripped punctuation (Â·, â, etc.).
     artifacts = [
         (i, text[i : i + 2])
         for i, c in enumerate(text[:-1])
@@ -40,3 +63,269 @@ def test_static_asset_is_valid_utf8_without_mojibake(asset: Path) -> None:
 
 def test_static_assets_exist() -> None:
     assert any(p.name == "dashboard.html" for p in _TEXT_ASSETS)
+
+
+# ---------------------------------------------------------------------------
+# JS syntax validation
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_is_syntactically_valid() -> None:
+    """The dashboard's inline JS must parse without syntax errors.
+
+    This test would have caught the ternary syntax error in commit ea03cde
+    (``cls?' class="'+esc(cls)+'"'':''`` parsed as two adjacent string
+    literals) that broke the dashboard entirely â render() never executed.
+    """
+    js = _extract_dashboard_js()
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(js)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, "--check", path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Dashboard JS syntax error:\n{result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# JS render test with mock data
+# ---------------------------------------------------------------------------
+
+# Prefix: mock DOM, mock fetch, mock globals â everything the dashboard JS
+# touches at load time and during the first poll cycle.
+_NODE_RENDER_PREFIX = r"""
+function _escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function _mockEl(id){
+  var _tc='',_ih='',_cn='';
+  return {
+    id:id,
+    style:{},
+    classList:{add:function(){},remove:function(){},toggle:function(){},contains:function(){return false;}},
+    get textContent(){return _tc;},
+    set textContent(v){_tc=String(v);_ih=_escapeHtml(_tc);},
+    get innerHTML(){return _ih;},
+    set innerHTML(v){_ih=String(v);},
+    get className(){return _cn;},
+    set className(v){_cn=String(v);},
+    setAttribute:function(){},
+    getAttribute:function(){return null;},
+    getBoundingClientRect:function(){return{left:0,top:0,width:200,height:120};},
+    addEventListener:function(){},
+    removeEventListener:function(){},
+    offsetWidth:100,
+    offsetHeight:20,
+    appendChild:function(){},
+    removeChild:function(){},
+    querySelectorAll:function(){return [];},
+    querySelector:function(){return null;},
+  };
+}
+var _elements={};
+var document={
+  createElement:function(tag){return _mockEl('');},
+  getElementById:function(id){if(!_elements[id])_elements[id]=_mockEl(id);return _elements[id];},
+  querySelectorAll:function(sel){return [];},
+  querySelector:function(sel){return null;},
+  addEventListener:function(){},
+  body:_mockEl('body'),
+};
+var window={addEventListener:function(){},scrollY:0,location:{href:'http://localhost/'}};
+var _warnings=[];
+var console_warn_original=console.warn;
+console.warn=function(){_warnings.push(Array.prototype.slice.call(arguments).join(' '));};
+var _mockStatus={
+  version:'1.0.0',build:'test',
+  concurrent_sessions:3,limit:4,hard_cap:8,
+  priority_low:false,priority_reason:null,
+  boxed_until:null,resets_at:null,
+  usage_age:1.5,stale:false,
+  effective_permits:4,band:'normal',phantom_estimate:0,
+  breaker:'closed',breaker_half_open_age_seconds:null,
+  recent_429s:2,total_429s:5,gateway_429s:0,
+  target:4,queue_depth:0,local_in_flight:2,cooling_down:0,
+  avg_wait_seconds:0.1,p95_wait_seconds:0.5,queue_timeouts:3,
+  ready:true,gate_closed_reason:'open',
+  config:{target:4,min_floor:1,poll_interval:5,usage_fresh_ttl:30,
+    phantom_window:5,breaker_threshold:3,breaker_window_seconds:300,
+    breaker_cooldown_seconds:60,provider:'umans',controller:'pid'},
+  overrides:{},
+  requests_in_window:100,requests_limit:500,requests_remaining:400,
+  requests_hard_cap:1000,requests_window_seconds:3600,
+  local_requests_in_window:95,request_window_delta:5,
+  total_requests_forwarded:1000,
+};
+var _fetchCount=0;
+var fetch=function(url,opts){
+  _fetchCount++;
+  if(url.indexOf('/status.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve(_mockStatus);},
+      text:function(){return Promise.resolve(JSON.stringify(_mockStatus));},
+      headers:{get:function(k){return k==='content-type'?'application/json':'';}},
+    });
+  }
+  if(url.indexOf('/history.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({entries:[]});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(){return '';}},
+    });
+  }
+  if(url.indexOf('/admin/config')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(k){return k==='content-type'?'application/json':'';}},
+    });
+  }
+  return Promise.resolve({ok:false,status:404,json:function(){return Promise.resolve({});},text:function(){return Promise.resolve('');},headers:{get:function(){return '';}}});
+};
+"""
+
+# Suffix: after the dashboard JS has loaded and the initial poll completed,
+# read the rendered HTML, then simulate a queue-timeout increment and
+# re-render to verify row-warn activation.
+_NODE_RENDER_SUFFIX = r"""
+setTimeout(function(){
+  try{
+    var statsHtml=_elements['stats']?_elements['stats'].innerHTML:'';
+    var configHtml=_elements['config-table']?_elements['config-table'].innerHTML:'';
+
+    /* Simulate a queue_timeout increment: the last hist entry has qt:3
+       (from the mock status data).  Bump lastD.queue_timeouts to 4 so
+       recentInc('qt','queue_timeouts') sees current > last-hist-value. */
+    if(typeof lastD!=='undefined'&&lastD
+       &&typeof hist!=='undefined'&&hist.length>0){
+      lastD.queue_timeouts=4;
+      render(lastD);
+    }
+    var statsAfter=_elements['stats']?_elements['stats'].innerHTML:'';
+
+    console.log(JSON.stringify({
+      error:null,
+      stats:statsHtml,
+      statsAfterIncrement:statsAfter,
+      config:configHtml,
+      fetchCount:_fetchCount,
+      warnings:_warnings,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({
+      error:e.message,stack:e.stack,
+      stats:'',statsAfterIncrement:'',config:'',
+    }));
+  }
+  process.exit(0);
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_renders_status_data() -> None:
+    """Execute the dashboard JS in Node with a mock DOM and mock /status.json.
+
+    Verifies the render() function produces correct HTML:
+    - Stats table has rows for all expected fields
+    - Primary-key rows (band, effective_permits, local_in_flight, breaker)
+      carry the ``row-primary`` class
+    - Non-primary rows carry ``row-detail``
+    - ``total_429s`` and ``recent_429s`` rows carry ``row-crit`` when
+      ``recent_429s > 0``
+    - ``queue_timeouts`` row gains ``row-warn`` after a simulated increment
+    - Config table renders the target stepper (``step-btn``)
+    """
+    js = _extract_dashboard_js()
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + _NODE_RENDER_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js render test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert not output.get("warnings"), (
+        f"Dashboard JS emitted unexpected console.warn: {output['warnings']}"
+    )
+
+    stats = output["stats"]
+    assert stats, "Stats table must not be empty after initial poll"
+    # CSS class assignments
+    assert "row-primary" in stats, "primary-key rows must have row-primary class"
+    assert "row-detail" in stats, "non-primary rows must have row-detail class"
+    assert "row-crit" in stats, "total_429s/recent_429s must have row-crit (recent_429s>0)"
+    assert "row-warn" not in stats, "queue_timeouts must not have row-warn on first poll"
+    # Expected field names rendered
+    for field in (
+        "band", "effective_permits", "local_in_flight", "breaker",
+        "queue_timeouts", "total_429s", "recent_429s", "queue_depth",
+    ):
+        assert f">{field}<" in stats, f"stats table must render field: {field}"
+
+    # After simulated queue_timeout increment
+    stats_after = output["statsAfterIncrement"]
+    assert "row-warn" in stats_after, (
+        "queue_timeouts row must gain row-warn after a timeout increment"
+    )
+
+    # Config table has the target stepper (Plan 011)
+    config = output["config"]
+    assert "step-btn" in config, "config table must render target stepper buttons"
+
+
+# ---------------------------------------------------------------------------
+# Structural assertions (no Node required)
+# ---------------------------------------------------------------------------
+
+def test_dashboard_has_render_class_styles() -> None:
+    """The dashboard HTML must define the CSS classes and JS logic for the
+    row-primary/detail/warn/crit rendering introduced in ea03cde.
+
+    This is a static-content assertion (same approach as the existing
+    dashboard layout tests) so it runs even when Node is unavailable.
+    """
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    # CSS classes defined in <style>
+    for cls in ("row-primary", "row-detail", "row-warn", "row-crit"):
+        assert f"tr.{cls}" in html, f"CSS class tr.{cls} must be defined in <style>"
+
+    # PRIMARY_KEYS constant with expected keys
+    pk_match = re.search(r"PRIMARY_KEYS\s*=\s*\{([^}]*)\}", html)
+    assert pk_match, "PRIMARY_KEYS constant must be defined"
+    pk_body = pk_match.group(1)
+    for key in ("band", "effective_permits", "local_in_flight", "breaker"):
+        assert f"'{key}'" in pk_body, f"PRIMARY_KEYS must include '{key}'"
+
+    # kvRow accepts (r, cls) parameters
+    assert re.search(r"function\s+kvRow\s*\(\s*r\s*,\s*cls\s*\)", html), (
+        "kvRow function must accept (r, cls) parameters"
+    )
+
+    # recentInc function is defined
+    assert re.search(r"function\s+recentInc\s*\(", html), (
+        "recentInc function must be defined"
+    )
+
+    # Class-assignment logic references the correct field names
+    assert "queue_timeouts" in html and "row-warn" in html
+    assert "total_429s" in html and "row-crit" in html
+    assert "recent_429s" in html and "row-crit" in html
