@@ -61,6 +61,9 @@ class StatusSnapshot:
     request_window_delta: int | None
     total_requests_forwarded: int
 
+    # Runtime overrides (Plan 011)
+    overrides: dict[str, Any]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "concurrent_sessions": self.concurrent_sessions,
@@ -102,6 +105,7 @@ class StatusSnapshot:
             "local_requests_in_window": self.local_requests_in_window,
             "request_window_delta": self.request_window_delta,
             "total_requests_forwarded": self.total_requests_forwarded,
+            "overrides": self.overrides,
         }
 
 
@@ -162,6 +166,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         local_requests_in_window=reconcile.local_requests_in_window,
         request_window_delta=reconcile.request_window_delta,
         total_requests_forwarded=reconcile.total_requests_forwarded,
+        overrides=reconcile.overrides,
     )
 
 
@@ -221,5 +226,11 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_local_requests_in_window", "Sluice forwarded requests within the provider's window", snap.local_requests_in_window)
     gauge("sluice_request_window_delta", "Provider requests_in_window minus sluice local count (leakage)", snap.request_window_delta)
     gauge("sluice_total_requests_forwarded", "Total requests forwarded upstream since startup", snap.total_requests_forwarded)
+
+    # Config + overrides (Plan 011)
+    gauge("sluice_config_target", "Current target concurrency (boot or overridden)", snap.target)
+    lines.append('# HELP sluice_config_overridden Whether a config field has a runtime override (0 or 1)')
+    lines.append('# TYPE sluice_config_overridden gauge')
+    lines.append(f'sluice_config_overridden{{field="target"}} {1 if "target" in snap.overrides else 0}')
 
     return "\n".join(lines) + "\n"

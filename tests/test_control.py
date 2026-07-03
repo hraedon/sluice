@@ -23,6 +23,7 @@ from sluice.control import (
     breaker_on_success,
     breaker_on_tick,
     adaptive_effective_permits,
+    validate_target_override,
 )
 
 NOW = 1_000_000.0
@@ -655,3 +656,68 @@ def test_adaptive_healthy_tick_preserves_decrease_timestamp():
 
     permits, snap = adaptive_effective_permits(bad, snap, cfg, now=115.0)
     assert permits == 5
+
+
+# --- Plan 011: Runtime override validation ----------------------------------
+
+
+def test_validate_target_below_1_rejected():
+    """target < 1 is rejected — a zero-permit target is a deploy decision."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    with pytest.raises(ValueError, match=">= 1"):
+        validate_target_override(0, r, CFG)
+    with pytest.raises(ValueError, match=">= 1"):
+        validate_target_override(-5, r, CFG)
+
+
+def test_validate_target_at_1_accepted():
+    """target=1 is the minimum valid override."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    assert validate_target_override(1, r, CFG) is None
+
+
+def test_validate_target_at_limit_accepted():
+    """target=limit is a clean accept (no warning)."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    assert validate_target_override(4, r, CFG) is None
+
+
+def test_validate_target_above_limit_accepted_with_warning():
+    """target > limit but <= hard_cap is accepted with a warning."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    warning = validate_target_override(5, r, CFG)
+    assert warning is not None
+    assert "above limit" in warning
+
+
+def test_validate_target_at_hard_cap_accepted_with_warning():
+    """target=hard_cap is above limit, so accepted with a warning."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    warning = validate_target_override(8, r, CFG)
+    assert warning is not None
+    assert "above limit" in warning
+
+
+def test_validate_target_above_hard_cap_rejected():
+    """target > hard_cap is rejected — the provider will punish."""
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
+    with pytest.raises(ValueError, match="hard_cap"):
+        validate_target_override(9, r, CFG)
+
+
+def test_effective_permits_clamped_by_hard_cap():
+    """When target > hard_cap (e.g. override), effective_permits clamps to hard_cap."""
+    cfg = ControllerConfig(target=10, min_floor=1)
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=6)
+    s = state(r, in_flight=0, phantom=0)
+    # base = 10, but clamped to min(10, 6) = 6
+    assert effective_permits(s, cfg, now=NOW) == 6
+
+
+def test_effective_permits_not_clamped_by_hard_cap_when_stale():
+    """When the reading is stale, hard_cap is not trusted — no clamp."""
+    cfg = ControllerConfig(target=10, min_floor=1)
+    r = reading(concurrent_sessions=0, limit=4, hard_cap=6, age_seconds=60.0)
+    s = state(r, in_flight=0, phantom=0)
+    # Stale: base = min(10, 10-1) = 9, clamped to [1, 10] = 9 (not clamped to 6)
+    assert effective_permits(s, cfg, now=NOW) == 9

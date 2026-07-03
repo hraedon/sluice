@@ -235,6 +235,12 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     if state.breaker is BreakerState.HALF_OPEN:
         return max(0, min(base, 1))
 
+    # Clamp target against the provider's hard_cap when the reading is fresh —
+    # a runtime override (or a plan downgrade) can leave target > hard_cap,
+    # and the provider will punish requests above hard_cap (AGENTS.md rule 1).
+    # When stale, we don't trust hard_cap; the stale_penalty already tightened.
+    if reading.age_seconds <= config.usage_fresh_ttl:
+        return _clamp(base, config.min_floor, min(config.target, reading.hard_cap))
     return _clamp(base, config.min_floor, config.target)
 
 
@@ -476,3 +482,40 @@ def adaptive_effective_permits(
         last_decrease_at=adaptive.last_decrease_at,
         last_decrease_monotonic=adaptive.last_decrease_monotonic,
     )
+
+
+# ---------------------------------------------------------------------------
+# Runtime override validation (Plan 011 — pure, provider-aware bounds)
+# ---------------------------------------------------------------------------
+
+
+def validate_target_override(
+    value: int, reading: UsageReading, config: ControllerConfig
+) -> str | None:
+    """Validate a target override against provider limits.
+
+    Returns ``None`` on clean accept, a warning string on accept-with-warning.
+    Raises :class:`ValueError` on rejection (caller returns 400 + reason).
+
+    Bounds (from Plan 011 §4):
+
+    * ``value < 1`` → reject (a zero-permit target is a deploy decision, not runtime).
+    * ``value > hard_cap`` → reject (the provider will punish requests above this;
+      never let an operator configure a value the provider won't serve).
+    * ``value > limit`` → accept-with-warning (this is the WI-024 experiment shape —
+      requests above ``limit`` run at low priority, sometimes wanted).
+    * Otherwise → clean accept.
+    """
+    if value < 1:
+        raise ValueError(f"target must be >= 1, got {value}")
+    if value > reading.hard_cap:
+        raise ValueError(
+            f"target {value} exceeds hard_cap {reading.hard_cap} — "
+            "the provider will reject requests above this"
+        )
+    if value > reading.limit:
+        return (
+            f"target {value} is above limit {reading.limit} — "
+            "requests above the limit run at low priority"
+        )
+    return None

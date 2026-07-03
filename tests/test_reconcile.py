@@ -5,6 +5,8 @@ Uses a fake clock and a fake usage source — no network.
 
 from __future__ import annotations
 
+import pytest
+
 from sluice.control import (
     Band,
     BreakerConfig,
@@ -806,3 +808,128 @@ async def test_observed_above_hard_cap_gives_reject_band():
     await loop.tick()
     assert loop.band is Band.REJECT
     assert gate.capacity == 1  # phantom absorption floors at min_floor
+
+
+# --- Plan 011: Override store -----------------------------------------------
+
+
+async def test_apply_override_changes_target():
+    """apply_override updates the controller config for the next tick."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.target == 3  # boot value
+
+    warning = loop.apply_override("target", 5)
+    assert warning is not None  # 5 > limit=4 → warning
+    assert loop.target == 5
+    assert "target" in loop.overrides
+    assert loop.overrides["target"]["boot"] == 3
+    assert loop.overrides["target"]["override"] == 5
+
+
+async def test_apply_override_resizes_gate_next_tick():
+    """After applying an override, the next tick resizes the gate."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert gate.capacity == 3
+
+    loop.apply_override("target", 4)  # at limit, no warning
+    await loop.tick()
+    assert gate.capacity == 4
+
+
+async def test_clear_override_reverts_to_boot():
+    """clear_override restores the boot config value."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    loop.apply_override("target", 5)
+    assert loop.target == 5
+
+    loop.clear_override("target")
+    assert loop.target == 3
+    assert loop.overrides == {}
+
+
+async def test_clear_override_no_op_when_none():
+    """clear_override on a field with no active override is a no-op."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    loop.clear_override("target")  # should not raise
+    assert loop.target == 3
+
+
+async def test_apply_override_rejects_unknown_field():
+    """Non-whitelisted fields are rejected."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    with pytest.raises(ValueError, match="whitelist"):
+        loop.apply_override("min_floor", 2)
+
+
+async def test_apply_override_rejects_above_hard_cap():
+    """A target above hard_cap is rejected by validate_target_override."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    with pytest.raises(ValueError, match="hard_cap"):
+        loop.apply_override("target", 99)
+
+
+async def test_override_visible_in_status_snapshot():
+    """The override appears in the status snapshot's overrides dict."""
+    from sluice.status import snapshot
+
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+
+    loop.apply_override("target", 5)
+    snap = snapshot(loop)
+    d = snap.to_dict()
+    assert "overrides" in d
+    assert d["overrides"]["target"]["boot"] == 3
+    assert d["overrides"]["target"]["override"] == 5
+
+
+async def test_no_override_shows_empty_overrides():
+    """When no override is active, overrides is an empty dict."""
+    from sluice.status import snapshot
+
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+
+    snap = snapshot(loop)
+    d = snap.to_dict()
+    assert d["overrides"] == {}
+
+
+async def test_apply_override_before_first_tick_rejected():
+    """Override is rejected before the first successful usage poll (fail-safe)."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    # No tick yet — _first_poll_ok is False
+    with pytest.raises(ValueError, match="first successful usage poll"):
+        loop.apply_override("target", 4)
+
+
+async def test_apply_override_with_stale_reading_rejected():
+    """Override is rejected when the latest reading is stale (fail-safe)."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+
+    client.set_fail(True)
+    await loop.tick()  # this tick gets a stale reading
+
+    with pytest.raises(ValueError, match="stale"):
+        loop.apply_override("target", 4)
+
+
+async def test_clear_override_reverts_adaptive_config():
+    """clear_override also reverts the adaptive config target."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    loop._controller = "adaptive"
+    loop._adaptive_cfg = type(loop._adaptive_cfg)(target=3)
+    await loop.tick()
+
+    loop.apply_override("target", 5)
+    assert loop._adaptive_cfg.target == 5
+
+    loop.clear_override("target")
+    assert loop._adaptive_cfg.target == 3

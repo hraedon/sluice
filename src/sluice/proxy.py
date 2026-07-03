@@ -17,15 +17,17 @@ import asyncio
 import logging
 import os
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from typing import Any
+from collections.abc import AsyncIterator, Mapping
 
 import httpx
 
 from sluice.admin import (
+    Receive,
     Send,
     Scope,
     check_admin_auth,
+    handle_config_delete,
+    handle_config_post,
     handle_healthz,
     handle_readyz,
     is_admin_auth_value,
@@ -42,9 +44,6 @@ from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import SingletonGuard
 
 log = logging.getLogger("sluice.proxy")
-
-# ASGI receive type (Send/Scope are re-exported from admin for callers that need them).
-Receive = Callable[[], Awaitable[dict[str, Any]]]
 
 # RFC 7230 hop-by-hop headers — never forwarded in either direction.
 _HOP_BY_HOP = frozenset(
@@ -192,6 +191,18 @@ class ProxyApp:
         # These are served unauthenticated — they contain no secrets.
         if path.startswith("/static/"):
             await serve_static(path, send)
+            return
+
+        # Config mutation endpoints (Plan 011) — own auth/disabled checks.
+        if path == "/admin/config" and scope["method"] == "POST":
+            await handle_config_post(
+                send, receive, self._reconcile, self._admin_token, scope, self._guard
+            )
+            return
+        if path == "/admin/config/target" and scope["method"] == "DELETE":
+            await handle_config_delete(
+                send, self._reconcile, self._admin_token, scope, self._guard
+            )
             return
 
         # Admin routes — token-gated when admin_token is set.  The dashboard

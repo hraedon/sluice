@@ -2856,3 +2856,335 @@ async def test_concurrent_load():
     assert gate.held == 0, "all permits released after completion"
     assert gate.queue_timeouts == 0, "no queue timeouts expected"
     assert max_queue_depth > 0, "queue depth should have reached > 0 at some point"
+
+
+# ---------------------------------------------------------------------------
+# Plan 011: Runtime config override via dashboard
+# ---------------------------------------------------------------------------
+
+
+async def test_post_config_override_with_bearer():
+    """POST /admin/config with valid bearer token applies a target override."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["target"] == 4
+    assert response.json()["overridden"] is True
+    assert reconcile.target == 4
+
+
+async def test_post_config_override_with_warning():
+    """POST /admin/config with target above limit returns a warning."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 6},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert "warning" in response.json()
+    assert "above limit" in response.json()["warning"]
+
+
+async def test_post_config_override_resizes_gate_next_tick():
+    """After applying an override, the next tick resizes the gate."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    await reconcile.tick()
+    assert reconcile.effective_permits_count == 4
+
+
+async def test_post_config_no_token_returns_405():
+    """POST /admin/config returns 405 when no admin token is configured."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/admin/config", json={"target": 4})
+
+    assert response.status_code == 405
+
+
+async def test_post_config_wrong_auth_returns_403():
+    """POST /admin/config returns 403 with invalid auth."""
+    app, _, _ = _make_app()
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer wrong"},
+        )
+
+    assert response.status_code == 403
+
+
+async def test_post_config_invalid_value_returns_400():
+    """POST /admin/config with target > hard_cap returns 400."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 99},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 400
+    assert "hard_cap" in response.json()["error"]
+
+
+async def test_post_config_unknown_field_returns_400():
+    """POST /admin/config with a non-whitelisted field returns 400."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"min_floor": 2},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 400
+
+
+async def test_post_config_null_reverts_override():
+    """POST /admin/config with {"target": null} reverts to boot value."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/admin/config",
+            json={"target": 5},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert reconcile.target == 5
+
+        response = await client.post(
+            "/admin/config",
+            json={"target": None},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["overridden"] is False
+    assert reconcile.target == 3  # boot value
+
+
+async def test_delete_config_reverts_override():
+    """DELETE /admin/config/target reverts to boot value."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/admin/config",
+            json={"target": 5},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert reconcile.target == 5
+
+        response = await client.delete(
+            "/admin/config/target",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["overridden"] is False
+    assert reconcile.target == 3
+
+
+async def test_delete_config_no_token_returns_405():
+    """DELETE /admin/config/target returns 405 when no admin token is configured."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.delete("/admin/config/target")
+
+    assert response.status_code == 405
+
+
+async def test_override_visible_in_status_json():
+    """The override is visible in /status.json after applying."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/admin/config",
+            json={"target": 5},
+            headers={"Authorization": "Bearer secret"},
+        )
+        response = await client.get(
+            "/status.json",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    data = response.json()
+    assert "overrides" in data
+    assert data["overrides"]["target"]["boot"] == 3
+    assert data["overrides"]["target"]["override"] == 5
+
+
+async def test_no_override_shows_empty_overrides_in_status():
+    """/status.json shows empty overrides when no override is active."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+
+    data = response.json()
+    assert data["overrides"] == {}
+
+
+async def test_override_visible_in_metrics():
+    """The override gauge appears in /metrics after applying."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        await client.post(
+            "/admin/config",
+            json={"target": 5},
+            headers={"Authorization": "Bearer secret"},
+        )
+        response = await client.get(
+            "/metrics",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert 'sluice_config_overridden{field="target"} 1' in response.text
+    assert "sluice_config_target 5" in response.text
+
+
+async def test_no_override_shows_zero_in_metrics():
+    """The override gauge is 0 in /metrics when no override is active."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/metrics")
+
+    assert 'sluice_config_overridden{field="target"} 0' in response.text
+
+
+async def test_post_config_with_basic_auth():
+    """POST /admin/config works with Basic auth (same credentials as dashboard)."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    basic = "Basic " + base64.b64encode(b"user:secret").decode()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": basic},
+        )
+
+    assert response.status_code == 200
+    assert reconcile.target == 4
+
+
+async def test_post_config_audit_log(caplog):
+    """Every accepted override logs the change with audit info."""
+    import logging as logging_mod
+
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    with caplog.at_level(logging_mod.INFO, logger="sluice.admin"):
+        async with _asgi_client(app) as client:
+            await client.post(
+                "/admin/config",
+                json={"target": 4},
+                headers={"Authorization": "Bearer secret"},
+            )
+
+    assert any("config override" in r.message for r in caplog.records), (
+        "accepted override must be logged"
+    )
+
+
+async def test_dashboard_has_config_stepper_elements():
+    """Dashboard HTML contains the target stepper, override badge, and revert link."""
+    app, _, _ = _make_app()
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/")
+
+    html = response.text
+    assert "stepTarget" in html
+    assert "revertTarget" in html
+    assert "step-btn" in html
+    assert "ov-badge" in html
+    assert "ov-revert" in html
+    assert "mutationsDisabled" in html
+
+
+async def test_post_config_wrong_content_type_returns_415():
+    """POST /admin/config with text/plain Content-Type is rejected (CSRF defence)."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            content=b'{"target": 4}',
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "text/plain",
+            },
+        )
+
+    assert response.status_code == 415
+
+
+async def test_post_config_override_before_tick_returns_400():
+    """POST /admin/config returns 400 when no successful usage poll has occurred."""
+    app, _, reconcile = _make_app(first_poll_ok=False)
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 400
+    assert "poll" in response.json()["error"]

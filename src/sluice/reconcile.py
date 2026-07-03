@@ -24,6 +24,7 @@ import math
 import time
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 from sluice.control import (
     Band,
@@ -42,6 +43,7 @@ from sluice.control import (
     effective_permits,
     is_hard_boxed,
     phantom_estimate,
+    validate_target_override,
 )
 from sluice.gate import PermitGate
 from sluice.history import History, HistoryEntry
@@ -56,6 +58,10 @@ _RETRY_AFTER_STALE_CAP = 300
 _PRUNE_INTERVAL_TICKS = 60
 _DEFAULT_HISTORY_TTL = 604800.0
 _REQ_TS_MAXLEN = 10000  # safety cap for local request-timestamp deque
+
+# Fields that may be overridden at runtime via the dashboard (Plan 011).
+# Grows one deliberate field at a time; never by reflection over the config dataclass.
+_OVERRIDE_WHITELIST = frozenset({"target"})
 
 
 class ReconciliationLoop:
@@ -81,6 +87,7 @@ class ReconciliationLoop:
         self._truth = truth_source
         self._gate = gate
         self._ctrl_cfg = controller_config
+        self._boot_config = controller_config
         self._brk_cfg = breaker_config
         self._poll_interval = poll_interval
         self._mono = monotonic_clock
@@ -122,6 +129,73 @@ class ReconciliationLoop:
 
         self._task: asyncio.Task[None] | None = None
         self._first_poll_ok = False
+
+        # Runtime overrides (Plan 011): ephemeral, leader-only, revert on restart.
+        # {"target": {"value": 6, "since": <epoch>}} — empty when no override active.
+        self._overrides: dict[str, dict[str, Any]] = {}
+
+    # -- runtime overrides (Plan 011) -----------------------------------------
+
+    def apply_override(self, field: str, value: int) -> str | None:
+        """Apply a runtime config override for a whitelisted field.
+
+        Rebuilds ``ControllerConfig`` via ``dataclasses.replace`` so the next
+        tick resizes the gate — no new resize path.  Returns a warning string
+        (accept-with-warning) or ``None`` (clean accept).  Raises
+        :class:`ValueError` on rejection (caller returns 400 + reason).
+        """
+        if field not in _OVERRIDE_WHITELIST:
+            raise ValueError(f"field '{field}' is not in the override whitelist")
+
+        # Fail-safe: refuse overrides until we have a fresh provider reading.
+        # Without a real reading, validation uses default hard_cap=8 which may
+        # be higher than the actual account's limit (AGENTS.md rule 1).
+        if not self._first_poll_ok:
+            raise ValueError(
+                "cannot apply override before first successful usage poll"
+            )
+        cached = self._last_reading_cached
+        if cached is None or not cached.ok:
+            raise ValueError(
+                "usage reading stale; override unavailable until fresh reading"
+            )
+
+        warning = validate_target_override(value, cached.reading, self._boot_config)
+
+        self._ctrl_cfg = dataclasses.replace(self._ctrl_cfg, **{field: value})
+        # The adaptive controller uses its own config; keep it in sync.
+        if field == "target" and self._controller == "adaptive":
+            self._adaptive_cfg = dataclasses.replace(self._adaptive_cfg, target=value)
+        self._overrides[field] = {"value": value, "since": self._wall()}
+        return warning
+
+    def clear_override(self, field: str) -> None:
+        """Revert a runtime override to its boot value."""
+        if field not in _OVERRIDE_WHITELIST:
+            raise ValueError(f"field '{field}' is not in the override whitelist")
+        if field not in self._overrides:
+            return
+
+        boot_val = getattr(self._boot_config, field)
+        self._ctrl_cfg = dataclasses.replace(self._ctrl_cfg, **{field: boot_val})
+        if field == "target" and self._controller == "adaptive":
+            self._adaptive_cfg = dataclasses.replace(self._adaptive_cfg, target=boot_val)
+        del self._overrides[field]
+
+    @property
+    def overrides(self) -> dict[str, Any]:
+        """Current runtime overrides for /status.json.
+
+        ``{"target": {"boot": 4, "override": 6, "since": <epoch>}}``, empty when none.
+        """
+        result: dict[str, Any] = {}
+        for field, info in self._overrides.items():
+            result[field] = {
+                "boot": getattr(self._boot_config, field),
+                "override": info["value"],
+                "since": info["since"],
+            }
+        return result
 
     # -- event-driven callbacks (called by the proxy) ------------------------
 

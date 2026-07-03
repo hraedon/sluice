@@ -15,6 +15,14 @@ h1{font-size:var(--fs-base);font-weight:500;margin:0;color:var(--accent)}
 padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm);cursor:pointer;
 font-family:var(--font-mono);font-size:var(--fs-xs)}
 .controls button:hover{border-color:var(--accent);color:var(--accent)}
+.step-btn{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text-2);
+padding:0 6px;border-radius:var(--radius-sm);cursor:pointer;
+font-family:var(--font-mono);font-size:var(--fs-xs);line-height:1.6}
+.step-btn:hover{border-color:var(--accent);color:var(--accent)}
+.step-btn:disabled{opacity:.4;cursor:default}
+.ov-badge{color:var(--warn);font-size:var(--fs-xs);margin-left:var(--space-1)}
+.ov-revert{color:var(--accent);font-size:var(--fs-xs);text-decoration:none;cursor:pointer;margin-left:var(--space-1)}
+.ov-revert:hover{text-decoration:underline}
 #theme-toggle{background:none;border:none;color:var(--text-3);cursor:pointer;padding:var(--space-1);font-size:var(--fs-md)}
 #theme-toggle:hover{color:var(--accent)}
 #theme-icon-dark{display:none}
@@ -176,6 +184,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 </div>
 <script>
 let paused=false,isActive=false,timer=null,fetching=false;
+let mutationsDisabled=false,configSaving=false;
 let lastValid=[];
 const HIST_MAX=60;
 // Long ranges pull from /history.json (5s tick cadence): 720 ticks = 1h, 2880 = 4h.
@@ -277,6 +286,48 @@ function togglePause(){
   if(!paused) schedule(0);
 }
 
+async function stepTarget(delta){
+  if(mutationsDisabled||configSaving||!lastD) return;
+  configSaving=true;
+  render(lastD);
+  var cur=lastD.config.target;
+  var newVal=cur+delta;
+  try{
+    var r=await fetch('/admin/config',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({target:newVal}),
+      credentials:'include'
+    });
+    if(r.status===405||r.status===403){
+      mutationsDisabled=true;
+    }else if(!r.ok){
+      try{var b=await r.json();console.warn('target override failed: '+(b.error||r.status));}catch(e){}
+    }
+  }catch(e){}
+  configSaving=false;
+  await doPoll();
+}
+
+async function revertTarget(){
+  if(mutationsDisabled||configSaving) return;
+  configSaving=true;
+  render(lastD);
+  try{
+    var r=await fetch('/admin/config/target',{
+      method:'DELETE',
+      credentials:'include'
+    });
+    if(r.status===405||r.status===403){
+      mutationsDisabled=true;
+    }else if(!r.ok){
+      try{var b=await r.json();console.warn('target revert failed: '+(b.error||r.status));}catch(e){}
+    }
+  }catch(e){}
+  configSaving=false;
+  await doPoll();
+}
+
 function render(d){
   const limit=d.limit??4,hc=d.hard_cap??8,tgt=d.target??3;
   const obs=d.concurrent_sessions,loc=d.local_in_flight;
@@ -336,8 +387,29 @@ function render(d){
     .map(kvRow).join('');
   // Config table
   var c=d.config||{};
+  var ov=d.overrides||{};
+  var tgtOv=ov.target||null;
+  var isOverridden=!!tgtOv;
+  var tgtVal=c.target;
+  var cfgHtml='';
+  var tgtTitle='Steady-state concurrency sluice aims to keep in flight';
+  if(mutationsDisabled){
+    cfgHtml+='<tr><th class="help" title="'+esc(tgtTitle)+'">target</th><td>'
+      +esc(tgtVal)+(isOverridden?' <span class="ov-badge">override (boot='+esc(tgtOv.boot)+')</span>':'')
+      +'</td></tr>';
+  }else{
+    cfgHtml+='<tr><th class="help" title="'+esc(tgtTitle)+'">target</th><td>';
+    cfgHtml+='<div style="display:inline-flex;align-items:center;gap:var(--space-1)">';
+    cfgHtml+='<button class="step-btn" onclick="stepTarget(-1)"'+(configSaving?' disabled':'')+'>\u2212</button>';
+    cfgHtml+='<span style="min-width:1.5em;text-align:center">'+esc(tgtVal)+'</span>';
+    cfgHtml+='<button class="step-btn" onclick="stepTarget(1)"'+(configSaving?' disabled':'')+'>+</button>';
+    if(isOverridden){
+      cfgHtml+='<span class="ov-badge">override (boot='+esc(tgtOv.boot)+')</span>';
+      cfgHtml+='<a class="ov-revert" onclick="revertTarget();return false"'+(configSaving?' style="pointer-events:none;opacity:.4"':'')+'>revert</a>';
+    }
+    cfgHtml+='</div></td></tr>';
+  }
   var crows=[
-    ['target',c.target,'Steady-state concurrency sluice aims to keep in flight'],
     ['min_floor',c.min_floor,'Effective permits never drop below this'],
     ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null,'How often the provider usage endpoint is polled'],
     ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null,'Maximum age of a usage reading before the controller stops trusting it'],
@@ -348,7 +420,8 @@ function render(d){
     ['provider',c.provider,'Usage-truth provider adapter in use'],
     ['controller',c.controller,'Permit controller strategy in use'],
   ].filter(function(r){return r[1]!=null;});
-  document.getElementById('config-table').innerHTML=crows.map(kvRow).join('');
+  cfgHtml+=crows.map(kvRow).join('');
+  document.getElementById('config-table').innerHTML=cfgHtml;
   // Banners
   var bb=document.getElementById('banner-boxed');
   var penaltyEnd=d.resets_at||d.boxed_until; // resets_at preferred; boxed_until fallback (observed null resets_at live)
