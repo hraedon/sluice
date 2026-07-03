@@ -37,6 +37,10 @@ table{width:100%;border-collapse:collapse;font-size:var(--fs-xs)}
 td,th{padding:var(--space-1) var(--space-2);text-align:left;border-bottom:1px solid var(--border)}
 th{color:var(--text-3);font-weight:400}
 td{color:var(--text);font-variant-numeric:tabular-nums}
+tr.row-primary td,tr.row-primary th{font-weight:500}
+tr.row-detail td{color:var(--text-3)}
+tr.row-warn td{color:var(--warn)}
+tr.row-crit td{color:var(--crit)}
 .banner{padding:var(--space-3) var(--space-4);border-radius:var(--radius-sm);margin-bottom:var(--space-4);font-size:var(--fs-sm);display:none}
 .banner.boxed{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit)}
 .banner.breaker{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
@@ -75,7 +79,7 @@ td{color:var(--text);font-variant-numeric:tabular-nums}
 .tip .stale{color:var(--crit)}
 .ranges{float:right;display:inline-flex;gap:var(--space-1)}
 .rbtn{background:none;border:1px solid var(--border-2);color:var(--text-3);
-font-family:var(--font-mono);font-size:var(--fs-xs);padding:0 var(--space-2);
+font-family:var(--font-mono);font-size:var(--fs-xs);padding:var(--space-1) var(--space-2);
 border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing:0}
 .rbtn:hover,.rbtn.active{border-color:var(--accent);color:var(--accent)}
 .ribbon{width:100%;height:4px;display:block;margin-top:2px}
@@ -191,6 +195,7 @@ const HIST_MAX=60;
 const RANGES={'5m':{limit:HIST_MAX},'1h':{limit:720},'4h':{limit:2880}};
 const BUCKETS=120,LONG_REFRESH_MS=15000;
 let hist=[],viewRange='5m',longHist=[],lastLongFetch=0,lastD=null;
+const PRIMARY_KEYS={'band':1,'effective_permits':1,'local_in_flight':1,'breaker':1};
 
 function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
 function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
@@ -328,6 +333,21 @@ async function revertTarget(){
   await doPoll();
 }
 
+function recentInc(histField,currentField){
+  var windowSecs=(lastD&&lastD.config&&lastD.config.breaker_window_seconds)||300;
+  var cutoff=Date.now()/1000-windowSecs;
+  for(var s=0;s<2;s++){
+    var arr=s===0?hist:longHist;
+    for(var i=1;i<arr.length;i++){
+      if(arr[i].ts>=cutoff&&(arr[i][histField]||0)>(arr[i-1][histField]||0)) return true;
+    }
+  }
+  if(lastD&&hist.length>0&&lastD[currentField]!=null){
+    if(lastD[currentField]>(hist[hist.length-1][histField]||0)) return true;
+  }
+  return false;
+}
+
 function render(d){
   const limit=d.limit??4,hc=d.hard_cap??8,tgt=d.target??3;
   const obs=d.concurrent_sessions,loc=d.local_in_flight;
@@ -369,22 +389,30 @@ function render(d){
         : null,
       'Seconds since the breaker went half_open and began probing'],
     ['recent_429s',d.recent_429s,'Upstream 429s within the breaker window'],
-    ['total_429s',d.total_429s,'Upstream concurrency 429s since startup'],
+    ['total_429s',d.total_429s,'Upstream concurrency 429s since startup; row highlights when there are 429s within the breaker window'],
     ['gateway_429s',d.gateway_429s,'Upstream 429s from CDN/gateway — not concurrency, not fed to the breaker (WI-024)'],
     ['queue_depth',d.queue_depth,'Requests currently waiting for a permit'],
     ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95','Wait time of recently granted requests that had to queue: mean and 95th percentile'],
-    ['queue_timeouts',d.queue_timeouts,'Requests that gave up waiting for a permit, since startup'],
+    ['queue_timeouts',d.queue_timeouts,'Requests that gave up waiting for a permit, since startup; row highlights when a timeout occurred within the breaker window'],
     ['gate_closed',d.gate_closed_reason,'Why the gate refuses new work: open means it is not closed; otherwise boxed, breaker, or saturated'],
     ['ready',d.ready,'True once the first usage poll succeeded and this instance holds the singleton lock'],
     ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':''),'Age of the newest usage reading; stale means the last poll failed'],
   ];
-  function kvRow(r){
+  var qtRecent=recentInc('qt','queue_timeouts'),t429Recent=d.recent_429s>0;
+  function kvRow(r,cls){
     var t=r[2]?' class="help" title="'+esc(r[2])+'"':'';
-    return '<tr><th'+t+'>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';
+    var trc=cls?' class="'+esc(cls)+'"'':'';
+    return '<tr'+trc+'><th'+t+'>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';
   }
   document.getElementById('stats').innerHTML=rows
     .filter(function(r){return r[1]!=null;})
-    .map(kvRow).join('');
+    .map(function(r){
+      var cls=PRIMARY_KEYS[r[0]]?'row-primary':'row-detail';
+      if(r[0]==='queue_timeouts'&&qtRecent) cls+=' row-warn';
+      if(r[0]==='total_429s'&&t429Recent) cls+=' row-crit';
+      if(r[0]==='recent_429s'&&t429Recent) cls+=' row-crit';
+      return kvRow(r,cls);
+    }).join('');
   // Config table
   var c=d.config||{};
   var ov=d.overrides||{};
@@ -420,7 +448,7 @@ function render(d){
     ['provider',c.provider,'Usage-truth provider adapter in use'],
     ['controller',c.controller,'Permit controller strategy in use'],
   ].filter(function(r){return r[1]!=null;});
-  cfgHtml+=crows.map(kvRow).join('');
+  cfgHtml+=crows.map(function(r){return kvRow(r);}).join('');
   document.getElementById('config-table').innerHTML=cfgHtml;
   // Banners
   var bb=document.getElementById('banner-boxed');
