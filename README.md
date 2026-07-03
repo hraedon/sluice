@@ -120,6 +120,16 @@ The release cooldown is what makes the dashboard sometimes show queued requests 
 (`cooling_down` > 0, not yet acquirable). The `cooling_down` count is visible in the
 dashboard's stats table and in `/status.json` / `/metrics`.
 
+**Interaction with `--reserve`:** Cooling-down slots reduce the *total* available count
+(`capacity - held - cooling_down`), which affects both the shared pool and the reserve.
+A cooling-down slot does not "belong" to either pool — it is simply unavailable. Under
+saturation with `--reserve interactive=1` and `--release-cooldown 2`, if a reserved slot
+is released and enters cooldown, the interactive class temporarily has no dedicated slot
+until the cooldown expires. The reserve guarantees *priority of admission* (non-interactive
+requests cannot use the reserved slot), not *instant availability* — a just-released
+reserved slot still rests for the cooldown period before a new interactive request can
+acquire it.
+
 All flags can also be set via environment variables (`SLUICE_TARGET`,
 `SLUICE_RELEASE_COOLDOWN`, etc.) or a TOML config file (`--config path.toml`).
 
@@ -134,6 +144,10 @@ a 503. This is known and expected at home-lab scale.
 `interactive` class may use. Non-interactive requests can use the shared pool only, so a
 flood of agent traffic cannot drive the interactive class to zero. Below saturation the
 reserve is invisible — it only bites when the shared pool is exhausted.
+
+With `--target 3` and `--reserve interactive=1`, agents get at most 2 shared permits and
+interactive gets 1 dedicated slot. If the shared pool is free, an interactive request may
+use a shared slot too (the reserve is a floor, not a ceiling for the reserved class).
 
 Clients tag themselves by sending the `x-sluice-client-label: interactive` header. sluice
 strips this header before forwarding (cache-transparency, Rule 7), so the upstream never

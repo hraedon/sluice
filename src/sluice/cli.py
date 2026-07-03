@@ -353,6 +353,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"in_flight:          {d['local_in_flight']}")
     print(f"observed_sessions:  {d['concurrent_sessions']}")
     print(f"phantom_estimate:   {d.get('phantom_estimate', '?')}")
+    print(f"cooling_down:       {d.get('cooling_down', '?')}")
     print(f"gate_closed_reason: {d.get('gate_closed_reason', '?')}")
     print(f"total_429s:         {d['total_429s']}")
     print(f"queue_depth:        {d['queue_depth']}")
@@ -360,6 +361,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"queue_timeouts:     {d.get('queue_timeouts', '?')}")
     print(f"ready:              {d.get('ready', '?')}")
     config = d.get("config", {})
+    if "target" in config:
+        print(f"target:             {config['target']}")
+    if "min_floor" in config:
+        print(f"min_floor:          {config['min_floor']}")
+    if "poll_interval" in config:
+        print(f"poll_interval:      {config['poll_interval']}s")
     if "provider" in config:
         print(f"provider:           {config['provider']}")
     if "controller" in config:

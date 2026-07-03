@@ -504,6 +504,71 @@ async def test_429_reported_to_reconcile():
     assert reconcile.total_429s == 1
 
 
+async def test_429_with_retry_after_not_recorded_as_concurrency():
+    """A 429 with a non-zero retry-after is classified as rate-limit, not concurrency.
+
+    The breaker must not trip on rate-limit 429s — only on concurrency 429s.
+    This is the classification path the monitoring hook watches: if umans ever
+    sends a non-zero retry-after on a concurrency 429, this test documents the
+    expected (fail-open) behaviour and the log would show the regression.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "rate_limit"}, headers={"retry-after": "60"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 429
+    assert reconcile.total_429s == 0, "rate-limit 429 (retry-after=60) must not trip the breaker"
+
+
+async def test_429_with_zero_retry_after_recorded_as_concurrency():
+    """A 429 with retry-after:0 is classified as concurrency (retry immediately).
+
+    The string "0" is truthy in Python, so a naive ``not header`` check would
+    silently skip breaker recording (fail-open).  _is_concurrency_429 handles
+    this edge case.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "concurrency"}, headers={"retry-after": "0"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 429
+    assert reconcile.total_429s == 1, "retry-after=0 is a concurrency 429 (retry immediately)"
+
+
+async def test_429_monitoring_hook_logs_all_429s(caplog):
+    """Every 429 is logged with its retry-after value and concurrency classification.
+
+    This is the monitoring hook that catches a regression: if umans starts
+    sending non-zero retry-after on concurrency 429s, the log would show
+    concurrency=False on what are actually concurrency rejections.
+    """
+    import logging as logging_mod
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "rate_limit"}, headers={"retry-after": "30"})
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    with caplog.at_level(logging_mod.WARNING, logger="sluice.proxy"):
+        async with _asgi_client(app) as client:
+            await client.post("/v1/messages", json={"prompt": "hi"})
+
+    # The log must mention retry_after and concurrency classification
+    assert any("retry_after" in r.message and "concurrency" in r.message for r in caplog.records), (
+        "every 429 must be logged with retry_after value and concurrency classification"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Healthz / metrics
 # ---------------------------------------------------------------------------

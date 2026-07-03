@@ -279,6 +279,106 @@ def test_effective_permits_phantom_exceeds_target_floors_at_min_floor():
     assert result > 0
 
 
+# --- Edge cases: extreme observed, zero local, invariant bounds ------------------
+
+
+def test_effective_permits_observed_far_exceeds_target_floors_at_min_floor():
+    """observed > target * 2: phantoms eat all permits, _clamp floors at min_floor.
+
+    E.g. target=3, observed=20, local=0 → phantom=20 → base=3-20=-17 → clamp to 1.
+    The gate never closes fully on phantoms alone (min_floor=1) — a live permit
+    is kept so sluice can still forward one request and observe the result.
+    """
+    r = reading(concurrent_sessions=20)
+    s = state(r, in_flight=0, phantom=20)
+    assert effective_permits(s, CFG, now=NOW) == CFG.min_floor
+
+
+def test_effective_permits_local_zero_during_burst():
+    """local_in_flight=0 with high observed: full phantom absorption.
+
+    During a burst where all local requests have completed but the provider
+    still counts phantoms, the estimate equals the full observed count.
+    """
+    r = reading(concurrent_sessions=7)
+    s = state(r, in_flight=0, phantom=7)
+    result = effective_permits(s, CFG, now=NOW)
+    assert result == CFG.min_floor  # 3 - 7 = -4 → clamp to 1
+
+
+def test_effective_permits_never_exceeds_target():
+    """effective_permits is bounded above by target in CLOSED/NORMAL state."""
+    r = reading(concurrent_sessions=0)
+    s = state(r, in_flight=0, phantom=0)
+    assert effective_permits(s, CFG, now=NOW) == CFG.target
+    # Even with negative phantom (impossible but defensive)
+    s2 = state(r, in_flight=10, phantom=0)
+    assert effective_permits(s2, CFG, now=NOW) == CFG.target
+
+
+def test_effective_permits_never_negative():
+    """effective_permits is never negative — min_floor is the floor."""
+    for phantom in range(0, 100, 10):
+        r = reading(concurrent_sessions=phantom)
+        s = state(r, in_flight=0, phantom=phantom)
+        result = effective_permits(s, CFG, now=NOW)
+        assert result >= 0, f"effective_permits negative for phantom={phantom}: {result}"
+        assert result >= CFG.min_floor, f"below min_floor for phantom={phantom}: {result}"
+
+
+def test_effective_permits_bounded_by_target_across_all_inputs():
+    """No combination of inputs can push effective_permits above target."""
+    for obs in range(0, 20):
+        for local in range(0, 20):
+            r = reading(concurrent_sessions=obs)
+            phantom = max(0, obs - local)
+            s = state(r, in_flight=local, phantom=phantom)
+            result = effective_permits(s, CFG, now=NOW)
+            assert result <= CFG.target, (
+                f"effective_permits above target for obs={obs}, local={local}: {result}"
+            )
+
+
+def test_phantom_estimate_never_exceeds_max_observed():
+    """phantom_estimate (windowed) never exceeds the maximum observed in the window."""
+    samples = [(10, 0), (15, 2), (8, 1)]
+    est = phantom_estimate(samples)
+    assert est <= max(obs for obs, _ in samples)
+    assert est >= 0
+
+
+def test_phantom_estimate_empty_and_single():
+    """Edge cases: empty window and single sample."""
+    assert phantom_estimate([]) == 0
+    assert phantom_estimate([(5, 0)]) == 5
+    assert phantom_estimate([(3, 3)]) == 0
+
+
+def test_phantom_estimate_all_below_local():
+    """When observed < local in every sample (impossible in practice but defensive),
+    the estimate is 0 — never negative."""
+    samples = [(1, 5), (2, 6), (0, 3)]
+    assert phantom_estimate(samples) == 0
+
+
+def test_stale_reading_with_extreme_observed_ignores_phantom():
+    """A stale reading with huge observed must NOT use the phantom estimate —
+    it applies the flat stale_penalty instead (don't trust stale numbers)."""
+    r = reading(concurrent_sessions=100, age_seconds=60.0)
+    s = state(r, in_flight=0, phantom=100)
+    result = effective_permits(s, CFG, now=NOW)
+    assert result == CFG.target - CFG.stale_penalty  # 3 - 1 = 2, not min_floor
+
+
+def test_low_band_with_extreme_phantom():
+    """LOW band + extreme phantom: both penalties stack, floor at min_floor."""
+    r = reading(concurrent_sessions=20, priority_low=True)
+    s = state(r, in_flight=0, phantom=20)
+    # base = target(3) - low_penalty(1) - phantom(20) = -18 → clamp to min_floor(1)
+    result = effective_permits(s, CFG, now=NOW)
+    assert result == CFG.min_floor
+
+
 # --- Breaker OPEN does not extend cooldown on 429 ---------------------------
 
 

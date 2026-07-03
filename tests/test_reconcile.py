@@ -712,3 +712,81 @@ async def test_request_window_delta_stale_reading():
     m[0] += 5
     await loop.tick()
     assert loop.request_window_delta is None
+
+
+# --- Edge cases: extreme observed, zero local, gate-closing conditions -----------
+
+
+async def test_extreme_observed_floors_gate_at_min_floor():
+    """observed >> target * 2: gate shrinks to min_floor, not to 0.
+
+    The phantom absorption eats all permits but _clamp floors at min_floor=1
+    so sluice can still forward one request and observe the result.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=20))
+    await loop.tick()
+    assert gate.capacity == 1  # min_floor, not 0
+
+
+async def test_zero_local_during_burst_full_phantom_absorption():
+    """local_in_flight=0 with high observed: full phantom absorption.
+
+    All local requests completed but the provider still counts phantoms.
+    The windowed estimate equals the full observed count (single sample).
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=7))
+    await loop.tick()
+    assert gate.capacity == 1  # 3 - 7 = -4 → clamp to min_floor=1
+
+
+async def test_sustained_extreme_phantom_stays_at_min_floor():
+    """Sustained extreme phantom across multiple ticks: gate stays at min_floor."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=15))
+    for _ in range(5):
+        await loop.tick()
+    assert gate.capacity == 1  # never closes fully on phantoms alone
+
+
+async def test_gate_closed_reason_saturated_when_permits_zero():
+    """gate_closed_reason returns 'saturated' when effective_permits is 0 but
+    not boxed or breaker."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.effective_permits_count == 3  # normal
+    assert loop.gate_closed_reason() == "open"
+
+    loop._last_permits = 0
+    assert loop.gate_closed_reason() == "saturated"
+
+
+async def test_phantom_clears_after_sustained_extreme():
+    """After a sustained extreme phantom clears, the gate reopens to target.
+
+    The windowed min drops the phantom once clean samples fill the window.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=15))
+
+    for _ in range(3):
+        await loop.tick()
+    assert gate.capacity == 1
+
+    client.set_reading(_reading(concurrent_sessions=0))
+    for _ in range(3):
+        await loop.tick()
+    assert gate.capacity == 3  # back to target
+
+
+async def test_observed_equals_hard_cap_gives_low_band():
+    """observed == hard_cap is LOW band (not REJECT — REJECT is > hard_cap)."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=8))
+    await loop.tick()
+    assert loop.band is Band.LOW
+    assert gate.capacity == 1  # phantom absorption floors at min_floor
+
+
+async def test_observed_above_hard_cap_gives_reject_band():
+    """observed > hard_cap is REJECT band — but the gate still floors at min_floor."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=9))
+    await loop.tick()
+    assert loop.band is Band.REJECT
+    assert gate.capacity == 1  # phantom absorption floors at min_floor

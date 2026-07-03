@@ -69,6 +69,7 @@ src/sluice/
   usage.py     # /v1/usage client + parser (borrows usage-dashboard's umans logic)
   providers.py # provider registry: truth sources + controller choice per upstream
   proxy.py     # async reverse proxy shell (streaming, both routes, disconnect→cancel)
+  admin.py     # admin route handlers: health, ready, status, metrics, history, dashboard, static
   gate.py      # resizable permit gate (FIFO queue, optional QoS reserve)
   reconcile.py # background loop: fetch truth → core decides → resize gate
   status.py    # point-in-time snapshot for /status.json and /metrics
@@ -76,8 +77,7 @@ src/sluice/
   history_store.py # optional fail-safe SQLite persistence for history (--history-store)
   singleton.py # single-instance guard (the semaphore only works if there's one)
   cli.py       # `sluice serve ...` entry point
-  static/      # dashboard assets (css, fonts, theme.js); the dashboard HTML/JS
-               # itself is inline in proxy.py
+  static/      # dashboard assets (css, fonts, theme.js, dashboard.html)
 tests/
   test_control.py        # pure-core unit tests, no network
   test_import_boundary.py # control imports stdlib only; shell→core one-way

@@ -30,6 +30,12 @@ class PermitGate:
     requests can use only the shared pool (``capacity - reserve``); reserved
     requests may use the shared pool *or* the reserved slots.  Below saturation
     the reserve is invisible — it only bites when the shared pool is exhausted.
+
+    Release cooldown interacts with the reserve as follows: a cooling-down slot
+    reduces the *total* available count (``capacity - held - cooling_down``)
+    regardless of which pool it belonged to.  A just-released reserved slot is
+    not acquirable until its cooldown expires — the reserve guarantees priority
+    of admission, not instant availability.
     """
 
     def __init__(

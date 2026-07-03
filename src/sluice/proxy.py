@@ -14,31 +14,37 @@ key of its own beyond the usage poller's.
 from __future__ import annotations
 
 import asyncio
-import base64
-import hmac
-import json
 import logging
 import os
 import random
 from collections.abc import AsyncIterator, Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
 import httpx
 
-from sluice import __version__
+from sluice.admin import (
+    Send,
+    Scope,
+    check_admin_auth,
+    handle_healthz,
+    handle_readyz,
+    is_admin_auth_value,
+    send_dashboard,
+    send_history_json,
+    send_json,
+    send_prometheus,
+    send_status_json,
+    send_text,
+    serve_static,
+)
 from sluice.gate import PermitGate
 from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import SingletonGuard
-from sluice.status import snapshot as status_snapshot
-from sluice.status import to_prometheus
 
 log = logging.getLogger("sluice.proxy")
 
-# ASGI callable types.
-Scope = dict[str, Any]
+# ASGI receive type (Send/Scope are re-exported from admin for callers that need them).
 Receive = Callable[[], Awaitable[dict[str, Any]]]
-Send = Callable[[dict[str, Any]], Awaitable[None]]
 
 # RFC 7230 hop-by-hop headers — never forwarded in either direction.
 _HOP_BY_HOP = frozenset(
@@ -71,14 +77,6 @@ _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
 _RESERVED_LABEL = "interactive"
-
-_STATIC_DIR = Path(__file__).resolve().parent / "static"
-_STATIC_CONTENT_TYPES = {
-    ".css": "text/css; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".woff2": "font/woff2",
-    ".txt": "text/plain; charset=utf-8",
-}
 
 
 def _is_concurrency_429(retry_after: str | None) -> bool:
@@ -132,50 +130,6 @@ class ProxyApp:
         self._acquire_retry_task: asyncio.Task[None] | None = None
         self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
 
-    def _is_admin_auth_value(self, value: bytes) -> bool:
-        """Check if an Authorization header value matches sluice admin credentials.
-
-        Used both to gate admin routes and to strip sluice-internal auth headers
-        from proxied requests (browsers cache Basic auth origin-wide, so the
-        dashboard login would otherwise leak to the upstream — Rule 7).
-        """
-        if not self._admin_token:
-            return False
-        # Bearer token (API clients like ``sluice status``).
-        bearer_expected = f"Bearer {self._admin_token}".encode()
-        if hmac.compare_digest(value, bearer_expected):
-            return True
-        # Basic auth (browser — password = admin token, username ignored).
-        # Scheme is case-insensitive per RFC 7235.
-        if value.lower().startswith(b"basic "):
-            try:
-                decoded = base64.b64decode(value[6:]).decode("utf-8")
-                _, _, password = decoded.partition(":")
-                if hmac.compare_digest(
-                    password.encode("utf-8"),
-                    self._admin_token.encode("utf-8"),
-                ):
-                    return True
-            except Exception:
-                pass
-        return False
-
-    def _check_admin_auth(self, scope: Scope) -> bool:
-        """Return True if the request is authorized for admin routes.
-
-        Accepts either a Bearer token (for API clients like ``sluice status``)
-        or HTTP Basic auth (for browser access to the dashboard, where the
-        password is the admin token — username is ignored).  Basic auth lets
-        the browser cache credentials so the dashboard's JS fetch to
-        /status.json succeeds after the initial 401 prompt.
-        """
-        if not self._admin_token:
-            return True
-        for k, v in scope.get("headers", []):
-            if k == b"authorization" and self._is_admin_auth_value(v):
-                return True
-        return False
-
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
             await self._handle_lifespan(receive, send)
@@ -185,22 +139,16 @@ class ProxyApp:
 
         path = scope["path"]
         if path == "/healthz":
-            await self._send_json(send, 200, {"status": "ok"})
+            await handle_healthz(send)
             return
         if path == "/readyz":
-            ready = self._reconcile.ready
-            if self._guard is not None:
-                ready = ready and self._guard.is_held()
-            if ready:
-                await self._send_json(send, 200, {"status": "ready"})
-            else:
-                await self._send_json(send, 503, {"status": "not ready"})
+            await handle_readyz(send, self._reconcile, self._guard)
             return
 
         # Static assets (patina design system: tokens.css, theme.js, fonts).
         # These are served unauthenticated — they contain no secrets.
         if path.startswith("/static/"):
-            await self._serve_static(path, send)
+            await serve_static(path, send)
             return
 
         # Admin routes — token-gated when admin_token is set.  The dashboard
@@ -208,8 +156,8 @@ class ProxyApp:
         # visit; the cached credentials then authorize the JS fetch to
         # /status.json.  Without gating /, the dashboard's fetch would 401.
         if path in ("/", "/status.json", "/metrics", "/history.json"):
-            if not self._check_admin_auth(scope):
-                await self._send_text(
+            if not check_admin_auth(scope, self._admin_token):
+                await send_text(
                     send,
                     401,
                     "Unauthorized",
@@ -218,16 +166,16 @@ class ProxyApp:
                 )
                 return
             if path == "/":
-                await self._send_dashboard(send)
+                await send_dashboard(send)
                 return
             if path == "/status.json":
-                await self._send_status_json(send)
+                await send_status_json(send, self._reconcile, self._guard, self._build_sha)
                 return
             if path == "/metrics":
-                await self._send_prometheus(send)
+                await send_prometheus(send, self._reconcile, self._guard)
                 return
             if path == "/history.json":
-                await self._send_history_json(send, scope)
+                await send_history_json(send, scope, self._reconcile)
                 return
 
         await self._proxy_request(scope, receive, send)
@@ -310,7 +258,7 @@ class ProxyApp:
         # Non-leader fast-fail: if the singleton guard is not held, refuse admission.
         if self._guard is not None and not self._guard.is_held():
             log.info("not leader — fast-failing 503")
-            await self._send_json(
+            await send_json(
                 send,
                 503,
                 {"error": "not_leader", "reason": "not_leader", "retry_after": _RETRY_AFTER_DEFAULT},
@@ -323,7 +271,7 @@ class ProxyApp:
         # traffic at the initial (target) capacity — fail-safe (WI-018).
         if not self._reconcile.ready:
             log.info("not ready (first poll pending) — fast-failing 503")
-            await self._send_json(
+            await send_json(
                 send,
                 503,
                 {"error": "not_ready", "reason": "not_ready", "retry_after": _RETRY_AFTER_DEFAULT},
@@ -337,7 +285,7 @@ class ProxyApp:
         if reason in ("boxed", "breaker"):
             retry_after = self._reconcile.retry_after_seconds()
             log.info("gate closed (%s) — fast-failing 503", reason)
-            await self._send_json(
+            await send_json(
                 send,
                 503,
                 {"error": reason, "reason": reason, "retry_after": retry_after},
@@ -361,7 +309,7 @@ class ProxyApp:
         acquired = await self._gate.acquire(timeout=self._queue_timeout, reserved=reserved)
         if not acquired:
             log.info("permit queue timeout — returning 503")
-            await self._send_json(
+            await send_json(
                 send,
                 503,
                 {"error": "concurrency limit reached", "reason": "saturated", "retry_after": _RETRY_AFTER_DEFAULT},
@@ -500,10 +448,22 @@ class ProxyApp:
                 # overload shrinks the gate regardless), but if this heuristic
                 # is wrong the breaker's fast trip is defeated.  Revisit when
                 # a real concurrency 429 is observed live.
-                if response.status_code == 429 and _is_concurrency_429(
-                    response.headers.get("retry-after")
-                ):
-                    self._reconcile.record_429()
+                #
+                # Monitoring hook: log every 429 with its retry-after value and
+                # classification so a regression (umans starts sending non-zero
+                # retry-after on concurrency 429s) is visible in the logs — the
+                # breaker would stop tripping and concurrency=False would appear
+                # on what are actually concurrency rejections.
+                if response.status_code == 429:
+                    retry_after_raw = response.headers.get("retry-after")
+                    is_concurrency = _is_concurrency_429(retry_after_raw)
+                    log.warning(
+                        "upstream 429: retry_after=%r concurrency=%s",
+                        retry_after_raw,
+                        is_concurrency,
+                    )
+                    if is_concurrency:
+                        self._reconcile.record_429()
 
                 # WI-004: Feed response headers to the truth source.
                 # For polled truth (umans) this is a no-op; for header truth
@@ -570,7 +530,7 @@ class ProxyApp:
             if not disconnect.is_set() and not response_started:
                 log.warning("upstream error: %s: %s", type(exc).__name__, exc)
                 try:
-                    await self._send_json(send, 502, {"error": "upstream error"})
+                    await send_json(send, 502, {"error": "upstream error"})
                 except Exception:
                     pass
         finally:
@@ -601,7 +561,7 @@ class ProxyApp:
             # path-scoped).  The client's own upstream Authorization header
             # (e.g. ``Bearer sk-...``) is not affected — only values that
             # match sluice's admin token are stripped.  (Rule 7.)
-            if name == "authorization" and self._is_admin_auth_value(v):
+            if name == "authorization" and is_admin_auth_value(v, self._admin_token):
                 continue
             result.append((k.decode("latin-1"), v.decode("latin-1")))
         return result
@@ -613,778 +573,3 @@ class ProxyApp:
             for k, v in response.headers.items()
             if k.lower() not in _HOP_BY_HOP
         ]
-
-    async def _send_json(
-        self,
-        send: Send,
-        status: int,
-        body: dict[str, Any],
-        *,
-        retry_after: int | None = None,
-    ) -> None:
-        payload = json.dumps(body).encode()
-        headers: list[tuple[bytes, bytes]] = [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(payload)).encode()),
-        ]
-        if retry_after is not None:
-            headers.append((b"retry-after", str(retry_after).encode()))
-        await send({"type": "http.response.start", "status": status, "headers": headers})
-        await send({"type": "http.response.body", "body": payload, "more_body": False})
-
-    async def _send_status_json(self, send: Send) -> None:
-        snap = status_snapshot(self._reconcile, self._guard)
-        payload = snap.to_dict()
-        payload["version"] = __version__
-        payload["build"] = self._build_sha
-        await self._send_json(send, 200, payload)
-
-    async def _send_prometheus(self, send: Send) -> None:
-        snap = status_snapshot(self._reconcile, self._guard)
-        text = to_prometheus(snap)
-        await self._send_text(send, 200, text, content_type="text/plain; version=0.0.4; charset=utf-8")
-
-    async def _send_history_json(self, send: Send, scope: Scope) -> None:
-        history = self._reconcile.history
-        if history is not None:
-            qs = scope.get("query_string", b"").decode("latin-1")
-            limit: int | None = None
-            if qs:
-                for pair in qs.split("&"):
-                    k, _, v = pair.partition("=")
-                    if k == "limit":
-                        try:
-                            limit = max(0, int(v))
-                        except ValueError:
-                            pass
-            entries = history.to_dict_list(limit=limit)
-        else:
-            entries = []
-        body = json.dumps({"entries": entries, "count": len(entries), "enabled": history is not None})
-        payload = body.encode()
-        headers: list[tuple[bytes, bytes]] = [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(payload)).encode()),
-            (b"cache-control", b"no-store"),
-        ]
-        await send({"type": "http.response.start", "status": 200, "headers": headers})
-        await send({"type": "http.response.body", "body": payload, "more_body": False})
-
-    async def _send_dashboard(self, send: Send) -> None:
-        await self._send_text(send, 200, _DASHBOARD_HTML, content_type="text/html; charset=utf-8")
-
-    async def _serve_static(self, path: str, send: Send) -> None:
-        """Serve a file from the vendored static directory (patina assets)."""
-        rel = path[len("/static/"):]
-        # Prevent path traversal: resolve and verify it's inside _STATIC_DIR
-        try:
-            file_path = (_STATIC_DIR / rel).resolve()
-            file_path.relative_to(_STATIC_DIR)
-        except (ValueError, OSError):
-            await self._send_text(send, 404, "Not found")
-            return
-        if not file_path.is_file():
-            await self._send_text(send, 404, "Not found")
-            return
-        ext = file_path.suffix.lower()
-        content_type = _STATIC_CONTENT_TYPES.get(ext, "application/octet-stream")
-        data = file_path.read_bytes()
-        headers: list[tuple[bytes, bytes]] = [
-            (b"content-type", content_type.encode()),
-            (b"content-length", str(len(data)).encode()),
-            (b"cache-control", b"public, max-age=3600"),
-        ]
-        await send({"type": "http.response.start", "status": 200, "headers": headers})
-        await send({"type": "http.response.body", "body": data, "more_body": False})
-
-    async def _send_text(
-        self,
-        send: Send,
-        status: int,
-        body: str,
-        *,
-        content_type: str = "text/plain",
-        extra_headers: list[tuple[bytes, bytes]] | None = None,
-    ) -> None:
-        payload = body.encode()
-        headers: list[tuple[bytes, bytes]] = [
-            (b"content-type", content_type.encode()),
-            (b"content-length", str(len(payload)).encode()),
-        ]
-        if extra_headers:
-            headers.extend(extra_headers)
-        await send({"type": "http.response.start", "status": status, "headers": headers})
-        await send({"type": "http.response.body", "body": payload, "more_body": False})
-
-
-_DASHBOARD_HTML = """\
-<!doctype html>
-<html lang="en" data-theme-key="sluice-theme">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>sluice</title>
-<script src="/static/theme.js"></script>
-<link rel="stylesheet" href="/static/css/tokens.css">
-<style>
-body{font-family:var(--font-mono);background:var(--bg);color:var(--text);margin:0;padding:var(--space-4);font-size:var(--fs-sm);line-height:1.5}
-.header{display:flex;justify-content:space-between;align-items:center;margin:0 0 var(--space-4)}
-h1{font-size:var(--fs-base);font-weight:500;margin:0;color:var(--accent)}
-.controls{display:flex;gap:var(--space-2);align-items:center}
-.controls button{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text-2);
-padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm);cursor:pointer;
-font-family:var(--font-mono);font-size:var(--fs-xs)}
-.controls button:hover{border-color:var(--accent);color:var(--accent)}
-#theme-toggle{background:none;border:none;color:var(--text-3);cursor:pointer;padding:var(--space-1);font-size:var(--fs-md)}
-#theme-toggle:hover{color:var(--accent)}
-#theme-icon-dark{display:none}
-:root[data-theme="dark"] #theme-icon-dark{display:none}
-:root[data-theme="dark"] #theme-icon-light{display:block}
-:root[data-theme="light"] #theme-icon-dark{display:block}
-:root[data-theme="light"] #theme-icon-light{display:none}
-.row{display:flex;gap:var(--space-4);flex-wrap:wrap;margin-bottom:var(--space-4)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-4);flex:1;min-width:260px}
-.card h2{font-size:var(--fs-xs);font-weight:400;color:var(--text-3);margin:0 0 var(--space-3);text-transform:uppercase;letter-spacing:.05em}
-table{width:100%;border-collapse:collapse;font-size:var(--fs-xs)}
-td,th{padding:var(--space-1) var(--space-2);text-align:left;border-bottom:1px solid var(--border)}
-th{color:var(--text-3);font-weight:400}
-td{color:var(--text);font-variant-numeric:tabular-nums}
-.banner{padding:var(--space-3) var(--space-4);border-radius:var(--radius-sm);margin-bottom:var(--space-4);font-size:var(--fs-sm);display:none}
-.banner.boxed{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit)}
-.banner.breaker{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
-#countdown{font-weight:600}
-.gauge{position:relative;height:24px;background:var(--inset);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
-.gz{position:absolute;top:0;height:100%}
-.gz-n{background:var(--info-soft)}.gz-l{background:var(--warn-soft)}
-.gm{position:absolute;top:0;height:100%;width:2px;transition:left .3s}
-.gm-o{background:var(--accent)}.gm-l{background:var(--warn)}
-.gt{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--accent)}
-.gl{display:flex;justify-content:space-between;font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1)}
-.gl .gl-limit{color:var(--accent)}
-.gl .gl-hardcap{color:var(--crit)}
-.card{position:relative}
-.spark{width:100%;height:240px;display:block}
-.sleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
-.sleg span{display:flex;align-items:center;gap:var(--space-1)}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.dash{width:12px;height:0;border-top:2px dashed var(--ok);display:inline-block}
-.spark-obs{stroke:var(--accent)}.spark-loc{stroke:var(--warn)}.spark-ph{stroke:var(--text-3)}
-.spark-ep{stroke:var(--ok);stroke-dasharray:2,1}
-.spark-grid{stroke:var(--border);stroke-dasharray:2,2}
-.spark-lim,.spark-hc{stroke:var(--border-2);stroke-width:0.5}
-.spark-hc{stroke:var(--crit);stroke-opacity:.35}
-.tick-qt{stroke:var(--warn)}
-.tick-429{stroke:var(--crit)}
-.tick-brk-open{stroke:var(--crit)}
-.tick-brk-half{stroke:var(--warn)}
-.tick-stale{stroke:var(--text-3)}
-.crosshair{stroke:var(--border-2);stroke-width:0.5;pointer-events:none}
-.tip{position:absolute;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-sm);padding:var(--space-2);font-size:var(--fs-xs);color:var(--text);pointer-events:none;display:none;z-index:10;box-shadow:var(--shadow);font-variant-numeric:tabular-nums}
-.tip th{color:var(--text-3);text-align:left;padding-right:var(--space-2);font-weight:400}
-.tip td{padding-right:var(--space-3)}
-.tip .stale{color:var(--crit)}
-.ranges{float:right;display:inline-flex;gap:var(--space-1)}
-.rbtn{background:none;border:1px solid var(--border-2);color:var(--text-3);
-font-family:var(--font-mono);font-size:var(--fs-xs);padding:0 var(--space-2);
-border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing:0}
-.rbtn:hover,.rbtn.active{border-color:var(--accent);color:var(--accent)}
-.ribbon{width:100%;height:4px;display:block;margin-top:2px}
-.qspark{width:100%;height:56px;display:block;margin-top:var(--space-2)}
-.help{cursor:help;text-decoration:underline dotted;text-decoration-color:var(--border-2);text-underline-offset:3px}
-.sleg span[title],.rleg span[title]{cursor:help}
-.spark-qd{stroke:var(--info,var(--accent))}
-.qfill{fill:var(--info-soft,none)}
-.req-section{margin-top:var(--space-3);display:none}
-.req-head{display:flex;justify-content:space-between;align-items:baseline;font-size:var(--fs-xs);color:var(--text-3);margin-bottom:var(--space-1)}
-.req-head .req-val{color:var(--text);font-variant-numeric:tabular-nums}
-.req-head .req-remain{color:var(--ok);font-variant-numeric:tabular-nums}
-.req-head .req-remain.low{color:var(--warn)}
-.req-head .req-remain.crit{color:var(--crit)}
-.budget{position:relative;height:18px;background:var(--inset);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
-.budget-used{position:absolute;top:0;height:100%;background:var(--accent);opacity:.55;transition:width .3s}
-.budget-used.low{background:var(--warn)}
-.budget-used.crit{background:var(--crit)}
-.budget-hc{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px solid var(--crit);opacity:.5}
-.budget-lim{position:absolute;top:-1px;height:calc(100% + 2px);border-left:1px dashed var(--text-3);opacity:.4}
-.rspark{width:100%;height:64px;display:block;margin-top:var(--space-2)}
-.spark-rwin{stroke:var(--accent)}.spark-rlw{stroke:var(--warn);stroke-dasharray:2,1}
-.rspark-grid{stroke:var(--border);stroke-dasharray:2,2}
-.rspark-lim{stroke:var(--text-3);stroke-width:0.5;stroke-dasharray:1,1}
-.rgap{fill:var(--warn);opacity:.12}
-.rleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
-.rleg .rdelta{color:var(--warn)}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>sluice <span id="build" style="color:var(--text-3);font-size:.55em;font-weight:normal"></span></h1>
-  <div class="controls">
-    <button id="btn-pause" onclick="togglePause()">pause</button>
-    <button onclick="refresh()">refresh</button>
-    <button id="theme-toggle" title="toggle theme">
-      <span id="theme-icon-dark">\u2600</span>
-      <span id="theme-icon-light">\u263d</span>
-    </button>
-  </div>
-</div>
-<div id="banner-boxed" class="banner boxed">ACCOUNT BOXED \u2014 retry after <span id="countdown">?</span>s</div>
-<div id="banner-breaker" class="banner breaker">CIRCUIT BREAKER OPEN \u2014 backing off</div>
-<div class="row">
-  <div class="card">
-    <h2>Concurrency Gauge</h2>
-    <div class="gauge" id="gauge"></div>
-    <div class="gl" id="gauge-labels"></div>
-  </div>
-</div>
-<div class="row">
-  <div class="card" id="spark-card">
-    <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span>
-      <span class="ranges">
-        <button class="rbtn active" id="r-5m" onclick="setRange('5m')">5m</button>
-        <button class="rbtn" id="r-1h" onclick="setRange('1h')">1h</button>
-        <button class="rbtn" id="r-4h" onclick="setRange('4h')">4h</button>
-      </span></h2>
-    <svg class="spark" id="spark" viewBox="0 0 200 120" preserveAspectRatio="none"><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/></svg>
-    <svg class="ribbon" id="ribbon" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
-    <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/></svg>
-    <div class="sleg">
-      <span title="concurrent_sessions from the provider usage endpoint - ground truth, includes phantoms"><span class="dot" style="background:var(--accent)"></span> observed</span>
-      <span title="local_in_flight - requests sluice is holding a permit for"><span class="dot" style="background:var(--warn)"></span> local</span>
-      <span title="phantom_estimate - sustained provider-observed excess over local; only drawn when above zero"><span class="dot" style="background:var(--text-3)"></span> phantom</span>
-      <span title="effective_permits - the controller ceiling, drawn as a step line"><span class="dash" style="border-top-color:var(--ok)"></span> effective</span>
-      <span title="queue_depth on the lower spark, on its own scale"><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
-      <span title="tick where queue_timeouts incremented between samples"><span class="dot" style="background:var(--warn)"></span> timeout</span>
-      <span title="tick where total_429s incremented between samples"><span class="dot" style="background:var(--crit)"></span> 429</span>
-    </div>
-    <div id="req-section" class="req-section">
-      <div class="req-head">
-        <span>Request Budget <span id="req-window" style="color:var(--text-3)"></span></span>
-        <span><span class="req-val" id="req-used">-</span> / <span id="req-limit">-</span> &middot; <span class="req-remain" id="req-remain">-</span> remaining</span>
-      </div>
-      <div class="budget" id="budget-bar"></div>
-      <svg class="rspark" id="rspark" viewBox="0 0 200 50" preserveAspectRatio="none"></svg>
-      <div class="rleg">
-        <span title="requests_in_window as reported by the provider"><span class="dot" style="background:var(--accent)"></span> provider</span>
-        <span title="requests sluice itself forwarded within the provider window"><span class="dot" style="background:var(--warn)"></span> sluice</span>
-        <span class="rdelta" id="rdelta-text" title="provider count minus sluice count; positive means requests reached the provider outside sluice"></span>
-        <span id="rspark-info" style="color:var(--text-3)"></span>
-      </div>
-    </div>
-    <div class="tip" id="spark-tip">
-      <table>
-        <tr><th>time</th><td id="tip-ts" colspan="5">-</td></tr>
-        <tr><th>obs</th><td id="tip-obs">-</td><th>loc</th><td id="tip-loc">-</td><th>ep</th><td id="tip-ep">-</td></tr>
-        <tr><th>qd</th><td id="tip-qd">-</td><th>band</th><td id="tip-band" colspan="3">-</td></tr>
-        <tr><th>age</th><td id="tip-age">-</td><th>lim</th><td id="tip-lim">-</td><th>hc</th><td id="tip-hc">-</td></tr>
-        <tr><th>brk</th><td id="tip-brk" colspan="5">-</td></tr>
-      </table>
-    </div>
-  </div>
-</div>
-<div class="row">
-  <div class="card">
-    <h2>Reading</h2>
-    <table id="stats"></table>
-  </div>
-  <div class="card">
-    <h2>Config</h2>
-    <table id="config-table"></table>
-  </div>
-</div>
-<script>
-let paused=false,isActive=false,timer=null,fetching=false;
-let lastValid=[];
-const HIST_MAX=60;
-// Long ranges pull from /history.json (5s tick cadence): 720 ticks = 1h, 2880 = 4h.
-const RANGES={'5m':{limit:HIST_MAX},'1h':{limit:720},'4h':{limit:2880}};
-const BUCKETS=120,LONG_REFRESH_MS=15000;
-let hist=[],viewRange='5m',longHist=[],lastLongFetch=0,lastD=null;
-
-function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
-function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
-
-function fromHistEntry(e){
-  return {ts:e.ts,obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep,lim:e.lim,hc:e.hc,
-          band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429,
-          rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta};
-}
-
-async function initHistory(){
-  try{
-    const r=await fetch('/history.json?limit='+HIST_MAX,{credentials:'include'});
-    if(!r.ok) return;
-    const d=await r.json();
-    if(!d.entries||!d.entries.length) return;
-    hist=d.entries.map(fromHistEntry);
-  }catch(e){}
-}
-
-function setRange(rg){
-  viewRange=rg;
-  ['5m','1h','4h'].forEach(function(k){
-    document.getElementById('r-'+k).className='rbtn'+(k===rg?' active':'');
-  });
-  if(rg==='5m'){renderSparks();}
-  else{fetchLong(true);}
-}
-
-async function fetchLong(force){
-  if(!force&&Date.now()-lastLongFetch<LONG_REFRESH_MS) return;
-  lastLongFetch=Date.now();
-  try{
-    const r=await fetch('/history.json?limit='+RANGES[viewRange].limit,{credentials:'include'});
-    if(!r.ok) return;
-    const d=await r.json();
-    longHist=(d.entries||[]).map(fromHistEntry);
-    renderSparks();
-  }catch(e){}
-}
-
-async function doPoll(){
-  if(fetching) return;
-  fetching=true;
-  try{
-    const r=await fetch('/status.json',{credentials:'include'});
-    if(!r.ok){
-      document.getElementById('stats').innerHTML='<tr><th>error</th><td>status '+r.status+'</td></tr>';
-      return;
-    }
-    const d=await r.json();
-    lastD=d;
-    document.getElementById('build').textContent='v'+d.version+(d.build?' @ '+d.build:'');
-    render(d);
-    hist.push({ts:Date.now()/1000,obs:d.concurrent_sessions,loc:d.local_in_flight,
-               ph:d.phantom_estimate,ep:d.effective_permits,
-               lim:d.limit,hc:d.hard_cap,band:d.band,brk:d.breaker,
-               stl:d.stale,age:d.usage_age,qd:d.queue_depth,
-               qt:d.queue_timeouts,t429:d.total_429s,
-               rwin:d.requests_in_window,rlim:d.requests_limit,
-               rrem:d.requests_remaining,rlw:d.local_requests_in_window,
-               rdelta:d.request_window_delta});
-    if(hist.length>HIST_MAX) hist.shift();
-    if(viewRange==='5m'){renderSparks();}
-    else{fetchLong(false);}
-  }catch(e){
-    document.getElementById('stats').innerHTML='<tr><th>error</th><td>'+esc(e.message)+'</td></tr>';
-  }finally{
-    fetching=false;
-  }
-}
-
-function schedule(delay){
-  if(timer) clearTimeout(timer);
-  timer=setTimeout(poll,delay);
-}
-
-async function poll(){
-  if(!paused) await doPoll();
-  schedule(paused?5000:(isActive?1000:5000));
-}
-
-function refresh(){
-  if(timer) clearTimeout(timer);
-  doPoll();
-  if(viewRange!=='5m') fetchLong(true);
-  schedule(paused?5000:(isActive?1000:5000));
-}
-
-function togglePause(){
-  paused=!paused;
-  document.getElementById('btn-pause').textContent=paused?'resume':'pause';
-  if(!paused) schedule(0);
-}
-
-function render(d){
-  const limit=d.limit??4,hc=d.hard_cap??8,tgt=d.target??3;
-  const obs=d.concurrent_sessions,loc=d.local_in_flight;
-  // Gauge
-  const g=document.getElementById('gauge');
-  if(obs==null||hc==null||limit==null){
-    g.innerHTML='<div style="text-align:center;color:var(--text-3);font-size:var(--fs-xs);line-height:24px">waiting for data...</div>';
-    document.getElementById('gauge-labels').innerHTML='';
-  }else{
-    var nW=Math.min(100,Math.max(0,(limit/hc)*100));
-    var lW=Math.max(0,100-nW);
-    var h='<div class="gz gz-n" style="left:0;width:'+nW+'%"></div>';
-    h+='<div class="gz gz-l" style="left:'+nW+'%;width:'+lW+'%"></div>';
-    var tP=Math.min(100,(tgt/hc)*100);
-    h+='<div class="gt" style="left:'+tP+'%" title="target='+tgt+'"></div>';
-    var oP=Math.min(100,(obs/hc)*100);
-    h+='<div class="gm gm-o" style="left:'+oP+'%" title="observed='+obs+'"></div>';
-    if(loc!=null){
-      var lP=Math.min(100,(loc/hc)*100);
-      h+='<div class="gm gm-l" style="left:'+lP+'%" title="local='+loc+'"></div>';
-    }
-    g.innerHTML=h;
-    document.getElementById('gauge-labels').innerHTML=
-      '<span>0</span><span class="gl-limit">limit='+limit+'</span><span class="gl-hardcap">hard_cap='+hc+'</span>';
-  }
-  // Stats table — third element is the hover explanation (title attribute)
-  var rows=[
-    ['band',d.band,'Provider enforcement band: normal, low (deprioritized), reject, or boxed'],
-    ['effective_permits',d.effective_permits,'Permits the controller currently grants: target minus phantom absorption and band/breaker backoff'],
-    ['concurrent_sessions',obs,'Sessions the provider reports as running - ground truth, includes phantoms sluice cannot see'],
-    ['local_in_flight',loc,'Requests sluice is holding a permit for right now'],
-    ['cooling_down',d.cooling_down,'Recently released permits still cooling down before they can be re-acquired'],
-    ['phantom_estimate',d.phantom_estimate,'Sustained excess of provider-observed sessions over local in-flight (windowed min) - sessions the provider still counts but sluice is not running'],
-    ['breaker',d.breaker,'Circuit breaker on upstream 429s: closed (normal), open (backing off), half_open (probing)'],
-    ['breaker_half_open_age',
-      d.breaker_half_open_age_seconds!=null
-        ? d.breaker_half_open_age_seconds+'s'
-        : null,
-      'Seconds since the breaker went half_open and began probing'],
-    ['recent_429s',d.recent_429s,'Upstream 429s within the breaker window'],
-    ['total_429s',d.total_429s,'Upstream 429s since startup'],
-    ['queue_depth',d.queue_depth,'Requests currently waiting for a permit'],
-    ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95','Wait time of recently granted requests that had to queue: mean and 95th percentile'],
-    ['queue_timeouts',d.queue_timeouts,'Requests that gave up waiting for a permit, since startup'],
-    ['gate_closed',d.gate_closed_reason,'Why the gate refuses new work: open means it is not closed; otherwise boxed, breaker, or saturated'],
-    ['ready',d.ready,'True once the first usage poll succeeded and this instance holds the singleton lock'],
-    ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':''),'Age of the newest usage reading; stale means the last poll failed'],
-  ];
-  function kvRow(r){
-    var t=r[2]?' class="help" title="'+esc(r[2])+'"':'';
-    return '<tr><th'+t+'>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';
-  }
-  document.getElementById('stats').innerHTML=rows
-    .filter(function(r){return r[1]!=null;})
-    .map(kvRow).join('');
-  // Config table
-  var c=d.config||{};
-  var crows=[
-    ['target',c.target,'Steady-state concurrency sluice aims to keep in flight'],
-    ['min_floor',c.min_floor,'Effective permits never drop below this'],
-    ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null,'How often the provider usage endpoint is polled'],
-    ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null,'Maximum age of a usage reading before the controller stops trusting it'],
-    ['phantom_window',c.phantom_window,'Number of polls in the windowed-min phantom estimate; higher is slower but surer absorption'],
-    ['breaker_threshold',c.breaker_threshold,'Recent 429s that trip the breaker open'],
-    ['breaker_window',c.breaker_window_seconds!=null?c.breaker_window_seconds+'s':null,'Sliding window over which recent 429s are counted'],
-    ['breaker_cooldown',c.breaker_cooldown_seconds!=null?c.breaker_cooldown_seconds+'s':null,'How long the breaker stays open before probing half_open'],
-    ['provider',c.provider,'Usage-truth provider adapter in use'],
-    ['controller',c.controller,'Permit controller strategy in use'],
-  ].filter(function(r){return r[1]!=null;});
-  document.getElementById('config-table').innerHTML=crows.map(kvRow).join('');
-  // Banners
-  var bb=document.getElementById('banner-boxed');
-  if(d.band==='boxed'){
-    bb.style.display='block';
-    var ra=d.resets_at?Math.max(0,Math.round(d.resets_at-Date.now()/1000)):'?';
-    document.getElementById('countdown').textContent=ra;
-  }else bb.style.display='none';
-  document.getElementById('banner-breaker').style.display=
-    (d.breaker==='open'||d.breaker==='half_open')?'block':'none';
-  if(d.breaker==='half_open'&&d.breaker_half_open_age_seconds!=null){
-    document.getElementById('banner-breaker').textContent=
-      'CIRCUIT BREAKER HALF_OPEN — probing ('+d.breaker_half_open_age_seconds+'s)';
-  }else{
-    document.getElementById('banner-breaker').textContent=
-      'CIRCUIT BREAKER OPEN — backing off';
-  }
-  // Active = anything moving
-  isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
-  renderBudget(d);
-}
-
-function renderBudget(d){
-  var sec=document.getElementById('req-section');
-  var rlim=d.requests_limit;
-  if(rlim==null){
-    sec.style.display='none';
-    return;
-  }
-  sec.style.display='block';
-  var rwin=d.requests_in_window!=null?d.requests_in_window:0;
-  var rrem=d.requests_remaining!=null?d.requests_remaining:(rlim-rwin);
-  var rhc=d.requests_hard_cap;
-  var ws=d.requests_window_seconds;
-  var pct=Math.min(100,Math.max(0,(rwin/rlim)*100));
-  var cls='';
-  if(rwin/rlim>=0.9) cls=' crit';
-  else if(rwin/rlim>=0.75) cls=' low';
-  var h='<div class="budget-used'+cls+'" style="width:'+pct+'%"></div>';
-  if(rhc!=null&&rhc>rlim){
-    var hcP=Math.min(100,(rhc/Math.max(rhc,rlim))*100);
-    h+='<div class="budget-hc" style="left:'+hcP+'%"></div>';
-  }
-  var limP=Math.min(100,(rlim/Math.max(rhc||rlim,rlim))*100);
-  h+='<div class="budget-lim" style="left:'+limP+'%"></div>';
-  document.getElementById('budget-bar').innerHTML=h;
-  document.getElementById('req-used').textContent=rwin;
-  document.getElementById('req-limit').textContent=rlim;
-  var remEl=document.getElementById('req-remain');
-  remEl.textContent=rrem;
-  remEl.className='req-remain'+cls;
-  var wEl=document.getElementById('req-window');
-  if(ws!=null){
-    var h=Math.floor(ws/3600);
-    wEl.textContent='('+h+'h window)';
-  }else{
-    wEl.textContent='';
-  }
-}
-
-const SEV={normal:0,low:1,reject:2,boxed:3};
-const SEV_COLOR={1:'var(--warn)',2:'var(--crit)',3:'var(--crit)'};
-const BRKSEV={closed:0,half_open:1,open:2};
-
-// Mark samples where the cumulative counters advanced vs the previous sample,
-// and flag discrete state values the spark overlays need.
-function withIncs(samples){
-  return samples.map(function(s,i){
-    var p=i>0?samples[i-1]:null;
-    return {ts:s.ts,obs:s.obs,loc:s.loc,ph:s.ph,ep:s.ep,lim:s.lim,hc:s.hc,
-            qd:s.qd||0,band:s.band||'normal',brk:s.brk||'closed',stl:!!s.stl,age:s.age||0,
-            qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429),
-            rwin:s.rwin,rlim:s.rlim,rrem:s.rrem,rlw:s.rlw,rdelta:s.rdelta};
-  });
-}
-
-// Downsample to <=n buckets. Max for numeric series (mean would erase the
-// spikes worth seeing), worst for band and breaker, any for event ticks.
-// Effective permits uses the last value of the bucket (controller decision
-// is piecewise-constant; last value is most representative).
-function bucketize(samples,n){
-  if(samples.length<=n) return samples;
-  var k=Math.ceil(samples.length/n),out=[];
-  for(var i=0;i<samples.length;i+=k){
-    var b={ts:0,obs:null,loc:0,ph:0,ep:0,lim:null,hc:null,qd:0,
-           band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false,
-           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null};
-    for(var j=i;j<Math.min(i+k,samples.length);j++){
-      var s=samples[j];
-      b.ts=s.ts||b.ts;
-      if(s.obs!=null&&(b.obs==null||s.obs>b.obs)) b.obs=s.obs;
-      if(s.loc>b.loc) b.loc=s.loc;
-      if(s.ph>b.ph) b.ph=s.ph;
-      if(s.ep!==undefined) b.ep=s.ep;
-      if(s.lim!=null&&(b.lim==null||s.lim>b.lim)) b.lim=s.lim;
-      if(s.hc!=null&&(b.hc==null||s.hc>b.hc)) b.hc=s.hc;
-      if(s.qd>b.qd) b.qd=s.qd;
-      if((SEV[s.band]||0)>(SEV[b.band]||0)) b.band=s.band;
-      if((BRKSEV[s.brk]||0)>(BRKSEV[b.brk]||0)) b.brk=s.brk;
-      b.stl=b.stl||s.stl;
-      b.qtInc=b.qtInc||s.qtInc;
-      b.t429Inc=b.t429Inc||s.t429Inc;
-      if(s.rwin!=null&&(b.rwin==null||s.rwin>b.rwin)) b.rwin=s.rwin;
-      if(s.rlim!=null&&(b.rlim==null||s.rlim>b.rlim)) b.rlim=s.rlim;
-      if(s.rrem!=null) b.rrem=s.rrem;
-      if(s.rlw!=null&&(b.rlw==null||s.rlw>b.rlw)) b.rlw=s.rlw;
-      if(s.rdelta!=null&&(b.rdelta==null||s.rdelta>b.rdelta)) b.rdelta=s.rdelta;
-    }
-    out.push(b);
-  }
-  return out;
-}
-
-function renderSparks(){
-  var d=lastD||{};
-  var curHc=d.hard_cap??8,curLimit=d.limit??4;
-  var raw=viewRange==='5m'?hist:longHist;
-  var samples=bucketize(withIncs(raw),BUCKETS);
-  var denom=viewRange==='5m'?HIST_MAX:samples.length;
-  var svg=document.getElementById('spark');
-  var info=document.getElementById('spark-info');
-  var valid=samples.filter(function(h){return h.obs!=null;});
-  lastValid=valid;
-  var infoBase=viewRange==='5m'
-    ? valid.length+'/'+denom+' samples'
-    : viewRange+' · '+raw.length+' ticks';
-  info.textContent=infoBase;
-  if(valid.length<2){
-    svg.innerHTML='<text x="100" y="62" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
-    document.getElementById('ribbon').innerHTML='';
-    document.getElementById('qspark').innerHTML='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
-    var rs2=document.getElementById('rspark');
-    if(rs2){rs2.innerHTML='';rs2.style.display='none';}
-    return;
-  }
-  var W=200,pad=3,H=120,QH=28;
-  var span=Math.max(denom-1,valid.length-1,1);
-  function xAt(i){return pad+(i/span)*(W-2*pad);}
-  function yFor(v){return H-pad-(v/maxV)*(H-2*pad);}
-  // -- main spark: observed / local / phantom / effective-permits against guide lines
-  var maxV=curHc;
-  for(var i=0;i<valid.length;i++){
-    if(valid[i].obs>maxV) maxV=valid[i].obs;
-    if(valid[i].loc>maxV) maxV=valid[i].loc;
-    if(valid[i].ep>maxV) maxV=valid[i].ep;
-  }
-  if(maxV<1) maxV=1;
-  function pts(key){
-    return valid.map(function(h,i){
-      var v=h[key]||0;
-      var y=yFor(v);
-      return xAt(i).toFixed(1)+','+y.toFixed(1);
-    }).join(' ');
-  }
-  function stepPts(key){
-    var out=[];
-    for(var i=0;i<valid.length;i++){
-      var y=yFor(valid[i][key]||0).toFixed(1);
-      var x=xAt(i).toFixed(1);
-      out.push(x+','+y);
-      if(i<valid.length-1) out.push(xAt(i+1).toFixed(1)+','+y);
-    }
-    return out.join(' ');
-  }
-  var limitY=yFor(curLimit).toFixed(1),hcY=yFor(curHc).toFixed(1);
-  var s='';
-  // Guide lines: limit and hard cap
-  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" class="spark-lim" />';
-  s+='<line x1="'+pad+'" y1="'+hcY+'" x2="'+(W-pad)+'" y2="'+hcY+'" class="spark-hc" />';
-  s+='<polyline points="'+pts('obs')+'" fill="none" class="spark-obs" stroke-width="1"/>';
-  s+='<polyline points="'+pts('loc')+'" fill="none" class="spark-loc" stroke-width="1"/>';
-  s+='<polyline points="'+stepPts('ep')+'" fill="none" class="spark-ep" stroke-width="1.2"/>';
-  var hasPh=false;
-  for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
-  if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" class="spark-ph" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
-  // Breaker / stale tick marks at the top of the spark
-  for(var b=0;b<valid.length;b++){
-    var x=xAt(b).toFixed(1);
-    if(valid[b].brk==='open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="13" class="tick-brk-open" stroke-width="1.5"/>';
-    else if(valid[b].brk==='half_open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="8" class="tick-brk-half" stroke-width="1.2"/>';
-    else if(valid[b].stl) s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="6" class="tick-stale" stroke-width="1"/>';
-  }
-  // Keep crosshair line on top and off-canvas by default
-  s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/>';
-  svg.innerHTML=s;
-  // -- band ribbon: one segment per non-normal sample
-  var rb='';
-  var segW=(W-2*pad)/Math.max(valid.length,1);
-  for(var m=0;m<valid.length;m++){
-    var sev=SEV[valid[m].band]||0;
-    if(sev>0) rb+='<rect x="'+xAt(m).toFixed(1)+'" y="0" width="'+Math.max(segW,1).toFixed(1)+'" height="4" fill="'+SEV_COLOR[sev]+'"/>';
-  }
-  document.getElementById('ribbon').innerHTML=rb;
-  // -- queue spark: depth area + event ticks, own scale
-  var maxQ=1;
-  for(var q=0;q<valid.length;q++){if(valid[q].qd>maxQ) maxQ=valid[q].qd;}
-  function qy(v){return QH-pad-(v/maxQ)*(QH-2*pad);}
-  var qpts=valid.map(function(h,i){return xAt(i).toFixed(1)+','+qy(h.qd||0).toFixed(1);}).join(' ');
-  var first=xAt(0).toFixed(1),last=xAt(valid.length-1).toFixed(1),base=(QH-pad).toFixed(1);
-  var qs='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
-  qs+='<polygon points="'+first+','+base+' '+qpts+' '+last+','+base+'" class="qfill" stroke="none"/>';
-  qs+='<polyline points="'+qpts+'" fill="none" class="spark-qd" stroke-width="1"/>';
-  for(var t=0;t<valid.length;t++){
-    var x=xAt(t).toFixed(1);
-    if(valid[t].t429Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-429" stroke-width="1"/>';
-    else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
-  }
-  document.getElementById('qspark').innerHTML=qs;
-  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ;
-  // -- reconciliation spark: provider requests_in_window vs sluice local count
-  var rspark=document.getElementById('rspark');
-  var rinfo=document.getElementById('rspark-info');
-  var rdeltaText=document.getElementById('rdelta-text');
-  var rvalid=samples.filter(function(h){return h.rwin!=null;});
-  if(rvalid.length<2){
-    rspark.innerHTML='';
-    rspark.style.display='none';
-    rinfo.textContent='';
-    rdeltaText.textContent='';
-  }else{
-    rspark.style.display='block';
-    var RH=50,rpad=3;
-    var rlimVal=rvalid[rvalid.length-1].rlim||rvalid[rvalid.length-1].rwin||1;
-    var rmaxV=rlimVal;
-    for(var ri=0;ri<rvalid.length;ri++){
-      if(rvalid[ri].rwin>rmaxV) rmaxV=rvalid[ri].rwin;
-      if(rvalid[ri].rlw!=null&&rvalid[ri].rlw>rmaxV) rmaxV=rvalid[ri].rlw;
-    }
-    if(rmaxV<1) rmaxV=1;
-    var rspan=Math.max(denom-1,rvalid.length-1,1);
-    function rxAt(i){return rpad+(i/rspan)*(W-2*rpad);}
-    function ryFor(v){return RH-rpad-(v/rmaxV)*(RH-2*rpad);}
-    var rs='';
-    if(rlimVal>0){
-      var limY=ryFor(rlimVal).toFixed(1);
-      rs+='<line x1="'+rpad+'" y1="'+limY+'" x2="'+(W-rpad)+'" y2="'+limY+'" class="rspark-lim"/>';
-    }
-    var rwinPts=rvalid.map(function(h,i){return rxAt(i).toFixed(1)+','+ryFor(h.rwin).toFixed(1);}).join(' ');
-    rs+='<polyline points="'+rwinPts+'" fill="none" class="spark-rwin" stroke-width="1"/>';
-    var hasRlw=false;
-    for(var ri2=0;ri2<rvalid.length;ri2++){if(rvalid[ri2].rlw!=null){hasRlw=true;break;}}
-    if(hasRlw){
-      var rlwPts=rvalid.map(function(h,i){
-        var v=h.rlw!=null?h.rlw:0;
-        return rxAt(i).toFixed(1)+','+ryFor(v).toFixed(1);
-      }).join(' ');
-      rs+='<polyline points="'+rlwPts+'" fill="none" class="spark-rlw" stroke-width="1"/>';
-      var gapPts='';
-      for(var gi=0;gi<rvalid.length;gi++){
-        gapPts+=rxAt(gi).toFixed(1)+','+ryFor(rvalid[gi].rwin).toFixed(1)+' ';
-      }
-      for(var gi2=rvalid.length-1;gi2>=0;gi2--){
-        var lv=rvalid[gi2].rlw!=null?rvalid[gi2].rlw:0;
-        gapPts+=rxAt(gi2).toFixed(1)+','+ryFor(lv).toFixed(1)+' ';
-      }
-      rs+='<polygon points="'+gapPts+'" class="rgap" stroke="none"/>';
-    }
-    rspark.innerHTML=rs;
-    var curDelta=rvalid[rvalid.length-1].rdelta;
-    rdeltaText.textContent=curDelta!=null?'\u0394 '+curDelta+(curDelta>0?' (leakage)':''):'';
-    rinfo.textContent='max '+rmaxV+' · lim '+rlimVal;
-  }
-}
-
-function onSparkHover(e){
-  var v=lastValid;
-  if(!lastD||v.length<2) return;
-  var svg=e.currentTarget;
-  var rect=svg.getBoundingClientRect();
-  var x=e.clientX-rect.left;
-  var W=200,pad=3;
-  var xView=Math.max(pad,Math.min(W-pad,(x/rect.width)*W));
-  var denom=viewRange==='5m'?HIST_MAX:v.length;
-  var span=Math.max(denom-1,v.length-1,1);
-  var idx=Math.round(((xView-pad)/(W-2*pad))*span);
-  idx=Math.max(0,Math.min(v.length-1,idx));
-  var s=v[idx];
-  document.getElementById('tip-ts').textContent=fmtTime(s.ts);
-  document.getElementById('tip-obs').textContent=s.obs!=null?s.obs:'-';
-  document.getElementById('tip-loc').textContent=s.loc;
-  document.getElementById('tip-ep').textContent=s.ep;
-  document.getElementById('tip-qd').textContent=s.qd;
-  document.getElementById('tip-band').textContent=s.band;
-  var ageEl=document.getElementById('tip-age');
-  ageEl.textContent=(s.age!=null?s.age+'s':'-')+(s.stl?' stale':'');
-  ageEl.className=s.stl?'stale':'';
-  document.getElementById('tip-lim').textContent=s.lim!=null?s.lim:'-';
-  document.getElementById('tip-hc').textContent=s.hc!=null?s.hc:'-';
-  var brkText=s.brk;
-  if(s.brk==='half_open'&&lastD.breaker_half_open_age_seconds!=null)
-    brkText+=' ('+lastD.breaker_half_open_age_seconds+'s)';
-  document.getElementById('tip-brk').textContent=brkText;
-  var tip=document.getElementById('spark-tip');
-  tip.style.display='block';
-  var card=document.getElementById('spark-card');
-  var cRect=card.getBoundingClientRect();
-  var left=e.clientX-cRect.left+12;
-  var top=e.clientY-cRect.top+12;
-  if(left+tip.offsetWidth>cRect.width-8) left=cRect.width-tip.offsetWidth-8;
-  if(top+tip.offsetHeight>cRect.height-8) top=cRect.height-tip.offsetHeight-8;
-  tip.style.left=left+'px';
-  tip.style.top=top+'px';
-  var cx=(pad+(idx/span)*(W-2*pad)).toFixed(1);
-  var cm=document.getElementById('crosshair-main');
-  if(cm){cm.setAttribute('x1',cx);cm.setAttribute('x2',cx);}
-  var cq=document.getElementById('crosshair-q');
-  if(cq){cq.setAttribute('x1',cx);cq.setAttribute('x2',cx);}
-}
-function hideSparkTip(){
-  document.getElementById('spark-tip').style.display='none';
-  var cm=document.getElementById('crosshair-main');
-  if(cm){cm.setAttribute('x1',-10);cm.setAttribute('x2',-10);}
-  var cq=document.getElementById('crosshair-q');
-  if(cq){cq.setAttribute('x1',-10);cq.setAttribute('x2',-10);}
-}
-document.getElementById('spark').addEventListener('mousemove',onSparkHover);
-document.getElementById('spark').addEventListener('mouseleave',hideSparkTip);
-document.getElementById('qspark').addEventListener('mousemove',onSparkHover);
-document.getElementById('qspark').addEventListener('mouseleave',hideSparkTip);
-
-initHistory().then(poll);
-</script>
-</body>
-</html>
-"""
