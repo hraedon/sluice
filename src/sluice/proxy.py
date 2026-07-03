@@ -78,7 +78,7 @@ _RETRY_ACQUIRE_INTERVAL = 10.0
 _RESERVED_LABEL = "interactive"
 
 # Headers that indicate a CDN/gateway layer, not the upstream application.
-# If present on a 429, the 427 is classified as "gateway" — tracked but not
+# If present on a 429, the 429 is classified as "gateway" — tracked but not
 # fed to the breaker (WI-024: CDN 429s don't represent concurrency pressure).
 _CDN_HEADERS = frozenset(
     {

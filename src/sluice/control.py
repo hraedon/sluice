@@ -261,7 +261,7 @@ class BreakerConfig:
 
 @dataclass(frozen=True)
 class BreakerSnapshot:
-    """Mutable breaker state carried across calls (the shell holds one)."""
+    """Breaker state carried across calls (the shell holds one)."""
 
     state: BreakerState = BreakerState.CLOSED
     opened_at: float | None = None  # monotonic timestamp of last OPEN transition
@@ -490,7 +490,7 @@ def adaptive_effective_permits(
 
 
 def validate_target_override(
-    value: int, reading: UsageReading, config: ControllerConfig
+    value: int, reading: UsageReading
 ) -> str | None:
     """Validate a target override against provider limits.
 

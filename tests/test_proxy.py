@@ -3188,3 +3188,76 @@ async def test_post_config_override_before_tick_returns_400():
 
     assert response.status_code == 400
     assert "poll" in response.json()["error"]
+
+
+async def test_post_config_body_too_large_returns_413():
+    """POST /admin/config rejects bodies exceeding the size cap (WI-025)."""
+    app, _, reconcile = _make_app()
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    big_body = b"x" * 10000
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            content=big_body,
+            headers={
+                "Authorization": "Bearer secret",
+                "Content-Type": "application/json",
+            },
+        )
+
+    assert response.status_code == 413
+
+
+async def test_non_leader_config_post_returns_503():
+    """POST /admin/config on a non-leader returns 503 not_leader."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, reconcile = _make_app_with_guard(guard)
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "not_leader"
+
+
+async def test_non_leader_config_delete_returns_503():
+    """DELETE /admin/config/target on a non-leader returns 503 not_leader."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, reconcile = _make_app_with_guard(guard)
+    app._admin_token = "secret"
+
+    async with _asgi_client(app) as client:
+        response = await client.delete(
+            "/admin/config/target",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "not_leader"
+
+
+async def test_config_post_auth_before_leader_check():
+    """Auth is checked before leader status — unauthenticated request gets 403,
+    not 503 not_leader (no topology leak)."""
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, reconcile = _make_app_with_guard(guard)
+    app._admin_token = "secret"
+    await reconcile.tick()
+
+    async with _asgi_client(app) as client:
+        response = await client.post(
+            "/admin/config",
+            json={"target": 4},
+            headers={"Authorization": "Bearer wrong"},
+        )
+
+    assert response.status_code == 403

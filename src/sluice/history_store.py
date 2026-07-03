@@ -13,7 +13,7 @@ stop the reconciliation loop.
 
 Design:
     * ``sqlite3`` (stdlib) in WAL mode for concurrent reads without blocking.
-    * Single ``history`` table with the 17 :class:`HistoryEntry` fields.
+    * Single ``history`` table with the :class:`HistoryEntry` fields.
     * Column names match the compact keys in :meth:`HistoryEntry.to_dict` for
       consistency.
     * Writes are synchronous (one INSERT per tick, ~0.1 ms in WAL mode) and

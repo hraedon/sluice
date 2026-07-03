@@ -233,17 +233,22 @@ async def serve_static(path: str, send: Send) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MAX_CONFIG_BODY = 8192
+
+
 async def _read_body(receive: Receive) -> bytes:
-    """Read the full request body from ASGI receive()."""
+    """Read the request body from ASGI receive(), capped at _MAX_CONFIG_BODY."""
     body: bytes = b""
     while True:
         event = await receive()
         if event["type"] == "http.request":
             body += event.get("body", b"")
+            if len(body) > _MAX_CONFIG_BODY:
+                raise ValueError("request body too large")
             if not event.get("more_body", False):
                 return body
         elif event["type"] == "http.disconnect":
-            return body
+            raise ConnectionError("client disconnected during body upload")
 
 
 def _extract_audit_user(scope: Scope) -> str:
@@ -286,12 +291,12 @@ async def handle_config_post(
         await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"})
         return
 
-    if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
-        return
-
     if not check_admin_auth(scope, admin_token):
         await send_json(send, 403, {"error": "unauthorized"})
+        return
+
+    if guard is not None and not guard.is_held():
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
         return
 
     # CSRF defence: require application/json Content-Type so cross-origin
@@ -306,7 +311,13 @@ async def handle_config_post(
         await send_json(send, 415, {"error": "Content-Type must be application/json"})
         return
 
-    body = await _read_body(receive)
+    try:
+        body = await _read_body(receive)
+    except ValueError:
+        await send_json(send, 413, {"error": "request body too large"})
+        return
+    except ConnectionError:
+        return
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
@@ -368,16 +379,17 @@ async def handle_config_delete(
         await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"})
         return
 
-    if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
-        return
-
     if not check_admin_auth(scope, admin_token):
         await send_json(send, 403, {"error": "unauthorized"})
         return
 
+    if guard is not None and not guard.is_held():
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
+        return
+
+    previous = reconcile.target
     reconcile.clear_override("target")
     user = _extract_audit_user(scope)
     remote = _extract_remote(scope)
-    log.info("config override: target reverted (user=%s, remote=%s)", user, remote)
+    log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
     await send_json(send, 200, {"target": reconcile.target, "overridden": False})

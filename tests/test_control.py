@@ -665,27 +665,27 @@ def test_validate_target_below_1_rejected():
     """target < 1 is rejected — a zero-permit target is a deploy decision."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
     with pytest.raises(ValueError, match=">= 1"):
-        validate_target_override(0, r, CFG)
+        validate_target_override(0, r)
     with pytest.raises(ValueError, match=">= 1"):
-        validate_target_override(-5, r, CFG)
+        validate_target_override(-5, r)
 
 
 def test_validate_target_at_1_accepted():
     """target=1 is the minimum valid override."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
-    assert validate_target_override(1, r, CFG) is None
+    assert validate_target_override(1, r) is None
 
 
 def test_validate_target_at_limit_accepted():
     """target=limit is a clean accept (no warning)."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
-    assert validate_target_override(4, r, CFG) is None
+    assert validate_target_override(4, r) is None
 
 
 def test_validate_target_above_limit_accepted_with_warning():
     """target > limit but <= hard_cap is accepted with a warning."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
-    warning = validate_target_override(5, r, CFG)
+    warning = validate_target_override(5, r)
     assert warning is not None
     assert "above limit" in warning
 
@@ -693,7 +693,7 @@ def test_validate_target_above_limit_accepted_with_warning():
 def test_validate_target_at_hard_cap_accepted_with_warning():
     """target=hard_cap is above limit, so accepted with a warning."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
-    warning = validate_target_override(8, r, CFG)
+    warning = validate_target_override(8, r)
     assert warning is not None
     assert "above limit" in warning
 
@@ -702,7 +702,7 @@ def test_validate_target_above_hard_cap_rejected():
     """target > hard_cap is rejected — the provider will punish."""
     r = reading(concurrent_sessions=0, limit=4, hard_cap=8)
     with pytest.raises(ValueError, match="hard_cap"):
-        validate_target_override(9, r, CFG)
+        validate_target_override(9, r)
 
 
 def test_effective_permits_clamped_by_hard_cap():

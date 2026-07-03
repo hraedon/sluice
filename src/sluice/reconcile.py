@@ -160,7 +160,7 @@ class ReconciliationLoop:
                 "usage reading stale; override unavailable until fresh reading"
             )
 
-        warning = validate_target_override(value, cached.reading, self._boot_config)
+        warning = validate_target_override(value, cached.reading)
 
         self._ctrl_cfg = dataclasses.replace(self._ctrl_cfg, **{field: value})
         # The adaptive controller uses its own config; keep it in sync.
