@@ -30,4 +30,4 @@ resources:
 images:
 - name: ghcr.io/hraedon/sluice
   newName: ghcr.io/hraedon/sluice
-  newTag: ef10513
+  newTag: 30d7298
