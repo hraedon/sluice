@@ -32,6 +32,18 @@ The enforcement ladder, by observed `concurrent_sessions`:
 | **reject**  | `> hard_cap` (>8)        | HTTP **429** concurrency errors |
 | **boxed**   | (accumulated) >10 concurrency-429s in a day | **5-hour pause**, `boxed_until` set; self-reactivate ≤5×/week |
 
+**`boxed_until` alone does not mean boxed.** Observed live (2026-07-03, see
+`docs/wi-024-429-capture-2026-07-03.md`): a *single* limit hit sets
+`boxed_until` for a 5-hour window with `priority.reason = "rate_limited"` —
+and the account **keeps serving normally at low priority** (an in-window
+probe returned 200 in 0.9 s). The `reason` field discriminates the rung:
+
+- `reason == "rate_limited"` → **deprioritization** — classified as band
+  *low*; the gate stays open, capped at the account `limit` (or `limit − 1`
+  when `target` already consumes the full limit), never fully closed.
+- `reason` absent or anything else → **hard box** — band *boxed*, gate
+  closed (fail safe: an unrecognized penalty is treated as the worst case).
+
 Key consequences that shape the design:
 
 - **The box is not a single overshoot.** It's *accumulated* 429s. So the failure is
@@ -65,7 +77,7 @@ Pure data, all held/derived in `sluice.control`:
 `effective_permits(state) -> int` — how many permits the gate should currently allow:
 
 ```
-if boxed_until is set and now < resets_at:
+if hard_boxed:                     # boxed_until set, reason NOT "rate_limited"
     return 0                       # gate closed; clients get 503 + Retry-After
 
 if breaker is open:
@@ -74,6 +86,10 @@ if breaker is open:
 base = target
 if priority_low:                   # already in the 'low' band → drain back under target
     base = max(min_floor, target - 1)
+
+if deprioritized:                  # boxed_until set, reason == "rate_limited"
+    cap = limit if target < limit else max(1, limit - 1)
+    base = min(base, cap)          # serve reduced, never fully closed
 
 # absorb phantoms we did not create (only when the usage reading is fresh enough)
 if usage_age <= usage_fresh_ttl:

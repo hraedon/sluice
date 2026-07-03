@@ -90,6 +90,47 @@ def test_parse_boxed_until():
     assert r.boxed_until_epoch is not None
     assert r.boxed_until_epoch > 0
     assert r.priority_low is False
+    assert r.priority_reason == "boxed"
+
+
+def test_parse_priority_reason_rate_limited():
+    # The deprioritization rung as captured live 2026-07-03.
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 0,
+            "priority": {
+                "low": True,
+                "boxed_until": "2026-07-03T12:23:04.763728+00:00",
+                "reason": "rate_limited",
+            },
+        },
+    }
+    r = parse_usage(payload)
+    assert r.priority_reason == "rate_limited"
+    assert r.boxed_until_epoch is not None
+
+
+def test_parse_priority_reason_non_string_is_none():
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 0,
+            "priority": {"low": False, "boxed_until": None, "reason": 7},
+        },
+    }
+    assert parse_usage(payload).priority_reason is None
+
+
+def test_parse_priority_reason_missing_is_none():
+    payload: dict[str, object] = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 0,
+            "priority": {"low": False, "boxed_until": None},
+        },
+    }
+    assert parse_usage(payload).priority_reason is None
 
 
 def test_parse_resets_at():

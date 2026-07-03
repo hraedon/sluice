@@ -61,6 +61,7 @@ class LimitState:
     priority_low: bool = False
     boxed_until_epoch: float | None = None  # seconds since epoch, or None
     resets_at_epoch: float | None = None  # when the box lifts (epoch seconds), or None
+    priority_reason: str | None = None  # umans priority.reason ("rate_limited" = deprioritized rung)
 
     # Token-bucket fields (Anthropic/OpenAI: in-band response headers;
     # umans: polled from /v1/usage limits.requests + usage.requests_in_window)
@@ -110,14 +111,40 @@ class ControllerState:
 # ---------------------------------------------------------------------------
 
 
+def in_penalty_window(reading: UsageReading, *, now: float) -> bool:
+    """True while the provider's ``boxed_until`` timestamp lies in the future."""
+    return reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch
+
+
+def is_deprioritized(reading: UsageReading, *, now: float) -> bool:
+    """Penalty window with ``reason == "rate_limited"`` — the deprioritization rung.
+
+    Observed live 2026-07-03 (docs/wi-024-429-capture-2026-07-03.md): umans sets
+    ``boxed_until`` for a single limit hit with ``priority.reason = "rate_limited"``,
+    but keeps serving normally at low priority.  Only this exact reason is soft;
+    a missing or unrecognized reason keeps the fail-safe full stop.
+    """
+    return in_penalty_window(reading, now=now) and reading.priority_reason == "rate_limited"
+
+
+def is_hard_boxed(reading: UsageReading, *, now: float) -> bool:
+    """Penalty window that is NOT the known-soft deprioritization rung.
+
+    Fail safe (AGENTS.md rule 1): any ``boxed_until`` whose reason we cannot
+    positively identify as ``rate_limited`` closes the gate, exactly as before
+    the reason field was parsed.
+    """
+    return in_penalty_window(reading, now=now) and reading.priority_reason != "rate_limited"
+
+
 def classify_band(reading: UsageReading, *, now: float) -> Band:
     """Map an observation onto the provider's enforcement ladder."""
-    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+    if is_hard_boxed(reading, now=now):
         return Band.BOXED
     obs = reading.concurrent_sessions
     if obs > reading.hard_cap:
         return Band.REJECT
-    if obs > reading.limit or reading.priority_low:
+    if obs > reading.limit or reading.priority_low or is_deprioritized(reading, now=now):
         return Band.LOW
     return Band.NORMAL
 
@@ -174,8 +201,9 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     """
     reading = state.reading
 
-    # Hard stops first.
-    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+    # Hard stops first.  A penalty window whose reason is known-soft
+    # ("rate_limited") is NOT a stop — it is handled as a cap below.
+    if is_hard_boxed(reading, now=now):
         return 0
     if state.breaker is BreakerState.OPEN:
         return 0
@@ -185,6 +213,14 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     # Already deprioritised → drain back under target.
     if classify_band(reading, now=now) is Band.LOW:
         base -= config.low_penalty
+
+    # Deprioritization window: serve at the account limit — one below it when
+    # target already consumes the full limit — never fully closed.  The
+    # provider keeps serving on this rung (proven live, see capture doc);
+    # closing the gate here would turn a soft penalty into a full outage.
+    if is_deprioritized(reading, now=now):
+        cap = reading.limit if config.target < reading.limit else max(1, reading.limit - 1)
+        base = min(base, cap)
 
     # Absorb phantoms only when the reading is fresh enough to trust the number;
     # otherwise apply a flat staleness penalty rather than assuming zero phantoms.
@@ -363,8 +399,10 @@ def adaptive_effective_permits(
     """
     reading = state.reading
 
-    # Hard stops (shared breaker — same as the concurrency reconciler).
-    if reading.boxed_until_epoch is not None and now < reading.boxed_until_epoch:
+    # Hard stops (shared breaker — same as the concurrency reconciler).  The
+    # known-soft "rate_limited" window does not stop the adaptive controller
+    # either; its AIMD decrease path handles degraded signals.
+    if is_hard_boxed(reading, now=now):
         return 0, adaptive
     if state.breaker is BreakerState.OPEN:
         return 0, adaptive

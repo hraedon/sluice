@@ -23,6 +23,7 @@ class StatusSnapshot:
     limit: int | None
     hard_cap: int | None
     priority_low: bool
+    priority_reason: str | None
     boxed_until: float | None
     resets_at: float | None
     usage_age: float
@@ -66,6 +67,7 @@ class StatusSnapshot:
             "limit": self.limit,
             "hard_cap": self.hard_cap,
             "priority_low": self.priority_low,
+            "priority_reason": self.priority_reason,
             "boxed_until": self.boxed_until,
             "resets_at": self.resets_at,
             "usage_age": round(self.usage_age, 1),
@@ -118,6 +120,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         limit=reading.limit if reading else None,
         hard_cap=reading.hard_cap if reading else None,
         priority_low=reading.priority_low if reading else False,
+        priority_reason=reading.priority_reason if reading else None,
         boxed_until=reading.boxed_until_epoch if reading else None,
         resets_at=reading.resets_at_epoch if reading else None,
         usage_age=reconcile.last_age_seconds,

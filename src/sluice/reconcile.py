@@ -40,6 +40,7 @@ from sluice.control import (
     breaker_on_success,
     breaker_on_tick,
     effective_permits,
+    is_hard_boxed,
     phantom_estimate,
 )
 from sluice.gate import PermitGate
@@ -578,10 +579,10 @@ class ReconciliationLoop:
         """
         if self._last_reading_cached is not None:
             r = self._last_reading_cached.reading
-            if r.boxed_until_epoch is not None:
-                now_wall = self._wall()
-                if now_wall < r.boxed_until_epoch:
-                    return "boxed"
+            # Only a hard box closes the gate; the "rate_limited" rung keeps
+            # serving at reduced permits (docs/wi-024-429-capture-2026-07-03.md).
+            if is_hard_boxed(r, now=self._wall()):
+                return "boxed"
         if self._breaker.state is BreakerState.OPEN:
             return "breaker"
         if self._last_permits == 0:

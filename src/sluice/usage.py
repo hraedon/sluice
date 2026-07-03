@@ -92,6 +92,11 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
         priority_low = bool(priority.get("low", False))
         boxed_until_epoch = _parse_iso_to_epoch(priority.get("boxed_until"))
         resets_at_epoch = _parse_iso_to_epoch(priority.get("resets_at"))
+        # reason discriminates the ladder rung ("rate_limited" = deprioritized,
+        # still serving). Anything non-string is treated as absent — fail safe:
+        # absent reason + boxed_until = hard box.
+        reason_raw = priority.get("reason")
+        priority_reason = reason_raw if isinstance(reason_raw, str) else None
 
         # Request-window fields (umans Code Pro: limits.requests + usage.requests_in_window).
         # These are optional — Code Max reports "unlimited" with no requests block.
@@ -111,6 +116,7 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
             priority_low=priority_low,
             boxed_until_epoch=boxed_until_epoch,
             resets_at_epoch=resets_at_epoch,
+            priority_reason=priority_reason,
             requests_limit=requests_limit,
             requests_remaining=remaining_requests,
             requests_in_window=requests_in_window,

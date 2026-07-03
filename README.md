@@ -31,8 +31,8 @@ enforcement ladder is:
 Ladder and numbers per the [official usage docs](https://app.umans.ai/offers/code/docs#usage).
 The exact thresholds drift (the docs say the box trips past 10 concurrency-429s a day;
 the dashboard currently shows a 20-hit daily allowance) — sluice doesn't hard-code any of
-them. It reacts to what `/v1/usage` itself reports (`priority.low`, `boxed_until`), so the
-ladder can move without a code change.
+them. It reacts to what `/v1/usage` itself reports (`priority.low`, `boxed_until`,
+`priority.reason`), so the ladder can move without a code change.
 
 Two facts make a naive limiter insufficient:
 
@@ -54,8 +54,12 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   (`effective = target − max(0, observed − local_in_flight)`).
 - **Prevents phantoms** rather than only absorbing them: when a downstream client
   disconnects, sluice issues a clean cancel upstream instead of leaving a dangling stream.
-- **Respects the box.** On `boxed_until` it closes the gate and returns `503 Retry-After`
-  until `resets_at`, instead of hammering a locked account toward a longer pause.
+- **Respects the box — and knows it from deprioritization.** On a hard box
+  (`boxed_until` without `priority.reason = "rate_limited"`) it closes the gate and
+  returns `503 Retry-After`, instead of hammering a locked account toward a longer
+  pause. On the `rate_limited` rung — where the provider keeps serving at low
+  priority — it serves at the account limit (or one below when `--target` already
+  sits at the limit) rather than turning a soft penalty into a self-inflicted outage.
 - **Both API surfaces.** Transparent streaming passthrough for the Anthropic
   (`/v1/messages`) and OpenAI (`/v1/chat/completions`) routes.
 - **Remembers the trend.** Every tick lands in a bounded in-memory history

@@ -323,6 +323,22 @@ async def test_gate_closed_reason_boxed():
     assert loop.gate_closed_reason() == "boxed"
 
 
+async def test_gate_closed_reason_rate_limited_is_not_boxed():
+    # Deprioritization rung: gate stays open at reduced permits; the proxy
+    # must NOT fast-fail (docs/wi-024-429-capture-2026-07-03.md).
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            concurrent_sessions=0,
+            boxed_until_epoch=1_000_100.0,
+            priority_low=True,
+            priority_reason="rate_limited",
+        )
+    )
+    await loop.tick()
+    assert loop.gate_closed_reason() != "boxed"
+    assert gate.capacity >= 1
+
+
 async def test_gate_closed_reason_boxed_elapsed_is_open():
     loop, client, gate, m, w = _make_loop(
         _reading(concurrent_sessions=0, boxed_until_epoch=1_000_000.0)

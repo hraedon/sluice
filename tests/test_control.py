@@ -121,6 +121,67 @@ def test_boxed_closes_gate():
     assert effective_permits(state(r), CFG, now=NOW) == 0
 
 
+# --- deprioritization rung (priority.reason == "rate_limited") ---------------
+# Live capture 2026-07-03 (docs/wi-024-429-capture-2026-07-03.md): umans sets
+# boxed_until with reason=rate_limited for a single limit hit but keeps
+# serving; only an unrecognized/absent reason is a hard box.
+
+
+def test_rate_limited_window_is_low_band_not_boxed():
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="rate_limited", priority_low=True)
+    assert classify_band(r, now=NOW) is Band.LOW
+
+
+def test_rate_limited_window_without_low_flag_is_still_low_band():
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="rate_limited")
+    assert classify_band(r, now=NOW) is Band.LOW
+
+
+def test_unknown_reason_stays_hard_boxed():
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="suspended")
+    assert classify_band(r, now=NOW) is Band.BOXED
+    assert effective_permits(state(r), CFG, now=NOW) == 0
+
+
+def test_missing_reason_stays_hard_boxed():
+    r = reading(boxed_until_epoch=NOW + 60)
+    assert classify_band(r, now=NOW) is Band.BOXED
+
+
+def test_rate_limited_expired_window_is_normal():
+    r = reading(boxed_until_epoch=NOW - 1, priority_reason="rate_limited")
+    assert classify_band(r, now=NOW) is Band.NORMAL
+
+
+def test_rate_limited_target_at_limit_serves_limit_minus_one():
+    cfg = ControllerConfig(target=4)
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="rate_limited", priority_low=True)
+    assert effective_permits(state(r), cfg, now=NOW) == 3
+
+
+def test_rate_limited_target_over_limit_capped_at_limit_minus_one():
+    # The WI-024 experiment shape: target=10 past hard_cap; the window must
+    # cap at limit-1, not track target.
+    cfg = ControllerConfig(target=10)
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="rate_limited", priority_low=True)
+    assert effective_permits(state(r), cfg, now=NOW) == 3
+
+
+def test_rate_limited_target_below_limit_keeps_low_band_drain():
+    # target=3 < limit=4: the cap (4) never binds; LOW drain applies as usual.
+    r = reading(boxed_until_epoch=NOW + 60, priority_reason="rate_limited", priority_low=True)
+    assert effective_permits(state(r), CFG, now=NOW) == CFG.target - CFG.low_penalty
+
+
+def test_rate_limited_never_fully_closes():
+    cfg = ControllerConfig(target=1, min_floor=1)
+    r = reading(
+        limit=1, hard_cap=2, boxed_until_epoch=NOW + 60,
+        priority_reason="rate_limited", priority_low=True,
+    )
+    assert effective_permits(state(r), cfg, now=NOW) >= 1
+
+
 def test_open_breaker_closes_gate():
     assert effective_permits(state(reading(), breaker=BreakerState.OPEN), CFG, now=NOW) == 0
 
