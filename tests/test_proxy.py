@@ -17,7 +17,7 @@ import pytest
 
 from sluice.control import BreakerConfig, ControllerConfig, UsageReading
 from sluice.gate import PermitGate
-from sluice.proxy import ProxyApp, _is_concurrency_429
+from sluice.proxy import ProxyApp, _classify_429, _is_concurrency_429
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
@@ -564,9 +564,123 @@ async def test_429_monitoring_hook_logs_all_429s(caplog):
             await client.post("/v1/messages", json={"prompt": "hi"})
 
     # The log must mention retry_after and concurrency classification
-    assert any("retry_after" in r.message and "concurrency" in r.message for r in caplog.records), (
-        "every 429 must be logged with retry_after value and concurrency classification"
+    assert any("retry_after" in r.message and "classification" in r.message for r in caplog.records), (
+        "every 429 must be logged with retry_after value and classification"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gateway/CDN 429 classification (WI-024)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_429_no_retry_after_no_cdn_headers_is_concurrency():
+    """A 429 with no retry-after and no CDN headers is concurrency (fail-safe)."""
+    assert _classify_429(None, {}) == "concurrency"
+    assert _classify_429("0", {}) == "concurrency"
+    assert _classify_429("", {}) == "concurrency"
+    assert _classify_429("abc", {}) == "concurrency"
+
+
+def test_classify_429_retry_after_positive_is_rate_limit():
+    """A 429 with a positive retry-after and no CDN headers is rate_limit."""
+    assert _classify_429("60", {}) == "rate_limit"
+    assert _classify_429("5", {}) == "rate_limit"
+
+
+def test_classify_429_with_cdn_header_is_gateway():
+    """A 429 with a known CDN header is classified as gateway regardless of retry-after."""
+    assert _classify_429(None, {"cf-ray": "abc123"}) == "gateway"
+    assert _classify_429("0", {"cf-ray": "abc123"}) == "gateway"
+    assert _classify_429("60", {"cf-ray": "abc123"}) == "gateway"
+    assert _classify_429(None, {"x-amz-cf-id": "xyz"}) == "gateway"
+    assert _classify_429(None, {"x-served-by": "cache-lhr"}) == "gateway"
+
+
+def test_classify_429_with_cdn_server_header_is_gateway():
+    """A 429 with server: cloudflare is classified as gateway."""
+    assert _classify_429(None, {"server": "cloudflare"}) == "gateway"
+    assert _classify_429(None, {"server": "CloudFlare"}) == "gateway"
+    assert _classify_429("60", {"server": "cloudflare"}) == "gateway"
+
+
+def test_classify_429_non_cdn_server_is_not_gateway():
+    """A non-CDN server header does not trigger gateway classification."""
+    assert _classify_429(None, {"server": "uvicorn"}) == "concurrency"
+    assert _classify_429(None, {"server": "gunicorn"}) == "concurrency"
+
+
+async def test_gateway_429_not_fed_to_breaker():
+    """A 429 with CDN headers does not trip the breaker (WI-024)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "cdn"}, headers={"cf-ray": "abc123"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+    reconcile._brk_cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+
+    async with _asgi_client(app) as client:
+        for _ in range(5):  # well above threshold
+            await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 0, "CDN 429s must not be recorded as concurrency"
+    assert reconcile.gateway_429s == 5
+    assert reconcile.breaker_state.value == "closed", "breaker must not trip on CDN 429s"
+
+
+async def test_gateway_429_tracked_separately():
+    """Gateway 429s are counted in a separate counter, visible in /status.json."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "cdn"}, headers={"server": "cloudflare"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+        await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.gateway_429s == 2
+    assert reconcile.total_429s == 0
+
+    async with _asgi_client(app) as client:
+        response = await client.get("/status.json")
+
+    data = response.json()
+    assert data["gateway_429s"] == 2
+    assert data["total_429s"] == 0
+
+
+async def test_gateway_429_in_prometheus():
+    """Gateway 429s appear in /metrics as sluice_gateway_429s."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "cdn"}, headers={"cf-ray": "x"})
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+        response = await client.get("/metrics")
+
+    assert "sluice_gateway_429s" in response.text
+
+
+async def test_concurrency_429_still_trips_breaker():
+    """A 429 without CDN headers still feeds the breaker (regression test)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "concurrency"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+    reconcile._brk_cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+
+    async with _asgi_client(app) as client:
+        for _ in range(3):
+            await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 3
+    assert reconcile.gateway_429s == 0
 
 
 # ---------------------------------------------------------------------------

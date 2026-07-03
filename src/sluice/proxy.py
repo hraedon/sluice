@@ -17,7 +17,7 @@ import asyncio
 import logging
 import os
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -78,20 +78,63 @@ _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
 _RESERVED_LABEL = "interactive"
 
+# Headers that indicate a CDN/gateway layer, not the upstream application.
+# If present on a 429, the 427 is classified as "gateway" — tracked but not
+# fed to the breaker (WI-024: CDN 429s don't represent concurrency pressure).
+_CDN_HEADERS = frozenset(
+    {
+        "cf-ray",               # Cloudflare
+        "x-amz-cf-id",          # CloudFront
+        "x-served-by",          # Fastly / Varnish
+        "x-fastly-request-id",  # Fastly
+        "x-vercel-id",          # Vercel
+        "fly-request-id",       # Fly.io
+    }
+)
+_CDN_SERVERS = frozenset({"cloudflare"})
+
+
+def _classify_429(
+    retry_after: str | None, headers: Mapping[str, str]
+) -> str:
+    """Classify a 429 as 'concurrency', 'rate_limit', or 'gateway'.
+
+    Classification order:
+
+    1. **gateway** — CDN/gateway headers are present (``cf-ray``, ``server:
+       cloudflare``, etc.).  The 429 was rejected at the edge, not by the
+       upstream's concurrency enforcement.  Tracked separately, not fed to
+       the breaker (WI-024).
+
+    2. **concurrency** — no retry-after or retry-after <= 0.  Fed to the
+       breaker (fail-safe: ambiguous values default to concurrency).
+
+    3. **rate_limit** — retry-after > 0.  Not fed to the breaker.
+
+    Per AGENTS.md rule 1 (fail safe), any unparseable or ambiguous value
+    is treated as concurrency — tightening the gate rather than assuming
+    a rate-limit window.
+    """
+    # 1. CDN/gateway detection (conservative: only known CDN headers).
+    for cdn_header in _CDN_HEADERS:
+        if headers.get(cdn_header) is not None:
+            return "gateway"
+    server = (headers.get("server") or "").lower()
+    for cdn_server in _CDN_SERVERS:
+        if cdn_server in server:
+            return "gateway"
+
+    # 2. Retry-after heuristic (unchanged from _is_concurrency_429).
+    if retry_after is None:
+        return "concurrency"
+    try:
+        return "concurrency" if int(retry_after.strip()) <= 0 else "rate_limit"
+    except (ValueError, TypeError):
+        return "concurrency"
+
 
 def _is_concurrency_429(retry_after: str | None) -> bool:
-    """Classify a 429 as concurrency (trip breaker) or rate-limit (skip).
-
-    Returns True when the 429 should be recorded in the breaker.  Per
-    AGENTS.md rule 1 (fail safe), any unparseable or ambiguous value is
-    treated as a concurrency 429 — tightening the gate rather than
-    assuming a rate-limit window.
-
-    - ``None`` (no header): concurrency rejection → True
-    - ``"0"`` / ``"00"`` / ``" 0 "``: "retry immediately" → True
-    - ``"60"``: rate-limit window → False
-    - ``""`` / ``"abc"`` / ``"-1"``: unparseable → True (fail safe)
-    """
+    """Backward-compatible wrapper — prefer _classify_429 for three-way."""
     if retry_after is None:
         return True
     try:
@@ -449,21 +492,24 @@ class ProxyApp:
                 # is wrong the breaker's fast trip is defeated.  Revisit when
                 # a real concurrency 429 is observed live.
                 #
-                # Monitoring hook: log every 429 with its retry-after value and
-                # classification so a regression (umans starts sending non-zero
-                # retry-after on concurrency 429s) is visible in the logs — the
-                # breaker would stop tripping and concurrency=False would appear
-                # on what are actually concurrency rejections.
+                # Monitoring hook (WI-024): classify every 429 as
+                # 'concurrency' (feed breaker), 'rate_limit' (skip), or
+                # 'gateway' (CDN/gateway rejection — tracked separately, not
+                # fed to the breaker).  Logs the classification and server
+                # header so CDN-originated 429s are visible.
                 if response.status_code == 429:
                     retry_after_raw = response.headers.get("retry-after")
-                    is_concurrency = _is_concurrency_429(retry_after_raw)
+                    classification = _classify_429(retry_after_raw, response.headers)
                     log.warning(
-                        "upstream 429: retry_after=%r concurrency=%s",
+                        "upstream 429: retry_after=%r classification=%s server=%s",
                         retry_after_raw,
-                        is_concurrency,
+                        classification,
+                        response.headers.get("server"),
                     )
-                    if is_concurrency:
+                    if classification == "concurrency":
                         self._reconcile.record_429()
+                    elif classification == "gateway":
+                        self._reconcile.record_gateway_429()
 
                 # WI-004: Feed response headers to the truth source.
                 # For polled truth (umans) this is a no-op; for header truth

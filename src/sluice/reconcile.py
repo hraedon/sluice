@@ -95,6 +95,7 @@ class ReconciliationLoop:
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
         self._total_429s = 0
+        self._total_gateway_429s = 0
 
         self._phantom_samples: deque[tuple[int, int]] = deque(
             maxlen=controller_config.phantom_window
@@ -135,6 +136,12 @@ class ReconciliationLoop:
             now=now,
             config=self._brk_cfg,
         )
+
+    def record_gateway_429(self) -> None:
+        """A gateway/CDN 429 was received (not from the upstream's concurrency
+        enforcement).  Tracked separately — does NOT feed the breaker (WI-024).
+        """
+        self._total_gateway_429s += 1
 
     def record_success(self) -> None:
         """An upstream request completed normally."""
@@ -423,6 +430,10 @@ class ReconciliationLoop:
     @property
     def total_429s(self) -> int:
         return self._total_429s
+
+    @property
+    def gateway_429s(self) -> int:
+        return self._total_gateway_429s
 
     @property
     def recent_429_count(self) -> int:
