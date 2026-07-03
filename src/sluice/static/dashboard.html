@@ -299,7 +299,7 @@ function render(d){
     document.getElementById('gauge-labels').innerHTML=
       '<span>0</span><span class="gl-limit">limit='+limit+'</span><span class="gl-hardcap">hard_cap='+hc+'</span>';
   }
-  // Stats table â third element is the hover explanation (title attribute)
+  // Stats table — third element is the hover explanation (title attribute)
   var rows=[
     ['band',d.band,'Provider enforcement band: normal, low (deprioritized), reject, or boxed'],
     ['effective_permits',d.effective_permits,'Permits the controller currently grants: target minus phantom absorption and band/breaker backoff'],
@@ -356,10 +356,10 @@ function render(d){
     (d.breaker==='open'||d.breaker==='half_open')?'block':'none';
   if(d.breaker==='half_open'&&d.breaker_half_open_age_seconds!=null){
     document.getElementById('banner-breaker').textContent=
-      'CIRCUIT BREAKER HALF_OPEN â probing ('+d.breaker_half_open_age_seconds+'s)';
+      'CIRCUIT BREAKER HALF_OPEN — probing ('+d.breaker_half_open_age_seconds+'s)';
   }else{
     document.getElementById('banner-breaker').textContent=
-      'CIRCUIT BREAKER OPEN â backing off';
+      'CIRCUIT BREAKER OPEN — backing off';
   }
   // Active = anything moving
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal')||(d.breaker!=='closed');
@@ -469,7 +469,7 @@ function renderSparks(){
   lastValid=valid;
   var infoBase=viewRange==='5m'
     ? valid.length+'/'+denom+' samples'
-    : viewRange+' Â· '+raw.length+' ticks';
+    : viewRange+' · '+raw.length+' ticks';
   info.textContent=infoBase;
   if(valid.length<2){
     svg.innerHTML='<text x="100" y="62" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
@@ -552,7 +552,7 @@ function renderSparks(){
     else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
   }
   document.getElementById('qspark').innerHTML=qs;
-  info.textContent=infoBase+' Â· y max '+maxV+' Â· lim '+(curLimit??'?')+' Â· hc '+(curHc??'?')+' Â· queue max '+maxQ;
+  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ;
   // -- reconciliation spark: provider requests_in_window vs sluice local count
   var rspark=document.getElementById('rspark');
   var rinfo=document.getElementById('rspark-info');
@@ -604,7 +604,7 @@ function renderSparks(){
     rspark.innerHTML=rs;
     var curDelta=rvalid[rvalid.length-1].rdelta;
     rdeltaText.textContent=curDelta!=null?'Δ '+curDelta+(curDelta>0?' (leakage)':''):'';
-    rinfo.textContent='max '+rmaxV+' Â· lim '+rlimVal;
+    rinfo.textContent='max '+rmaxV+' · lim '+rlimVal;
   }
 }
 
