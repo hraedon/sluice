@@ -37,15 +37,15 @@ spec:
             - https://api.code.umans.ai
             - --listen
             - 0.0.0.0:8800
-            # TEMPORARY (WI-024 capture): target raised past the provider's
-            # limit (4) and hard cap (8) to provoke genuine upstream
-            # concurrency 429s, so the 429 log hook can record what they look
-            # like (headers/retry-after) vs the CDN/gateway 429s. 8 didn't
-            # trigger rejections under tonight's load; 10 exceeds the hard
-            # cap so upstream must reject. Revert to "4" once a real set is
-            # captured.
+            # Aim at the provider's full limit (4). The controller still backs
+            # off automatically when observed concurrency or phantoms push into
+            # the priority.low band, so this trades a 1-slot safety buffer for
+            # using the 4th concurrent slot the plan pays for. Watch the
+            # dashboard's queue_wait / band on the first days at 4.
+            # (Temporarily 8→10 on 2026-07-03 for the WI-024 429 capture —
+            # see docs/wi-024-429-capture-2026-07-03.md. Cost: a 5 h box.)
             - --target
-            - "10"
+            - "4"
             - --poll-interval
             - "5"
             - --release-cooldown
