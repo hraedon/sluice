@@ -38,14 +38,14 @@ spec:
             - --listen
             - 0.0.0.0:8800
             # TEMPORARY (WI-024 capture): target raised past the provider's
-            # limit (4) to the hard cap (8) to provoke genuine upstream
+            # limit (4) and hard cap (8) to provoke genuine upstream
             # concurrency 429s, so the 429 log hook can record what they look
-            # like (headers/retry-after) vs the CDN/gateway 429s. The
-            # controller will still drain back when the band goes low, so
-            # expect 429s from bursts, not steady state. Revert to "4" once
-            # a real set is captured.
+            # like (headers/retry-after) vs the CDN/gateway 429s. 8 didn't
+            # trigger rejections under tonight's load; 10 exceeds the hard
+            # cap so upstream must reject. Revert to "4" once a real set is
+            # captured.
             - --target
-            - "8"
+            - "10"
             - --poll-interval
             - "5"
             - --release-cooldown
