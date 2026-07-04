@@ -94,6 +94,11 @@ jobs:
 
       - name: Bump kustomize image tag to the immutable digest tag
         run: |
+          # Trust root is the GitHub release tag (v5.4.3), not an
+          # independent out-of-band hash.  checksums.txt is fetched
+          # from the same release — a compromised release asset could
+          # swap both.  The checksum step catches accidental corruption
+          # but not a targeted supply-chain attack on the release.
           KUSTOMIZE_VERSION="v5.4.3"
           KUSTOMIZE_URL="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
           CHECKSUMS_URL="https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/${KUSTOMIZE_VERSION}/checksums.txt"

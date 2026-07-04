@@ -225,13 +225,20 @@ class KubeLeaseGuard(SingletonGuard):
                     existing["spec"]["acquireTime"] = now
                     existing["spec"]["leaseDurationSeconds"] = self._lease_duration
 
+                    # Same resourceVersion protection as renew(): the
+                    # PUT includes metadata.resourceVersion from the
+                    # GET, so a concurrent take-over by another pod
+                    # results in 409 Conflict.
                     resp = await client.put(self._lease_url, json=existing)
                     if resp.status_code == 200:
                         self._held = True
                         self._mark_renewed()
                         log.info("KubeLeaseGuard: acquired lease (expired peer)")
                         return True
-                    log.warning("KubeLeaseGuard: take-over failed: %d", resp.status_code)
+                    if resp.status_code == 409:
+                        log.info("KubeLeaseGuard: take-over lost (resourceVersion conflict)")
+                    else:
+                        log.warning("KubeLeaseGuard: take-over failed: %d", resp.status_code)
                     return False
 
                 log.info("KubeLeaseGuard: lease held by %s, not expired", holder)
@@ -267,8 +274,22 @@ class KubeLeaseGuard(SingletonGuard):
                 self._held = False
                 return False
 
+            # The PUT sends the full lease object (including
+            # metadata.resourceVersion from the GET), so the K8s API
+            # server's optimistic concurrency control rejects a stale
+            # write with 409 Conflict if another pod modified the lease
+            # between our GET and PUT — the TOCTOU window is closed.
+            # The PUT sends the full lease object (including
+            # metadata.resourceVersion from the GET), so the K8s API
+            # server's optimistic concurrency control rejects a stale
+            # write with 409 Conflict if another pod modified the lease
+            # between our GET and PUT — the TOCTOU window is closed.
             lease["spec"]["renewTime"] = now
             resp = await client.put(self._lease_url, json=lease)
+            if resp.status_code == 409:
+                log.info("KubeLeaseGuard: lost lease (resourceVersion conflict)")
+                self._held = False
+                return False
             if resp.status_code != 200:
                 log.warning("KubeLeaseGuard: renew PUT failed: %d", resp.status_code)
                 self._held = False
