@@ -65,6 +65,8 @@ async def test_snapshot_fields():
     assert d["cooling_down"] == 0
     assert d["avg_wait_seconds"] == 0.0
     assert d["p95_wait_seconds"] == 0.0
+    assert d["avg_hold_seconds"] == 0.0
+    assert d["retry_after_hint"] == 5  # floor (no hold samples)
     assert d["queue_timeouts"] == 0
     assert "config" in d
     assert d["config"]["target"] == 3
@@ -293,3 +295,80 @@ async def test_no_request_body_in_status_payload():
     payload = str(snap.to_dict())
 
     assert secret_body_text not in payload, "status payload must not contain request body text"
+
+
+async def test_snapshot_hold_time_reflects_gate():
+    """avg_hold_seconds in the snapshot reads the gate's hold samples (Plan 013 WI-005)."""
+    from collections import deque
+
+    gate = PermitGate(initial_capacity=3)
+    loop = ReconciliationLoop(
+        truth_source=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(target=3, phantom_window=3),
+        breaker_config=BreakerConfig(),
+    )
+    await loop.tick()
+
+    # Inject hold samples directly.
+    gate._hold_samples = deque([5.0, 10.0, 15.0], maxlen=64)
+
+    snap = snapshot(loop)
+    assert snap.avg_hold_seconds == 10.0  # (5+10+15)/3
+    assert snap.to_dict()["avg_hold_seconds"] == 10.0
+
+
+async def test_snapshot_retry_after_hint():
+    """retry_after_hint reflects the un-jittered estimator output (Plan 013 WI-005)."""
+    from collections import deque
+
+    gate = PermitGate(initial_capacity=4)
+    loop = ReconciliationLoop(
+        truth_source=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(target=3, phantom_window=3),
+        breaker_config=BreakerConfig(),
+    )
+    await loop.tick()
+
+    # No hold samples → hint is floor (5).
+    snap = snapshot(loop)
+    assert snap.retry_after_hint == 5
+    assert snap.to_dict()["retry_after_hint"] == 5
+
+    # Inject hold samples and queue depth.  After tick(), gate capacity
+    # was resized to target=3; use that for the expected value.
+    gate._hold_samples = deque([10.0] * 10, maxlen=64)
+    gate._waiters = 3  # queue_depth
+
+    snap = snapshot(loop)
+    # capacity=3 (resized by tick), queue_depth=3, avg_hold=10
+    # ceil((3+1)*10/3) = ceil(13.33) = 14
+    assert snap.retry_after_hint == 14
+
+
+async def test_prometheus_hold_and_retry_after_metrics():
+    """Prometheus output includes hold-time and retry_after_hint gauges (Plan 013 WI-005)."""
+    from collections import deque
+
+    gate = PermitGate(initial_capacity=4)
+    loop = ReconciliationLoop(
+        truth_source=FakeUsageClient(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8)),  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(target=3, phantom_window=3),
+        breaker_config=BreakerConfig(),
+    )
+    await loop.tick()
+
+    gate._hold_samples = deque([10.0] * 5, maxlen=64)
+
+    snap = snapshot(loop)
+    text = to_prometheus(snap)
+
+    assert "# HELP sluice_hold_avg_seconds" in text
+    assert "# TYPE sluice_hold_avg_seconds gauge" in text
+    assert "sluice_hold_avg_seconds 10.0" in text
+
+    assert "# HELP sluice_retry_after_hint_seconds" in text
+    assert "# TYPE sluice_retry_after_hint_seconds gauge" in text
+    assert "sluice_retry_after_hint_seconds" in text

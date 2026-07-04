@@ -47,6 +47,8 @@ class StatusSnapshot:
     cooling_down: int
     avg_wait_seconds: float
     p95_wait_seconds: float
+    avg_hold_seconds: float
+    retry_after_hint: int
     queue_timeouts: int
     ready: bool
     gate_closed_reason: str
@@ -95,6 +97,8 @@ class StatusSnapshot:
             "cooling_down": self.cooling_down,
             "avg_wait_seconds": round(self.avg_wait_seconds, 2),
             "p95_wait_seconds": round(self.p95_wait_seconds, 2),
+            "avg_hold_seconds": round(self.avg_hold_seconds, 2),
+            "retry_after_hint": self.retry_after_hint,
             "queue_timeouts": self.queue_timeouts,
             "ready": self.ready,
             "gate_closed_reason": self.gate_closed_reason,
@@ -146,6 +150,8 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         cooling_down=reconcile.cooling_down,
         avg_wait_seconds=reconcile.avg_wait_seconds,
         p95_wait_seconds=reconcile.p95_wait_seconds,
+        avg_hold_seconds=reconcile.avg_hold_seconds,
+        retry_after_hint=reconcile.saturation_hint,
         queue_timeouts=reconcile.queue_timeouts,
         ready=ready,
         gate_closed_reason=reconcile.gate_closed_reason(),
@@ -207,6 +213,8 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_cooling_down", "Permits in release cooldown", snap.cooling_down)
     gauge("sluice_queue_wait_avg_seconds", "Mean queue wait over recent blocked grants", round(snap.avg_wait_seconds, 3))
     gauge("sluice_queue_wait_p95_seconds", "95th-pct queue wait over recent blocked grants", round(snap.p95_wait_seconds, 3))
+    gauge("sluice_hold_avg_seconds", "Mean hold duration (acquire to release) over recent completed holds", round(snap.avg_hold_seconds, 3))
+    gauge("sluice_retry_after_hint_seconds", "Un-jittered saturation Retry-After estimate (pressure-derived)", snap.retry_after_hint)
     gauge("sluice_queue_timeouts_total", "Requests that gave up waiting for a permit", snap.queue_timeouts)
     enum_gauge(
         "sluice_band",

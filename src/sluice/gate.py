@@ -61,6 +61,13 @@ class PermitGate:
         # Instant grants (a permit was free) are not sampled, so the average
         # reflects queue pressure rather than being diluted toward zero.
         self._wait_samples: deque[float] = deque(maxlen=wait_window)
+        # Recent hold durations (acquire→release), sampled only when the caller
+        # passes hold_seconds to release().  Only *completed* holds are sampled
+        # — long-running streams still in flight are invisible, so the average
+        # skews short under mixed workloads.  Acceptable for an advisory hint
+        # (the saturation Retry-After estimator, Plan 013 WI-002); would not be
+        # acceptable for a control input.
+        self._hold_samples: deque[float] = deque(maxlen=wait_window)
         self._timeouts = 0
 
     def _prune_cooldowns(self) -> None:
@@ -124,8 +131,14 @@ class PermitGate:
             finally:
                 self._waiters -= 1
 
-    async def release(self, *, reserved: bool = False) -> None:
-        """Release a permit.  It enters cooldown (if configured)."""
+    async def release(self, *, reserved: bool = False, hold_seconds: float | None = None) -> None:
+        """Release a permit.  It enters cooldown (if configured).
+
+        ``hold_seconds`` is the acquire→release duration, measured by the
+        caller (the proxy) with the same monotonic clock.  When provided,
+        it is sampled for the ``avg_hold_seconds`` advisory hint.  ``None``
+        (the default) means the caller cannot measure it → not sampled.
+        """
         async with self._cond:
             if self._held <= 0:
                 log.warning("release called with no held permits (double-release?)")
@@ -135,6 +148,8 @@ class PermitGate:
                 self._held_reserved -= 1
             if self._release_cooldown > 0:
                 self._cooldowns.append(self._clock() + self._release_cooldown)
+            if hold_seconds is not None:
+                self._hold_samples.append(hold_seconds)
             self._cond.notify_all()
 
     async def resize(self, new_capacity: int) -> None:
@@ -174,10 +189,34 @@ class PermitGate:
 
     @property
     def avg_wait_seconds(self) -> float:
-        """Mean queue wait over recent grants that actually blocked (0.0 if none)."""
+        """Mean queue wait over recent grants that actually blocked (0.0 if none).
+
+        **Survivorship bias:** only requests that blocked *and were eventually
+        granted* are sampled — every sample is below ``queue_timeout`` by
+        construction.  The client receiving a saturated 503 is one whose true
+        wait *exceeded* ``queue_timeout``; at the moment we stamp the header,
+        these stats systematically underestimate.  The honest signal for the
+        saturated Retry-After is forward-looking queue pressure using hold-time
+        (``avg_hold_seconds``) × queue depth, not these wait stats
+        (Plan 013 WI-002).  Never a control input.
+        """
         if not self._wait_samples:
             return 0.0
         return sum(self._wait_samples) / len(self._wait_samples)
+
+    @property
+    def avg_hold_seconds(self) -> float:
+        """Mean hold duration (acquire→release) over recent completed holds (0.0 if none).
+
+        **Sampling bias:** only *completed* holds are sampled — long-running
+        streams still in flight are invisible, so the average skews short under
+        mixed workloads.  Acceptable for an advisory hint (the saturation
+        Retry-After estimator, Plan 013 WI-002); would not be acceptable for
+        a control input.
+        """
+        if not self._hold_samples:
+            return 0.0
+        return sum(self._hold_samples) / len(self._hold_samples)
 
     @property
     def p95_wait_seconds(self) -> float:

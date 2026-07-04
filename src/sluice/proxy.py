@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import time
 from collections.abc import AsyncIterator, Mapping
 from email.utils import parsedate_to_datetime
 
@@ -45,7 +47,7 @@ from sluice.admin import (
 )
 from sluice.gate import PermitGate
 from sluice.lifecycle import LifecycleManager
-from sluice.reconcile import ReconciliationLoop
+from sluice.reconcile import ReconciliationLoop, RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle
 from sluice.session import SESSION_COOKIE as _SESSION_COOKIE
 from sluice.singleton import SingletonGuard
@@ -83,7 +85,6 @@ _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 # Stripped from forwarded Cookie headers (Rule 7).
 
 _QUEUE_TIMEOUT_DEFAULT = 30.0
-_RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
 _DRAIN_TIMEOUT_DEFAULT = 25.0
 _RESERVED_LABEL = "interactive"
@@ -168,6 +169,7 @@ def _classify_429(
             parsedate_to_datetime(retry_after.strip())
             return "rate_limit"
         except (ValueError, TypeError):
+            log.debug("unrecognized retry-after format: %r", retry_after)
             return "concurrency"
 
 
@@ -299,8 +301,8 @@ class ProxyApp:
             await send_json(
                 send,
                 503,
-                {"error": "draining", "reason": "draining", "retry_after": _RETRY_AFTER_DEFAULT},
-                retry_after=_RETRY_AFTER_DEFAULT,
+                {"error": "draining", "reason": "draining", "retry_after": RETRY_AFTER_SHORT},
+                retry_after=RETRY_AFTER_SHORT,
             )
             return
 
@@ -310,8 +312,8 @@ class ProxyApp:
             await send_json(
                 send,
                 503,
-                {"error": "not_leader", "reason": "not_leader", "retry_after": _RETRY_AFTER_DEFAULT},
-                retry_after=_RETRY_AFTER_DEFAULT,
+                {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT},
+                retry_after=RETRY_AFTER_SHORT,
             )
             return
 
@@ -320,11 +322,15 @@ class ProxyApp:
         # traffic at the initial (target) capacity — fail-safe (WI-018).
         if not self._reconcile.ready:
             log.info("not ready (first poll pending) — fast-failing 503")
+            # The honest value is "until the first successful poll" — track the
+            # configured poll interval.  Floor at 2 s so a sub-second poll
+            # interval doesn't promise an impossibly fast retry.
+            not_ready_ra = max(2, math.ceil(self._reconcile.poll_interval))
             await send_json(
                 send,
                 503,
-                {"error": "not_ready", "reason": "not_ready", "retry_after": _RETRY_AFTER_DEFAULT},
-                retry_after=_RETRY_AFTER_DEFAULT,
+                {"error": "not_ready", "reason": "not_ready", "retry_after": not_ready_ra},
+                retry_after=not_ready_ra,
             )
             return
 
@@ -358,11 +364,12 @@ class ProxyApp:
         acquired = await self._gate.acquire(timeout=self._queue_timeout, reserved=reserved)
         if not acquired:
             log.info("permit queue timeout — returning 503")
+            retry_after = self._reconcile.saturation_retry_after()
             await send_json(
                 send,
                 503,
-                {"error": "concurrency limit reached", "reason": "saturated", "retry_after": _RETRY_AFTER_DEFAULT},
-                retry_after=_RETRY_AFTER_DEFAULT,
+                {"error": "concurrency limit reached", "reason": "saturated", "retry_after": retry_after},
+                retry_after=retry_after,
             )
             return
 
@@ -375,19 +382,29 @@ class ProxyApp:
             await send_json(
                 send,
                 503,
-                {"error": "draining", "reason": "draining", "retry_after": _RETRY_AFTER_DEFAULT},
-                retry_after=_RETRY_AFTER_DEFAULT,
+                {"error": "draining", "reason": "draining", "retry_after": RETRY_AFTER_SHORT},
+                retry_after=RETRY_AFTER_SHORT,
             )
             return
 
         self._reconcile.record_request_forwarded()
 
+        acquire_mono = time.monotonic()
+        forward_failed = False
         try:
             await self._forward(scope, receive, send)
         except Exception:
+            forward_failed = True
             log.exception("proxy forward failed")
         finally:
-            await self._gate.release(reserved=reserved)
+            hold_seconds = time.monotonic() - acquire_mono
+            # Don't sample failed forwards — a quick connection error produces
+            # a short hold that doesn't represent typical forward duration and
+            # would skew avg_hold_seconds low (fail-safe: shorter waits = worse).
+            await self._gate.release(
+                reserved=reserved,
+                hold_seconds=None if forward_failed else hold_seconds,
+            )
 
     async def _forward(self, scope: Scope, receive: Receive, send: Send) -> None:
         url = self._build_url(scope)

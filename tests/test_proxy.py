@@ -1271,6 +1271,41 @@ async def test_saturated_503_has_reason():
     assert response.json()["reason"] == "saturated"
 
 
+async def test_saturated_503_header_matches_body():
+    """The Retry-After header and JSON body carry the same value (Plan 013 WI-003)."""
+    app, _, _ = _make_app(gate_capacity=0, queue_timeout=0.1)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    header_ra = int(response.headers["retry-after"])
+    body_ra = response.json()["retry_after"]
+    assert header_ra == body_ra
+
+
+async def test_saturated_503_retry_after_bounded():
+    """The saturated Retry-After is within [5, 60] (Plan 013 WI-003)."""
+    app, _, _ = _make_app(gate_capacity=0, queue_timeout=0.1)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    ra = response.json()["retry_after"]
+    assert 5 <= ra <= 60
+
+
+async def test_hold_time_sampled_after_successful_forward():
+    """A successful forward through the proxy samples hold time (Plan 013 WI-001)."""
+    app, gate, _ = _make_app(gate_capacity=1)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+        assert response.status_code == 200
+
+    assert gate.avg_hold_seconds > 0.0
+
+
 # ---------------------------------------------------------------------------
 # Cache-transparency: wire-indistinguishable from a direct client (Plan 005 WI-000)
 # ---------------------------------------------------------------------------
@@ -2436,6 +2471,73 @@ async def test_startup_window_503_has_retry_after():
     assert response.status_code == 503
     assert response.headers.get("retry-after") is not None
     assert response.json()["reason"] == "not_ready"
+
+
+async def test_not_ready_retry_after_tracks_poll_interval():
+    """The not_ready Retry-After tracks the poll interval (Plan 013 WI-004).
+
+    With poll_interval=5.0 (default), retry_after = max(2, ceil(5)) = 5.
+    With poll_interval=8.0, retry_after = max(2, ceil(8)) = 8.
+    """
+    # Default poll_interval=5.0
+    app, _, reconcile = _make_app(first_poll_ok=False)
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+    assert response.json()["retry_after"] == 5
+
+    # Custom poll_interval=8.0
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    upstream_client = httpx.AsyncClient(
+        transport=_StreamingMockTransport(_default_handler),
+        timeout=None,
+    )
+    reconcile2 = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+        poll_interval=8.0,
+    )
+    reconcile2._first_poll_ok = False
+    app2 = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile2,
+        queue_timeout=30.0,
+        upstream_client=upstream_client,
+    )
+    async with _asgi_client(app2) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+    assert response.json()["retry_after"] == 8
+
+
+async def test_draining_503_uses_shared_constant():
+    """The draining 503 retry_after comes from RETRY_AFTER_SHORT (Plan 013 WI-004)."""
+    from sluice.reconcile import RETRY_AFTER_SHORT
+
+    app, _, reconcile = _make_app(first_poll_ok=True)
+    app._lifecycle._draining = True  # type: ignore[attr-defined]
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["retry_after"] == RETRY_AFTER_SHORT
+
+
+async def test_not_leader_503_uses_shared_constant():
+    """The not_leader 503 retry_after comes from RETRY_AFTER_SHORT (Plan 013 WI-004)."""
+    from sluice.reconcile import RETRY_AFTER_SHORT
+
+    guard = _FakeGuard(held=False, acquire_result=False)
+    app, _, _ = _make_app_with_guard(guard)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["retry_after"] == RETRY_AFTER_SHORT
 
 
 # ---------------------------------------------------------------------------

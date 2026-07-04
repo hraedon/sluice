@@ -10,6 +10,7 @@ Enforced by tests/test_import_boundary.py.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -528,3 +529,50 @@ def validate_target_override(
             "requests above the limit run at low priority"
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Saturation Retry-After estimator (Plan 013 WI-002)
+# ---------------------------------------------------------------------------
+
+
+def saturation_retry_after(
+    *,
+    queue_depth: int,
+    capacity: int,
+    avg_hold_seconds: float,
+    floor: int = 5,
+    cap: int = 60,
+) -> int:
+    """Pressure-derived Retry-After hint for saturated 503s.
+
+    Estimates how long a retrying client should wait before rejoining the queue:
+
+    .. code-block:: text
+
+        expected_wait ≈ (queue_depth + 1) × avg_hold_seconds / capacity
+
+    The ``+1`` is the retrying client itself rejoining the back of the scramble.
+    The result is clamped to ``[floor, cap]``.
+
+    * **Advisory only** — shapes the ``Retry-After`` header, never the permit
+      math.  ``effective_permits`` / band logic are untouched.
+    * **Fail safe** — floored at ``floor`` (5 s): the estimator can never
+      promise a *faster* retry than today's default.  When there is no data
+      (no hold samples yet → ``avg_hold_seconds <= 0``), falls back to ``floor``.
+    * **Pure** — no clock, no randomness.  Jitter is applied by the shell
+      (:mod:`sluice.reconcile`) so tests stay deterministic.
+
+    Degenerate inputs:
+
+    * ``avg_hold_seconds <= 0`` (no samples yet) → ``floor``.
+    * ``capacity <= 0`` (zero-width gate) → ``cap`` — the caller layers in
+      the poll cadence (Plan 013 WI-003); the pure core does not know the
+      interval.
+    """
+    if avg_hold_seconds <= 0:
+        return floor
+    if capacity <= 0:
+        return cap
+    raw = (queue_depth + 1) * avg_hold_seconds / capacity
+    return max(floor, min(cap, math.ceil(raw)))
