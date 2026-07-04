@@ -1,8 +1,7 @@
 # Configuring clients to route through sluice
 
-> **Note:** the `sluice.k8s.hraedon.com` URLs throughout this document are the author's
-> own deployment, kept concrete as a worked example. Substitute wherever your sluice
-> instance is reachable (e.g. `http://127.0.0.1:8800` for a local run).
+> **Note:** substitute the `sluice.k8s.REDACTED` URLs throughout this document with
+> wherever your sluice instance is reachable (e.g. `http://127.0.0.1:8800` for a local run).
 
 sluice only works if **every** client points at it instead of at umans directly. The
 concurrency invariant is account-wide; a single client that still talks to
@@ -19,10 +18,10 @@ of umans' API surfaces, so pick the base URL matching the surface your client sp
 
 | Client speaks | umans base URL (before) | sluice base URL (after) |
 |---|---|---|
-| OpenAI (`/v1/chat/completions`) | `https://api.code.umans.ai/v1` | `https://sluice.k8s.hraedon.com/v1` |
-| Anthropic (`/v1/messages`) | `https://api.code.umans.ai` | `https://sluice.k8s.hraedon.com` |
+| OpenAI (`/v1/chat/completions`) | `https://api.code.umans.ai/v1` | `https://sluice.k8s.REDACTED/v1` |
+| Anthropic (`/v1/messages`) | `https://api.code.umans.ai` | `https://sluice.k8s.REDACTED` |
 
-The deployed instance is **`https://sluice.k8s.hraedon.com`** — the internal Traefik ingress,
+The deployed instance is **`https://sluice.k8s.REDACTED`** — the internal Traefik ingress,
 real Let's Encrypt TLS on 443 (no port suffix; the container's `:8800` is internal to the
 cluster). Reachable from the LAN only. Models stay `umans-coder`, `umans-flash`,
 `umans-kimi-k2.7`, `umans-glm-5.2`.
@@ -30,7 +29,7 @@ cluster). Reachable from the LAN only. Models stay `umans-coder`, `umans-flash`,
 ### TLS
 
 The deployed endpoint terminates TLS at the Traefik ingress with a real Let's Encrypt
-certificate (`sluice-internal-tls`, issued for `sluice.k8s.hraedon.com`), so clients just
+certificate (`sluice-internal-tls`, issued for `sluice.k8s.REDACTED`), so clients just
 use the `https://` URL — no self-signed cert to trust, no plaintext fallback needed. This
 also satisfies clients that refuse non-TLS base URLs. (If you run sluice locally for dev
 instead of through the cluster, it listens on plain HTTP at `127.0.0.1:8800` — use that
@@ -45,7 +44,7 @@ opencode uses an OpenAI-compatible provider via the AI SDK. Two equivalent route
 **A. Let umans write the config, then redirect the base URL (lowest-effort).**
 1. `umans opencode --setup` — writes the umans provider block into opencode's config.
 2. In the file it wrote, change the provider's `options.baseURL` from
-   `https://api.code.umans.ai/v1` to `https://sluice.k8s.hraedon.com/v1`. Leave the key and
+   `https://api.code.umans.ai/v1` to `https://sluice.k8s.REDACTED/v1`. Leave the key and
    model list untouched.
 
 **B. Configure the provider by hand** in `opencode.json` (project dir; `$schema` enables
@@ -59,7 +58,7 @@ validation):
       "npm": "@ai-sdk/openai-compatible",
       "name": "umans (via sluice)",
       "options": {
-        "baseURL": "https://sluice.k8s.hraedon.com/v1",
+        "baseURL": "https://sluice.k8s.REDACTED/v1",
         "apiKey": "{env:UMANS_API_KEY}"
       },
       "models": {
@@ -80,7 +79,7 @@ Open WebUI speaks the OpenAI surface, so use the `/v1` base URL.
 
 1. **Settings → Admin Settings → Connections** (you must be an admin).
 2. Under **OpenAI API**, add/manage a connection:
-   - **API Base URL:** `https://sluice.k8s.hraedon.com/v1`
+   - **API Base URL:** `https://sluice.k8s.REDACTED/v1`
    - **API Key:** your umans key (`sk-...`)
 3. Save, then verify the connection.
 
@@ -102,7 +101,7 @@ so use the `/v1` base URL. Config lives in `~/.hermes/config.yaml`; secrets in
 model:
   provider: custom            # custom OpenAI-compatible endpoint
   default: umans-coder        # umans model name
-  base_url: https://sluice.k8s.hraedon.com/v1
+  base_url: https://sluice.k8s.REDACTED/v1
   api_key: ""                 # leave blank to fall back to ~/.hermes/.env
 ```
 
@@ -115,7 +114,7 @@ OPENAI_API_KEY=sk-...
 **Or set it at runtime** (secrets auto-route to `.env`, config to `config.yaml`):
 
 ```bash
-hermes config set model.base_url https://sluice.k8s.hraedon.com/v1
+hermes config set model.base_url https://sluice.k8s.REDACTED/v1
 hermes config set model.provider custom
 hermes config set OPENAI_API_KEY sk-...
 ```
@@ -129,8 +128,8 @@ sluice — check those first if hermes traffic doesn't show up in the dashboard.
 
 ## Verify each client after pointing it at sluice
 
-1. Open the live dashboard at **`https://sluice.k8s.hraedon.com/`** (or poll JSON:
-   `curl -s -u admin:$TOKEN https://sluice.k8s.hraedon.com/status.json`). Both are gated by
+1. Open the live dashboard at **`https://sluice.k8s.REDACTED/`** (or poll JSON:
+   `curl -s -u admin:$TOKEN https://sluice.k8s.REDACTED/status.json`). Both are gated by
    the admin token. In a browser, visit `/` and paste the token at the login page — a
    signed session cookie is set (30-day TTL). For `curl` and API clients, use Basic auth
    (any username, token as password) or a Bearer header. Retrieve the token with

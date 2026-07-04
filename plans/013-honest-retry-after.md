@@ -44,12 +44,13 @@ existing wait sampler.
 - **Fail safe means don't advertise too soon.** Floor at the current default (5 s) so
   the estimator can never promise a *faster* retry than today; when there is no data
   (no hold samples yet), fall back to the floor, not to zero.
-- **Stay actionable at the client.** Cap the saturated value at 60 s: both major SDKs
-  ignore a `Retry-After` above ~60 s and fall back to exponential backoff (verify the
-  exact thresholds against the pinned SDK versions during WI-006 — do not trust this
-  from memory). A cap the client discards is not honesty, it's noise. (`boxed` may
-  still exceed 60 s — its value is genuinely the window reset and the body carries it
-  for sophisticated clients; document the SDK-cap interplay rather than distort it.)
+- **Stay actionable at the client.** Cap the saturated value at 60 s: the Anthropic
+  and OpenAI Python SDKs ignore a `Retry-After` above ~60 s and fall back to exponential
+  backoff (verify the exact thresholds against the pinned SDK versions during WI-006 —
+  do not trust this from memory). A cap the client discards is not honesty, it's noise.
+  (`boxed` may still exceed 60 s — its value is genuinely the window reset and the body
+  carries it for sophisticated clients; document the SDK-cap interplay rather than
+  distort it.)
 - **Cache-transparency (hard rule 7) is untouched.** Everything here is response-side
   on sluice's own 503s; no request byte changes.
 

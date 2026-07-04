@@ -85,7 +85,7 @@ depth **at the moment each request timed out**:
   unjittered estimate reached ~52 s before the ±15 % jitter window.
 - Deep burst (`retry_after: 60`): peak depth produced an estimate well above
   60 s, so the cap bit. The actual unjittered estimate would have been
-  `ceil((qd + 1) × 15 / 2)` for some `qd` at failure time.
+  `ceil((qd + 1) × 15 / 2)` for some `qd` at failure time, so the cap applied.
 
 ## Findings
 
