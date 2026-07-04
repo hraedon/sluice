@@ -130,6 +130,7 @@ class ReconciliationLoop:
 
         self._task: asyncio.Task[None] | None = None
         self._first_poll_ok = False
+        self._stopped = False
 
         # Runtime overrides (Plan 011): ephemeral, leader-only, revert on restart.
         # {"target": {"value": 6, "since": <epoch>}} — empty when no override active.
@@ -261,7 +262,13 @@ class ReconciliationLoop:
         For polled truth (umans) this is a no-op.  For header truth
         (Anthropic/OpenAI) it parses the allowlisted ratelimit headers into
         the :class:`HeaderTruthSource`.
+
+        Safe to call after :meth:`stop` — returns early when the truth
+        source has been closed (WI-030: in-flight requests during drain
+        may call this after stop closes the truth source).
         """
+        if self._stopped:
+            return
         now = self._mono()
         self._truth.record_response_headers(
             headers, status, now_monotonic=now
@@ -493,11 +500,18 @@ class ReconciliationLoop:
 
     async def start(self) -> None:
         """Start the background loop as a task."""
+        self._stopped = False
         if self._task is None:
             self._task = asyncio.create_task(self.run())
 
     async def stop(self) -> None:
-        """Cancel the background loop and close the truth source + store."""
+        """Cancel the background loop and close the truth source + store.
+
+        Sets ``_stopped`` first so in-flight proxy requests calling
+        :meth:`record_response_headers` during the drain window return
+        early instead of touching the closed truth source (WI-030).
+        """
+        self._stopped = True
         if self._task is not None:
             self._task.cancel()
             try:

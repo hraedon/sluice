@@ -586,6 +586,31 @@ def test_classify_429_no_retry_after_no_cdn_headers_is_concurrency():
     assert _classify_429("abc", {}) == "concurrency"
 
 
+def test_classify_429_http_date_retry_after_is_rate_limit():
+    """WI-031: HTTP-date retry-after is classified as rate_limit, not concurrency.
+
+    RFC 7231 §7.1.3 allows retry-after to be either delta-seconds or an
+    HTTP-date. An HTTP-date means "retry at this specific time" — a rate-limit
+    window, not a concurrency rejection. Both classifications feed the breaker
+    equally; the distinction is for telemetry accuracy only.
+    """
+    assert _classify_429("Wed, 21 Oct 2025 07:28:00 GMT", {}) == "rate_limit"
+    assert _classify_429("Fri, 04 Jul 2026 12:00:00 GMT", {}) == "rate_limit"
+    assert _classify_429("  Wed, 21 Oct 2025 07:28:00 GMT  ", {}) == "rate_limit"
+
+
+def test_classify_429_garbage_non_date_non_integer_is_concurrency():
+    """Truly unparseable values (not integer, not HTTP-date) default to concurrency (fail-safe)."""
+    assert _classify_429("not-a-date", {}) == "concurrency"
+    assert _classify_429("abc def ghi", {}) == "concurrency"
+    assert _classify_429("123abc", {}) == "concurrency"
+
+
+def test_classify_429_http_date_with_cdn_still_gateway():
+    """HTTP-date retry-after with CDN headers is still gateway (CDN check runs first)."""
+    assert _classify_429("Wed, 21 Oct 2025 07:28:00 GMT", {"cf-ray": "x"}) == "gateway"
+
+
 def test_classify_429_retry_after_positive_is_rate_limit():
     """A 429 with a positive retry-after and no CDN headers is rate_limit."""
     assert _classify_429("60", {}) == "rate_limit"
@@ -3554,3 +3579,128 @@ def test_upstream_client_has_bounded_connect_write_pool():
     assert timeout.write is not None and timeout.write > 0
     assert timeout.pool is not None and timeout.pool > 0
     assert timeout.read is None, "read must be None — no response-duration cap (WI-027)"
+
+
+# ---------------------------------------------------------------------------
+# WI-029: drain_timeout=0 backward-compat path
+# ---------------------------------------------------------------------------
+
+
+async def test_drain_timeout_zero_closes_immediately():
+    """WI-029: drain_timeout=0 skips the drain wait and closes immediately.
+
+    The drain_timeout=0 path is the backward-compat default for users who
+    don't want graceful drain. The upstream client must be closed right
+    away, even if requests are in-flight. This path had zero coverage.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def gen():
+            await asyncio.sleep(10.0)  # won't complete — drain_timeout=0 skips
+            yield b'{"ok": true}'
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        drain_timeout=0.0,
+    )
+    app._client = httpx.AsyncClient(
+        transport=_StreamingMockTransport(handler),
+        timeout=None,
+    )
+    app._lifecycle._client = app._client
+
+    # Start lifespan
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_scope = {"type": "lifespan"}
+    lifespan_task = asyncio.create_task(app(lifespan_scope, lifespan_receive_fn, lifespan_send_fn))
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    # Start a request (will block for 10s)
+    async with _asgi_client(app) as client:
+        request_task = asyncio.create_task(client.post("/v1/messages", json={"prompt": "hi"}))
+        await asyncio.sleep(0.2)
+        assert gate.held == 1
+
+        # Start shutdown — drain_timeout=0, should complete immediately
+        start = asyncio.get_running_loop().time()
+        await lifespan_receive.put({"type": "lifespan.shutdown"})
+        await asyncio.wait_for(lifespan_task, timeout=5.0)
+        elapsed = asyncio.get_running_loop().time() - start
+
+    shutdown_complete = [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.complete"]
+    assert len(shutdown_complete) == 1
+    assert app._client.is_closed, "owned client must be closed after shutdown"
+    assert elapsed < 2.0, "shutdown with drain_timeout=0 must not wait for in-flight requests"
+
+    request_task.cancel()
+    try:
+        await request_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def test_drain_timeout_zero_with_no_in_flight():
+    """WI-029: drain_timeout=0 with no in-flight requests completes normally."""
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        drain_timeout=0.0,
+    )
+
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_scope = {"type": "lifespan"}
+    lifespan_task = asyncio.create_task(app(lifespan_scope, lifespan_receive_fn, lifespan_send_fn))
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    # No in-flight requests — shutdown should be instant
+    await lifespan_receive.put({"type": "lifespan.shutdown"})
+    await asyncio.wait_for(lifespan_task, timeout=5.0)
+
+    shutdown_complete = [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.complete"]
+    assert len(shutdown_complete) == 1
+    assert app._client.is_closed

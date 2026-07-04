@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Mapping
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -138,8 +139,8 @@ def _classify_429(
        genuine concurrency 429s — they are classified as ``rate_limit``
        here.  Both ``concurrency`` and ``rate_limit`` are fed to the
        breaker in the proxy (the distinction is for telemetry only).
-       Per AGENTS.md rule 1 (fail safe), any unparseable or ambiguous
-       value is treated as concurrency.
+       Per AGENTS.md rule 1 (fail safe), any value that is neither a
+       positive integer nor a valid HTTP-date is treated as concurrency.
     """
     # 1. CDN/gateway detection (conservative: only known CDN headers).
     for cdn_header in _CDN_HEADERS:
@@ -157,7 +158,17 @@ def _classify_429(
     try:
         return "concurrency" if int(retry_after.strip()) <= 0 else "rate_limit"
     except (ValueError, TypeError):
-        return "concurrency"
+        # Not a delta-seconds integer — check if it's an HTTP-date
+        # (RFC 7231 §7.1.3: "Wed, 21 Oct 2015 07:28:00 GMT").  An
+        # HTTP-date retry-after means "retry at this specific time" — a
+        # rate-limit window, not a concurrency rejection.  Both
+        # classifications feed the breaker equally; the distinction is
+        # for telemetry accuracy only (WI-031).
+        try:
+            parsedate_to_datetime(retry_after.strip())
+            return "rate_limit"
+        except (ValueError, TypeError):
+            return "concurrency"
 
 
 class ProxyApp:

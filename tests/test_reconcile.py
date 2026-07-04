@@ -933,3 +933,72 @@ async def test_clear_override_reverts_adaptive_config():
 
     loop.clear_override("target")
     assert loop._adaptive_cfg.target == 3
+
+
+# ---------------------------------------------------------------------------
+# WI-030: record_response_headers safe after stop
+# ---------------------------------------------------------------------------
+
+
+class _TrackingTruthSource:
+    """Truth source that tracks record_response_headers calls and raises if closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.record_calls: list[tuple[dict, int, float]] = []
+
+    async def fetch(self, *, now_monotonic: float) -> CachedReading:
+        return CachedReading(
+            reading=_reading(concurrent_sessions=0),
+            fetched_at_monotonic=now_monotonic,
+            ok=True,
+        )
+
+    @property
+    def last_cached(self) -> CachedReading | None:
+        return None
+
+    def record_response_headers(self, headers, status, *, now_monotonic) -> None:
+        if self.closed:
+            raise RuntimeError("truth source is closed")
+        self.record_calls.append((headers, status, now_monotonic))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_record_response_headers_safe_after_stop():
+    """WI-030: record_response_headers is a no-op after stop().
+
+    The lifecycle manager calls reconcile.stop() (which closes the truth
+    source) before the drain completes. In-flight proxy requests may still
+    call record_response_headers. The method must return early instead of
+    touching the closed truth source.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    # Replace with a tracking truth source that raises on use-after-close
+    tracking = _TrackingTruthSource()
+    loop._truth = tracking
+
+    await loop.tick()
+    assert not tracking.closed
+
+    await loop.stop()
+    assert tracking.closed, "stop() should close the truth source"
+
+    # This must NOT raise — record_response_headers should be a no-op
+    loop.record_response_headers({"x-ratelimit-limit": "100"}, 200)
+    assert len(tracking.record_calls) == 0, "no calls should reach the closed truth source"
+
+
+async def test_record_response_headers_works_before_stop():
+    """Sanity check: record_response_headers works normally before stop()."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    tracking = _TrackingTruthSource()
+    loop._truth = tracking
+
+    await loop.tick()
+
+    loop.record_response_headers({"x-ratelimit-limit": "100"}, 200)
+    assert len(tracking.record_calls) == 1
+    assert tracking.record_calls[0][0] == {"x-ratelimit-limit": "100"}
