@@ -71,6 +71,7 @@ src/sluice/
   proxy.py     # async reverse proxy shell (streaming, both routes, disconnect→cancel)
   lifecycle.py # ASGI lifespan + singleton lease management (startup/shutdown, retry)
   admin.py     # admin route handlers: health, ready, status, metrics, history, dashboard, static
+  session.py   # session cookie mint/verify + global login throttle (Plan 012, stdlib only)
   gate.py      # resizable permit gate (FIFO queue, optional QoS reserve)
   reconcile.py # background loop: fetch truth → core decides → resize gate
   status.py    # point-in-time snapshot for /status.json and /metrics

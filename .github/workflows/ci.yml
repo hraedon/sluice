@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly cron keeps pip-audit live even when the repo is settled (no
+  # pushes). Also surfaces bit-rot early (setup-uv/node20 deprecations
+  # that have bitten the whole family's CI).
+  schedule:
+    - cron: "0 6 * * 1"  # Monday 06:00 UTC
 
 jobs:
   test:

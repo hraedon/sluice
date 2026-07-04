@@ -28,11 +28,15 @@ from sluice.admin import (
     handle_config_delete,
     handle_config_post,
     handle_healthz,
+    handle_login_get,
+    handle_login_post,
+    handle_logout,
     handle_readyz,
     is_admin_auth_value,
     send_dashboard,
     send_history_json,
     send_json,
+    send_login_page,
     send_prometheus,
     send_status_json,
     send_text,
@@ -41,6 +45,8 @@ from sluice.admin import (
 from sluice.gate import PermitGate
 from sluice.lifecycle import LifecycleManager
 from sluice.reconcile import ReconciliationLoop
+from sluice.session import LoginThrottle
+from sluice.session import SESSION_COOKIE as _SESSION_COOKIE
 from sluice.singleton import SingletonGuard
 
 log = logging.getLogger("sluice.proxy")
@@ -72,11 +78,25 @@ _CONTROL_HEADERS = frozenset(
 # All headers stripped from the request before forwarding upstream.
 _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 
+# Session cookie name — imported from sluice.session (single source of truth).
+# Stripped from forwarded Cookie headers (Rule 7).
+
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
 _DRAIN_TIMEOUT_DEFAULT = 25.0
 _RESERVED_LABEL = "interactive"
+# read=None: no response-duration cap. A finite read timeout (e.g. 300s)
+# would kill any stream with a >300s inter-chunk gap, releasing the permit
+# while the upstream may still count the session — self-inflicting the
+# phantom the reconciler exists to absorb.  The tradeoff: a hung upstream
+# (silent TCP death) holds the permit until the client disconnects or the
+# drain timeout fires.  This is acceptable for a single-operator in-path
+# proxy where client-side timeouts provide a fallback.  If hung upstreams
+# become a problem, add an application-level liveness watchdog around the
+# streaming loop rather than reintroducing a read timeout that truncates
+# legitimate slow streams.
+_UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
 
 # Headers that indicate a CDN/gateway layer, not the upstream application.
 # If present on a 429, the 429 is classified as "gateway" — tracked but not
@@ -161,12 +181,13 @@ class ProxyApp:
         self._gate = gate
         self._reconcile = reconcile
         self._queue_timeout = queue_timeout
-        self._client = upstream_client or httpx.AsyncClient(timeout=None)
+        self._client = upstream_client or httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
         self._owns_client = upstream_client is None
         self._guard = guard
         self._admin_token = admin_token
         self._retry_interval = retry_interval
         self._build_sha = os.environ.get("SLUICE_BUILD_SHA") or None
+        self._login_throttle = LoginThrottle()
         self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
         self._lifecycle = LifecycleManager(
             guard=guard,
@@ -199,6 +220,24 @@ class ProxyApp:
             await serve_static(path, send)
             return
 
+        # Login / logout routes (Plan 012) — 404 when no token configured.
+        if path == "/login":
+            if scope["method"] == "GET":
+                await handle_login_get(send, self._admin_token)
+            elif scope["method"] == "POST":
+                await handle_login_post(
+                    send, receive, self._admin_token, scope, self._login_throttle
+                )
+            else:
+                await send_text(send, 405, "Method not allowed")
+            return
+        if path == "/logout":
+            if scope["method"] == "POST":
+                await handle_logout(send, self._admin_token, scope)
+            else:
+                await send_text(send, 405, "Method not allowed")
+            return
+
         # Config mutation endpoints (Plan 011) — own auth/disabled checks.
         if path == "/admin/config" and scope["method"] == "POST":
             await handle_config_post(
@@ -211,22 +250,20 @@ class ProxyApp:
             )
             return
 
-        # Admin routes — token-gated when admin_token is set.  The dashboard
-        # (/) is included so the browser prompts for Basic auth on first
-        # visit; the cached credentials then authorize the JS fetch to
-        # /status.json.  Without gating /, the dashboard's fetch would 401.
+        # Admin routes — token-gated when admin_token is set.
+        # GET / without auth serves the login page (200, no challenge);
+        # JSON/metrics routes without auth return 401 JSON without
+        # WWW-Authenticate (no Basic popup — Plan 012).
         if path in ("/", "/status.json", "/metrics", "/history.json"):
-            if not check_admin_auth(scope, self._admin_token):
-                await send_text(
-                    send,
-                    401,
-                    "Unauthorized",
-                    content_type="text/plain",
-                    extra_headers=[(b"www-authenticate", b'Basic realm="sluice"')],
-                )
+            authed = check_admin_auth(scope, self._admin_token)
+            if not authed and path != "/":
+                await send_json(send, 401, {"error": "unauthorized"})
                 return
             if path == "/":
-                await send_dashboard(send)
+                if authed or not self._admin_token:
+                    await send_dashboard(send)
+                else:
+                    await send_login_page(send)
                 return
             if path == "/status.json":
                 await send_status_json(send, self._reconcile, self._guard, self._build_sha)
@@ -593,6 +630,14 @@ class ProxyApp:
             # match sluice's admin token are stripped.  (Rule 7.)
             if name == "authorization" and is_admin_auth_value(v, self._admin_token):
                 continue
+            if name == "cookie":
+                cookie_str = v.decode("latin-1")
+                parts = [p.strip() for p in cookie_str.split(";")]
+                filtered = [p for p in parts if p and not p.startswith(f"{_SESSION_COOKIE}=")]
+                if len(filtered) < len([p for p in parts if p]):
+                    if filtered:
+                        result.append((k.decode("latin-1"), "; ".join(filtered)))
+                    continue
             result.append((k.decode("latin-1"), v.decode("latin-1")))
         return result
 

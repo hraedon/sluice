@@ -1117,16 +1117,16 @@ async def test_admin_token_not_required_for_healthz():
 
 
 async def test_dashboard_requires_auth_when_token_set():
-    """The dashboard at / requires auth when admin_token is set."""
+    """Unauthenticated GET / serves the login page (200, no challenge header)."""
     app, _, _ = _make_app()
     app._admin_token = "secret"
 
     async with _asgi_client(app) as client:
         response = await client.get("/")
 
-    assert response.status_code == 401
-    assert response.headers.get("www-authenticate") is not None
-    assert "Basic" in response.headers.get("www-authenticate", "")
+    assert response.status_code == 200
+    assert response.headers.get("www-authenticate") is None
+    assert "password" in response.text
 
 
 async def test_dashboard_works_with_basic_auth():
@@ -3524,3 +3524,33 @@ async def test_config_post_auth_before_leader_check():
         )
 
     assert response.status_code == 403
+
+
+def test_upstream_client_has_bounded_connect_write_pool():
+    """WI-027: the production client has finite connect/write/pool timeouts
+    to protect against hung connections, but read=None (no response-duration
+    cap) so slow/streaming completions are not truncated.
+
+    A read timeout would kill any stream with a >300s inter-chunk gap,
+    releasing the permit while the upstream may still count the session
+    — self-inflicting the phantom the reconciler exists to absorb.
+    """
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+    )
+    timeout = app._client.timeout
+    assert timeout.connect is not None and timeout.connect > 0
+    assert timeout.write is not None and timeout.write > 0
+    assert timeout.pool is not None and timeout.pool > 0
+    assert timeout.read is None, "read must be None — no response-duration cap (WI-027)"

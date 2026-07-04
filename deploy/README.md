@@ -34,8 +34,15 @@ kubectl create secret generic sluice-secrets \
 `admin-token` is **required**: the deployment sets `SLUICE_ADMIN_TOKEN` from it,
 which gates the admin routes (`/`, `/status.json`, `/metrics`, `/history.json`)
 and enables the dashboard's config-mutation endpoints. The ServiceMonitor
-presents the same token so Prometheus scrapes keep working. Dashboard login is
-HTTP Basic — any username, the token as password. Retrieve it later with:
+presents the same token so Prometheus scrapes keep working.
+
+Dashboard login is a **cookie-based login page** (not Basic-auth popup). Visit `/`
+in a browser and paste the token at the login form — a signed session cookie is
+set (30-day TTL, HttpOnly, SameSite=Strict). Bearer-token auth (for `sluice
+status`, Prometheus, and `curl`) and HTTP Basic auth (`curl -u`) still work
+unchanged for preemptive clients. Challenge-response clients (e.g. `wget`
+without `--auth-no-challenge`, PowerShell `-Credential`) will loop, since the
+WWW-Authenticate challenge is no longer sent. Retrieve the token later with:
 
 ```sh
 kubectl get secret sluice-secrets -n sluice -o jsonpath='{.data.admin-token}' | base64 -d
@@ -63,6 +70,7 @@ are already token-gated (see above), so turning it on is one step:
 The NetworkPolicy already admits the `traefik-external` namespace, so no
 network-policy change is needed.
 
-> The dashboard's JS fetch sends `credentials:'include'`, so browser-cached
-> Basic auth from the dashboard login authorizes the `/status.json` poll
-> automatically — no separate token-in-browser auth needed.
+> The dashboard's JS fetch sends `credentials:'include'`, so the session cookie
+> from the login page authorizes the `/status.json` poll automatically — no
+> separate token-in-browser auth needed. Bearer-token clients (Prometheus,
+> `sluice status`, `curl`) are unaffected.

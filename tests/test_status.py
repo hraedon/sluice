@@ -226,6 +226,29 @@ async def test_prometheus_format():
     assert 'sluice_band{state="boxed"} 0' in text
     assert 'sluice_breaker{state="closed"} 1' in text
 
+    assert "# HELP sluice_usage_stale" in text
+    assert "# TYPE sluice_usage_stale gauge" in text
+    assert "sluice_usage_stale 0" in text
+
+    assert "# HELP sluice_usage_age_seconds" in text
+    assert "# TYPE sluice_usage_age_seconds gauge" in text
+    assert "sluice_usage_age_seconds " in text
+
+
+async def test_prometheus_stale_usage():
+    """When the usage poll is stale, sluice_usage_stale must be 1."""
+    loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))
+    await loop.tick()
+
+    # Simulate a fetch failure by marking the cached reading as not-ok.
+    assert loop._last_reading_cached is not None
+    loop._last_reading_cached.ok = False
+
+    snap = snapshot(loop)
+    text = to_prometheus(snap)
+
+    assert "sluice_usage_stale 1" in text
+
 
 async def test_no_request_body_in_status_payload():
     """The status payload must never contain request or response body text.

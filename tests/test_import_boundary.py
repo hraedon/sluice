@@ -12,7 +12,8 @@ import sys
 from pathlib import Path
 
 CORE = Path(__file__).resolve().parent.parent / "src" / "sluice" / "control.py"
-SHELL_MODULES = {"sluice.proxy", "sluice.usage", "sluice.cli", "sluice.gate", "sluice.reconcile", "sluice.singleton", "sluice.status", "sluice.providers", "sluice.history", "sluice.history_store", "sluice.admin", "sluice.lifecycle"}
+SESSION = Path(__file__).resolve().parent.parent / "src" / "sluice" / "session.py"
+SHELL_MODULES = {"sluice.proxy", "sluice.usage", "sluice.cli", "sluice.gate", "sluice.reconcile", "sluice.singleton", "sluice.status", "sluice.providers", "sluice.history", "sluice.history_store", "sluice.admin", "sluice.lifecycle", "sluice.session"}
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -30,6 +31,12 @@ def test_control_imports_stdlib_only():
     stdlib = set(sys.stdlib_module_names)
     offenders = {m for m in _imported_modules(CORE) if m not in stdlib and m != "sluice"}
     assert not offenders, f"sluice.control may import stdlib only, found: {sorted(offenders)}"
+
+
+def test_session_imports_stdlib_only():
+    stdlib = set(sys.stdlib_module_names)
+    offenders = {m for m in _imported_modules(SESSION) if m not in stdlib and m != "sluice"}
+    assert not offenders, f"sluice.session may import stdlib only, found: {sorted(offenders)}"
 
 
 def test_control_does_not_import_shell():

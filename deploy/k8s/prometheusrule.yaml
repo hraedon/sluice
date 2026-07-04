@@ -63,3 +63,12 @@ spec:
           annotations:
             summary: "Sluice permit leak detected"
             description: "In-flight permits have been non-zero and unchanged for more than 5 minutes. This indicates a truly stuck permit, not active streaming traffic."
+
+        - alert: SluiceUsageStale
+          expr: sluice_usage_stale == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sluice /v1/usage poll is stale"
+            description: "The /v1/usage fetch has been failing for more than 10 minutes (network error, provider returning non-200, or parse failure). Serving last-known-good or fail-safe data — the gate will tighten if this persists."

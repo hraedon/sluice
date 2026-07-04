@@ -131,8 +131,10 @@ sluice — check those first if hermes traffic doesn't show up in the dashboard.
 
 1. Open the live dashboard at **`https://sluice.k8s.hraedon.com/`** (or poll JSON:
    `curl -s -u admin:$TOKEN https://sluice.k8s.hraedon.com/status.json`). Both are gated by
-   the admin token (Basic auth — any username, token as password; retrieve it with
-   `kubectl get secret sluice-secrets -n sluice -o jsonpath='{.data.admin-token}' | base64 -d`).
+   the admin token. In a browser, visit `/` and paste the token at the login page — a
+   signed session cookie is set (30-day TTL). For `curl` and API clients, use Basic auth
+   (any username, token as password) or a Bearer header. Retrieve the token with
+   `kubectl get secret sluice-secrets -n sluice -o jsonpath='{.data.admin-token}' | base64 -d`.
    Counts-only either way.
 2. Send one test completion from the client.
 3. Confirm `local_in_flight` increments while the request is in flight and releases when the

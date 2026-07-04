@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme-key="sluice-theme">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sluice — login</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="sluice">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/css/tokens.css">
+<style>
+body{font-family:var(--font-mono);background:var(--bg);color:var(--text);margin:0;padding:0;display:flex;justify-content:center;align-items:center;min-height:100vh;font-size:var(--fs-sm)}
+.login{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-4);width:320px;max-width:90vw}
+.login h1{font-size:var(--fs-base);font-weight:500;margin:0 0 var(--space-3);color:var(--accent)}
+.login label{display:block;font-size:var(--fs-xs);color:var(--text-3);margin-bottom:var(--space-1);text-transform:uppercase;letter-spacing:.05em}
+.login input{width:100%;background:var(--inset);border:1px solid var(--border-2);color:var(--text);padding:var(--space-2);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:var(--fs-sm);box-sizing:border-box}
+.login input:focus{outline:none;border-color:var(--accent)}
+.login button{width:100%;margin-top:var(--space-3);background:var(--accent);border:none;color:var(--bg);padding:var(--space-2);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:var(--fs-sm);cursor:pointer;font-weight:500}
+.login button:hover{opacity:.85}
+.err{color:var(--warn);font-size:var(--fs-xs);margin-top:var(--space-2);display:none}
+.err.show{display:block}
+</style>
+</head>
+<body>
+<div class="login">
+<h1>sluice</h1>
+<form method="POST" action="/login">
+<label for="token">admin token</label>
+<input type="password" id="token" name="token" autocomplete="current-password" autofocus>
+<div id="err" class="err">invalid token</div>
+<button type="submit">log in</button>
+</form>
+</div>
+<script>
+if(new URLSearchParams(location.search).has('error'))document.getElementById('err').classList.add('show');
+</script>
+</body>
+</html>

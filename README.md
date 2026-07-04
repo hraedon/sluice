@@ -183,9 +183,22 @@ sluice serve --provider anthropic --upstream https://api.anthropic.com
 
 By default, the dashboard (`/`), `/status.json`, `/metrics`, and `/history.json` are
 unauthenticated. Pass `--admin-token SECRET` (or `SLUICE_ADMIN_TOKEN`) to gate them.
-Clients authenticate with either a Bearer token (`Authorization: Bearer SECRET`) or HTTP
-Basic auth (password = token, username ignored). The token is stripped from proxied
-requests so it never reaches the upstream.
+Three credential forms are accepted:
+
+- **Session cookie** (browser): visit `/` and paste the token at the login page.
+  A signed `sluice_session` cookie is set (HttpOnly, SameSite=Strict, 30-day TTL).
+  The cookie's `Secure` attribute is set automatically on HTTPS or localhost origins;
+  on plain-HTTP LAN access (e.g. the Docker quickstart) it is omitted by design so
+  the browser doesn't silently drop it — a warning is logged. `/logout` clears the
+  cookie. Rotating the admin token invalidates every outstanding session.
+- **Bearer token** (API clients, Prometheus ServiceMonitor, `sluice status`):
+  `Authorization: Bearer SECRET`.
+- **HTTP Basic auth** (curl `-u`): password = token, username ignored.
+
+The token is stripped from proxied requests so it never reaches the upstream. The
+session cookie is also stripped from forwarded `Cookie` headers (Rule 7 — cache
+transparency). No response carries `WWW-Authenticate` anywhere; the iOS Home-Screen
+webview popup problem is eliminated.
 
 ```sh
 docker run --rm -p 8800:8800 \

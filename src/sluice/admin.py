@@ -6,21 +6,25 @@ and falls through to the proxy path for everything else.
 
 All functions are stateless — they receive ``reconcile``, ``guard``, and
 ``admin_token`` as arguments from the caller (ProxyApp).  The only module-level
-state is the dashboard HTML, loaded once from ``static/dashboard.html`` at import
+state is the dashboard and login HTML, loaded once from ``static/`` at import
 time (same lifecycle as the previous inline string).
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hmac
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from urllib.parse import parse_qs
 
 from sluice import __version__
+from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
 from sluice.status import snapshot as status_snapshot
 from sluice.status import to_prometheus
 
@@ -42,9 +46,15 @@ _STATIC_CONTENT_TYPES = {
     ".woff2": "font/woff2",
     ".txt": "text/plain; charset=utf-8",
     ".html": "text/html; charset=utf-8",
+    ".png": "image/png",
+    ".webmanifest": "application/manifest+json; charset=utf-8",
 }
 
 _DASHBOARD_HTML = (_STATIC_DIR / "dashboard.html").read_text(encoding="utf-8")
+_LOGIN_HTML = (_STATIC_DIR / "login.html").read_text(encoding="utf-8")
+
+_SESSION_COOKIE = SESSION_COOKIE
+_SESSION_TTL = 2_592_000  # 30 days
 
 
 # ---------------------------------------------------------------------------
@@ -123,18 +133,80 @@ def is_admin_auth_value(value: bytes, admin_token: str | None) -> bool:
     return False
 
 
-def check_admin_auth(scope: Scope, admin_token: str | None) -> bool:
+def _get_session_cookie(scope: Scope) -> str | None:
+    """Extract the sluice_session cookie value from the Cookie header."""
+    for k, v in scope.get("headers", []):
+        if k == b"cookie":
+            for part in v.decode("latin-1").split(";"):
+                part = part.strip()
+                if part.startswith(f"{_SESSION_COOKIE}="):
+                    val: str = part[len(_SESSION_COOKIE) + 1:]
+                    return val
+    return None
+
+
+def _should_set_secure(scope: Scope) -> bool:
+    """Determine whether the Secure cookie attribute should be set.
+
+    Secure is set when the scheme is https (directly or via X-Forwarded-Proto,
+    which is the k8s truth behind Traefik's TLS termination) or the host is
+    localhost/127.0.0.1 (secure contexts per spec).  A plain-HTTP LAN origin
+    gets a non-Secure cookie (browsers silently drop Secure cookies on http).
+
+    .. warning::
+
+       Trusting X-Forwarded-Proto is not strictly correct: if a misconfigured
+       intermediate hop injects ``X-Forwarded-Proto: https`` on an actually
+       plain-HTTP origin, the Secure attribute is set and the browser drops
+       the cookie → silent login loop.  This is low-likelihood in the Traefik
+       deployment (Traefik sets XFP correctly and ingress is internal-only)
+       but the risk is real, not "harmless" as an earlier draft claimed.
+       Uvicorn's ``--forwarded-allow-ips`` should be configured to restrict
+       which clients can set XFP headers.
+    """
+    if scope.get("scheme") == "https":
+        return True
+    for k, v in scope.get("headers", []):
+        if k == b"x-forwarded-proto":
+            first = v.decode("latin-1").split(",")[0].strip().lower()
+            if first == "https":
+                return True
+    server = scope.get("server")
+    if server and server[0] in ("127.0.0.1", "localhost", "::1"):
+        return True
+    return False
+
+
+def _build_set_cookie(value: str, max_age: int, scope: Scope) -> bytes:
+    """Build a Set-Cookie header value for the session cookie."""
+    parts = [
+        f"{_SESSION_COOKIE}={value}",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Path=/",
+        f"Max-Age={max_age}",
+    ]
+    if _should_set_secure(scope):
+        parts.append("Secure")
+    return "; ".join(parts).encode("latin-1")
+
+
+def check_admin_auth(scope: Scope, admin_token: str | None, *, now: float | None = None) -> bool:
     """Return True if the request is authorized for admin routes.
 
-    Accepts either a Bearer token (for API clients like ``sluice status``)
-    or HTTP Basic auth (for browser access to the dashboard, where the
-    password is the admin token — username is ignored).
+    Accepts a Bearer token (API clients), HTTP Basic auth (curl -u), or a
+    signed session cookie (browser login page — Plan 012).
     """
     if not admin_token:
         return True
+    if now is None:
+        now = time.time()
     for k, v in scope.get("headers", []):
         if k == b"authorization" and is_admin_auth_value(v, admin_token):
             return True
+    cookie_value = _get_session_cookie(scope)
+    if cookie_value is not None:
+        return verify_session(cookie_value, admin_token, now)
     return False
 
 
@@ -204,6 +276,124 @@ async def send_dashboard(send: Send) -> None:
     await send_text(send, 200, _DASHBOARD_HTML, content_type="text/html; charset=utf-8")
 
 
+async def send_login_page(send: Send) -> None:
+    await send_text(send, 200, _LOGIN_HTML, content_type="text/html; charset=utf-8")
+
+
+async def handle_login_get(send: Send, admin_token: str | None) -> None:
+    """GET /login — serve the login form, or 404 if no token configured."""
+    if not admin_token:
+        await send_text(send, 404, "Not found")
+        return
+    await send_login_page(send)
+
+
+async def handle_login_post(
+    send: Send,
+    receive: Receive,
+    admin_token: str | None,
+    scope: Scope,
+    throttle: LoginThrottle,
+) -> None:
+    """POST /login — verify token, set session cookie, redirect to /."""
+    if not admin_token:
+        await send_text(send, 404, "Not found")
+        return
+
+    now = time.time()
+
+    if throttle.is_locked(now):
+        retry = throttle.retry_after(now)
+        log.warning("login throttled — retry_after=%d", retry)
+        await send_json(
+            send,
+            429,
+            {"error": "too many attempts", "retry_after": retry},
+            retry_after=retry,
+        )
+        return
+
+    try:
+        body = await _read_body(receive)
+    except ValueError:
+        await send_text(send, 413, "request body too large")
+        return
+    except ConnectionError:
+        return
+
+    params = parse_qs(body.decode("utf-8", errors="replace"))
+    token = params.get("token", [""])[0]
+
+    if not token or not hmac.compare_digest(token.encode("utf-8"), admin_token.encode("utf-8")):
+        throttle.record_failure(now)
+        log.warning(
+            "login failed — remote=%s",
+            _extract_remote(scope),
+        )
+        await asyncio.sleep(0.2)
+        await send_text(
+            send,
+            303,
+            "",
+            extra_headers=[(b"location", b"/login?error=1")],
+        )
+        return
+
+    throttle.record_success(now)
+    cookie_value = mint_session(admin_token, now, _SESSION_TTL)
+    set_cookie = _build_set_cookie(cookie_value, _SESSION_TTL, scope)
+    if not _should_set_secure(scope):
+        log.warning(
+            "session cookie set without Secure — plain-HTTP origin (remote=%s)",
+            _extract_remote(scope),
+        )
+    await send_text(
+        send,
+        303,
+        "",
+        extra_headers=[(b"location", b"/"), (b"set-cookie", set_cookie)],
+    )
+
+
+async def handle_logout(
+    send: Send,
+    admin_token: str | None,
+    scope: Scope,
+) -> None:
+    """POST /logout — clear session cookie and redirect to /login."""
+    if not admin_token:
+        await send_text(send, 303, "", extra_headers=[(b"location", b"/")])
+        return
+    if not check_csrf(scope, admin_token):
+        await send_text(send, 403, "cross-site request blocked")
+        return
+    set_cookie = _build_set_cookie("", 0, scope)
+    await send_text(
+        send,
+        303,
+        "",
+        extra_headers=[(b"location", b"/login"), (b"set-cookie", set_cookie)],
+    )
+
+
+def check_csrf(scope: Scope, admin_token: str | None) -> bool:
+    """CSRF check for cookie-authenticated mutation requests.
+
+    Bearer/Basic-authenticated mutations are exempt (Authorization headers
+    cannot be set cross-site by an attacker page).  For cookie-authenticated
+    requests, the Sec-Fetch-Site header must be absent (older browsers, curl)
+    or equal to ``same-origin``.
+    """
+    for k, v in scope.get("headers", []):
+        if k == b"authorization" and is_admin_auth_value(v, admin_token):
+            return True
+    for k, v in scope.get("headers", []):
+        if k == b"sec-fetch-site":
+            site: str = v.decode("latin-1").strip().lower()
+            return site == "same-origin"
+    return True
+
+
 async def serve_static(path: str, send: Send) -> None:
     """Serve a file from the vendored static directory (patina assets)."""
     rel = path[len("/static/"):]
@@ -264,6 +454,8 @@ def _extract_audit_user(scope: Scope) -> str:
                     pass
             elif v.lower().startswith(b"bearer "):
                 return "bearer"
+    if _get_session_cookie(scope) is not None:
+        return "session"
     return "unknown"
 
 
@@ -293,6 +485,10 @@ async def handle_config_post(
 
     if not check_admin_auth(scope, admin_token):
         await send_json(send, 403, {"error": "unauthorized"})
+        return
+
+    if not check_csrf(scope, admin_token):
+        await send_json(send, 403, {"error": "cross-site request blocked"})
         return
 
     if guard is not None and not guard.is_held():
@@ -381,6 +577,10 @@ async def handle_config_delete(
 
     if not check_admin_auth(scope, admin_token):
         await send_json(send, 403, {"error": "unauthorized"})
+        return
+
+    if not check_csrf(scope, admin_token):
+        await send_json(send, 403, {"error": "cross-site request blocked"})
         return
 
     if guard is not None and not guard.is_held():

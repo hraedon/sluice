@@ -1,5 +1,13 @@
 # Plan 007 — Streaming/lifecycle test fidelity + fault injection
 
+> **Status: Complete.** All six work items landed:
+> - WI-1 (streaming mock transport / backpressure): `_StreamingMockTransport` + `test_backpressure_real`
+> - WI-2 (latency-injecting transport / race the races): `_StreamingMockTransport(header_delay/chunk_delay)` + `test_mid_body_upload_disconnect_with_latency`
+> - WI-3 (startup-window honesty): `first_poll_ok` parameter + `test_startup_window_closes_on_first_poll`
+> - WI-4 (body_done/disconnect_watcher handoff): pinning test `test_body_done_disconnect_watcher_handoff`
+> - WI-5 (fault-injection soak harness): `scripts/soak.py`
+> - WI-6 (breaker_half_open_age_seconds): exposed in `status.py` + rendered in dashboard
+
 sluice's risk does not live in the pure core — `control.py` is deterministic, exhaustively
 tested, and has survived two adversarial reviews. It lives in the **async lifecycle edges of
 the proxy** (disconnect, cancellation, backpressure, startup), and the last two sessions'

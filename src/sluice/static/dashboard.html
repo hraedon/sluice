@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sluice</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="sluice">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
 <script src="/static/theme.js"></script>
 <link rel="stylesheet" href="/static/css/tokens.css">
 <style>
@@ -119,6 +124,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <span id="theme-icon-dark">☀</span>
       <span id="theme-icon-light">☽</span>
     </button>
+    <button id="btn-logout" onclick="doLogout()" title="log out">logout</button>
   </div>
 </div>
 <div id="banner-boxed" class="banner boxed">ACCOUNT BOXED — retry after <span id="countdown">?</span>s</div>
@@ -209,11 +215,22 @@ function fromHistEntry(e){
 async function initHistory(){
   try{
     const r=await fetch('/history.json?limit='+HIST_MAX,{credentials:'include'});
-    if(!r.ok) return;
+    if(!r.ok){
+      if(r.status===401){window.location.href='/';return;}
+      return;
+    }
     const d=await r.json();
     if(!d.entries||!d.entries.length) return;
     hist=d.entries.map(fromHistEntry);
   }catch(e){}
+}
+
+function doLogout(){
+  var f=document.createElement('form');
+  f.method='POST';
+  f.action='/logout';
+  document.body.appendChild(f);
+  f.submit();
 }
 
 function setRange(rg){
@@ -230,7 +247,10 @@ async function fetchLong(force){
   lastLongFetch=Date.now();
   try{
     const r=await fetch('/history.json?limit='+RANGES[viewRange].limit,{credentials:'include'});
-    if(!r.ok) return;
+    if(!r.ok){
+      if(r.status===401){window.location.href='/';return;}
+      return;
+    }
     const d=await r.json();
     longHist=(d.entries||[]).map(fromHistEntry);
     renderSparks();
@@ -243,6 +263,7 @@ async function doPoll(){
   try{
     const r=await fetch('/status.json',{credentials:'include'});
     if(!r.ok){
+      if(r.status===401){window.location.href='/';return;}
       document.getElementById('stats').innerHTML='<tr><th>error</th><td>status '+r.status+'</td></tr>';
       return;
     }
@@ -304,8 +325,10 @@ async function stepTarget(delta){
       body:JSON.stringify({target:newVal}),
       credentials:'include'
     });
-    if(r.status===405||r.status===403){
+    if(r.status===405){
       mutationsDisabled=true;
+    }else if(r.status===403){
+      window.location.href='/';return;
     }else if(!r.ok){
       try{var b=await r.json();console.warn('target override failed: '+(b.error||r.status));}catch(e){}
     }
@@ -323,8 +346,10 @@ async function revertTarget(){
       method:'DELETE',
       credentials:'include'
     });
-    if(r.status===405||r.status===403){
+    if(r.status===405){
       mutationsDisabled=true;
+    }else if(r.status===403){
+      window.location.href='/';return;
     }else if(!r.ok){
       try{var b=await r.json();console.warn('target revert failed: '+(b.error||r.status));}catch(e){}
     }

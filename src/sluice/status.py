@@ -188,6 +188,8 @@ def to_prometheus(snap: StatusSnapshot) -> str:
         for state in states:
             lines.append(f'{name}{{state="{state}"}} {1 if value == state else 0}')
 
+    gauge("sluice_usage_stale", "1 if the last /v1/usage fetch failed (serving LKG or fail-safe), 0 if the last fetch succeeded", 1 if snap.stale else 0)
+    gauge("sluice_usage_age_seconds", "Seconds since the last successful /v1/usage poll", round(snap.usage_age, 1))
     gauge("sluice_in_flight", "Currently held permits", snap.local_in_flight)
     gauge("sluice_effective_permits", "Current effective permit count", snap.effective_permits)
     gauge("sluice_observed_sessions", "Provider-reported concurrent sessions", snap.concurrent_sessions)
