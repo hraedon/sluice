@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="logging level (default: INFO)")
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
-    serve.add_argument("--admin-token", default=None, help="token for admin routes (/, /status.json, /metrics) — sent as Bearer header or Basic auth password")
+    serve.add_argument("--admin-token", default=None, help="token gating admin routes (/, /status.json, /metrics, /history.json) — accepts a browser login-page session cookie, a Bearer header, or a Basic auth password")
     serve.add_argument("--reserve", default=None, help="reserve permits for a QoS class, e.g. 'interactive=1' (default: none → pure FIFO)")
     serve.add_argument("--history-size", type=int, default=None, help="number of tick snapshots to retain for trend analysis (default: 2880, ~4h at 5s poll; 0 disables)")
     serve.add_argument("--history-store", default=None, help="path to SQLite file for history persistence (default: none — in-memory only). Survives restarts; enables crash forensics.")

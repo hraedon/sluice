@@ -53,7 +53,8 @@ silently dropped.
    request sluice *egresses* must be byte-for-byte what the client sent — same body bytes
    (never parse/re-serialise/reorder/buffer a body), same content and `anthropic-*` /
    cache-control / `authorization` headers — minus only hop-by-hop headers, plus **nothing
-   sluice-internal**. Any sluice control header (e.g. a QoS client label) is consumed and
+   sluice-internal**. Any sluice control header (e.g. a QoS client label), the admin
+   `authorization` credential, and the `sluice_session` login cookie are consumed and
    **stripped before forwarding**, never sent upstream. We don't know umans' cache
    internals and don't need to: a request through sluice must hash identically to the same
    request sent directly, so whatever the provider caches is unaffected by our presence.
