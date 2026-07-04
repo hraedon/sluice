@@ -27,7 +27,18 @@ The secret is **not** in git. Create it before the app first syncs:
 kubectl create namespace sluice   # or let CreateNamespace=true handle it
 kubectl create secret generic sluice-secrets \
   --namespace sluice \
-  --from-literal=umans-api-key='sk-...'
+  --from-literal=umans-api-key='sk-...' \
+  --from-literal=admin-token="$(openssl rand -hex 32)"
+```
+
+`admin-token` is **required**: the deployment sets `SLUICE_ADMIN_TOKEN` from it,
+which gates the admin routes (`/`, `/status.json`, `/metrics`, `/history.json`)
+and enables the dashboard's config-mutation endpoints. The ServiceMonitor
+presents the same token so Prometheus scrapes keep working. Dashboard login is
+HTTP Basic — any username, the token as password. Retrieve it later with:
+
+```sh
+kubectl get secret sluice-secrets -n sluice -o jsonpath='{.data.admin-token}' | base64 -d
 ```
 
 Then register the app (one-time):
@@ -41,15 +52,11 @@ rather than recreating them.
 
 ## Exposing sluice externally (currently internal-only)
 
-The manifests are kept ready but external exposure is **off**. To turn it on:
+The manifests are kept ready but external exposure is **off**. The admin routes
+are already token-gated (see above), so turning it on is one step:
 
 1. Add `- ingress-external.yaml` to `kustomization.yaml` resources.
-2. Gate the admin routes — otherwise `/status.json` and `/metrics` are published
-   unauthenticated:
-   - add `admin-token` to the secret
-     (`--from-literal=admin-token="$(openssl rand -hex 32)"`),
-   - uncomment the `SLUICE_ADMIN_TOKEN` block in `deployment.yaml`.
-3. The proxy routes (`/v1/messages`, `/v1/chat/completions`) are always
+2. The proxy routes (`/v1/messages`, `/v1/chat/completions`) are always
    auth-bound — clients must present their own upstream key; sluice holds no
    key of its own for proxying.
 

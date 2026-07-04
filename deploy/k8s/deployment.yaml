@@ -54,6 +54,11 @@ spec:
             - "30"
             - --usage-key-env
             - SLUICE_USAGE_KEY
+            # Persist history to the sluice-data PVC so sparklines/forensics
+            # survive image bumps (Recreate strategy restarts the pod on every
+            # release). Default TTL (7 days) applies.
+            - --history-store
+            - /data/history.sqlite
           env:
             - name: SLUICE_USAGE_KEY
               valueFrom:
@@ -70,20 +75,19 @@ spec:
                   fieldPath: metadata.namespace
             - name: SLUICE_SINGLETON_GUARD
               value: kube-lease
-            # --- External-exposure hardening (currently internal-only) ---------
-            # Admin routes (/status.json, /metrics) are unauthenticated by
-            # default — fine behind traefik-internal. BEFORE adding the external
-            # ingress, gate them by setting an admin token here (and the matching
-            # key in the secret). Caveat: the HTML dashboard at / fetches
-            # /status.json from the browser with no token, so enabling this
-            # blanks the live dashboard until token-in-browser auth exists
-            # (tracked — see deploy/README.md). The proxy routes are always
-            # auth-bound: clients must present their own upstream key.
-            # - name: SLUICE_ADMIN_TOKEN
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: sluice-secrets
-            #       key: admin-token
+            # Gates the admin routes (/, /status.json, /metrics, /history.json)
+            # and enables the Plan 011 config-mutation endpoints (/admin/config).
+            # Dashboard login = HTTP Basic, any username, token as password
+            # (WI-008 resolved 2026-07-01: the dashboard's fetch rides the
+            # browser-cached Basic auth). Prometheus scrapes carry the same
+            # token via the ServiceMonitor `authorization` block. The proxy
+            # routes are always auth-bound: clients present their own upstream
+            # key.
+            - name: SLUICE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sluice-secrets
+                  key: admin-token
           ports:
             - name: http
               containerPort: 8800
@@ -119,6 +123,11 @@ spec:
           volumeMounts:
             - mountPath: /tmp
               name: tmp
+            - mountPath: /data
+              name: data
       volumes:
         - emptyDir: {}
           name: tmp
+        - name: data
+          persistentVolumeClaim:
+            claimName: sluice-data

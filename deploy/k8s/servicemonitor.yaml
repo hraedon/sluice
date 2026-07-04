@@ -17,3 +17,11 @@ spec:
     - port: http
       path: /metrics
       interval: 15s
+      # /metrics is gated by SLUICE_ADMIN_TOKEN (deployment.yaml); the scrape
+      # presents it as a Bearer token or Prometheus gets 401s and sluice goes
+      # dark on the dashboards.
+      authorization:
+        type: Bearer
+        credentials:
+          name: sluice-secrets
+          key: admin-token

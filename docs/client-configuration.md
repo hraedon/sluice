@@ -130,15 +130,17 @@ sluice — check those first if hermes traffic doesn't show up in the dashboard.
 ## Verify each client after pointing it at sluice
 
 1. Open the live dashboard at **`https://sluice.k8s.hraedon.com/`** (or poll JSON:
-   `curl -s https://sluice.k8s.hraedon.com/status.json`). Both are unauthenticated and
-   counts-only on the current internal deployment.
+   `curl -s -u admin:$TOKEN https://sluice.k8s.hraedon.com/status.json`). Both are gated by
+   the admin token (Basic auth — any username, token as password; retrieve it with
+   `kubectl get secret sluice-secrets -n sluice -o jsonpath='{.data.admin-token}' | base64 -d`).
+   Counts-only either way.
 2. Send one test completion from the client.
 3. Confirm `local_in_flight` increments while the request is in flight and releases when the
    response finishes; watch `concurrent_sessions` (umans ground truth) and `band` track it.
 
 > The `sluice status` CLI targets `http://<host>` and is meant for a local/dev instance
 > (`127.0.0.1:8800`) or a `kubectl port-forward`, not the TLS ingress — use the dashboard or
-> `curl https://…/status.json` against the deployed instance.
+> the authenticated `curl` above against the deployed instance.
 
 If traffic does **not** appear in sluice but the client still gets responses, that client is
 bypassing sluice — recheck its base URL (and any stray `OPENAI_BASE_URL` still pointing at

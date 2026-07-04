@@ -18,6 +18,7 @@ resources:
 - role.yaml
 - rolebinding.yaml
 - deployment.yaml
+- pvc.yaml
 - service.yaml
 - ingress-internal.yaml
 - networkpolicy.yaml

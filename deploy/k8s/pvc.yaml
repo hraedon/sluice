@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sluice-data
+  namespace: sluice
+  labels:
+    app.kubernetes.io/name: sluice
+spec:
+  # History SQLite store (--history-store). Longhorn (cluster default) so the
+  # volume survives node drains; 1Gi is generous — 7-day TTL at 5s poll is a
+  # few MB. RWO is fine: replicas is pinned to 1 (Recreate).
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
