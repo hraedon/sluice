@@ -56,9 +56,24 @@ a single token field, Vault-style, no username to invent.
      revocation story and is correct.
    Verification is a pure function (mint/verify pair unit-tested without
    ASGI, constant-time, rejects expired/garbled/None). Cookie attributes:
-   `HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=<--session-ttl>`,
-   default 30 days (the device is trusted and the token itself never leaves
-   the secret store; `/logout` exists for untrusted-device hygiene).
+   `HttpOnly; SameSite=Strict; Path=/; Max-Age=<--session-ttl>`, default
+   30 days (the device is trusted and the token itself never leaves the
+   secret store; `/logout` exists for untrusted-device hygiene).
+
+   **`Secure` is auto, not unconditional — the Docker/local case.** A
+   `Secure` cookie is silently dropped by browsers on a plain-HTTP,
+   non-localhost origin — which is exactly the README's Docker quickstart
+   (`http://<lan-ip>:8800`); an unconditional `Secure` would produce an
+   unexplainable login loop there. Rule: set `Secure` when the effective
+   scheme is https (`scope["scheme"]`, or `X-Forwarded-Proto: https` —
+   the k8s pod sees plain http behind Traefik's TLS termination, so the
+   forwarded header is the k8s truth) or the host is
+   localhost/127.0.0.1 (secure contexts per spec). A plain-HTTP LAN
+   origin gets a non-`Secure` cookie plus one logged warning naming the
+   trade-off — degrading visibly beats breaking silently, and the
+   alternative (refusing login) would regress the documented Docker
+   path. Trusting a spoofed `X-Forwarded-Proto: https` only *adds* the
+   `Secure` attribute, which is harmless.
 
 5. **CSRF: SameSite=Strict + fetch-metadata check on mutations.** Cookie
    auth makes `POST /admin/config` CSRF-relevant (cached Basic auth had the
@@ -109,7 +124,9 @@ to `/login`. All three respond 404 when `SLUICE_ADMIN_TOKEN` is unset
 (tokenless deployments keep today's open behavior, nothing new to reach).
 **AC:** correct token → cookie set with the §4 attributes + redirect; wrong
 token → no cookie, neutral error; logout clears; tokenless mode: routes 404
-and `/` serves the dashboard directly as today.
+and `/` serves the dashboard directly as today; `Secure` present on
+https/forwarded-https/localhost requests and absent (with the logged
+warning) on plain-HTTP LAN requests — one test per origin class.
 
 ### WI-003 — Auth acceptance + challenge removal
 `check_admin_auth` accepts a valid session cookie alongside Bearer/Basic.
@@ -150,9 +167,12 @@ the session TTL.
 `deploy/README.md` (login flow replaces the Basic-auth login note; token
 retrieval command unchanged), `docs/client-configuration.md` (browser step
 says "paste the token at the login page"; the authenticated-curl step is
-unchanged), README dashboard section.
+unchanged), README dashboard section — including a Docker/local note: with
+`SLUICE_ADMIN_TOKEN` unset nothing changes at all, and on plain-HTTP LAN
+access the session cookie is non-`Secure` by design (§4).
 **AC:** docs describe the login page; no doc anywhere still instructs the
-reader to expect a Basic-auth prompt in a browser.
+reader to expect a Basic-auth prompt in a browser; the Docker quickstart
+works as documented with and without a token.
 
 ## Sequencing & notes
 
