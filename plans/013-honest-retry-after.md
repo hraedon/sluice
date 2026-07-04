@@ -183,10 +183,12 @@ behaviour, not intent).
   with headers, before and after — the "before" artifact shows the fixed 5, the
   "after" shows a pressure-scaled, jittered value. Save alongside
   `docs/wi-024-429-capture-2026-07-03.md`.
-- Watch a real SDK client's retry cadence change: before = metronomic 5 s; after =
-  spread and scaled with queue depth. Confirm per-client which of the live clients
-  (Claude Code / hermes / opencode / open-webui) actually honor `Retry-After` on 503,
-  and record the findings — if a client ignores the header entirely, its behaviour is
-  unchanged and that's worth knowing too.
+- SDK `Retry-After` behaviour has been verified at source level (see
+  `docs/concurrency-model.md` "Client reality"): Anthropic and OpenAI Python SDKs
+  accept the header only if `<= 60` seconds and fall back to exponential backoff
+  otherwise; the Anthropic TypeScript SDK has the same 60 s cap; Claude Code's wrapper
+  does not globally cap it; Open WebUI does not retry upstream errors at all. Record
+  live per-client retry cadence if possible, but the cap is now grounded in pinned
+  source, not memory.
 - Confirm the global invariant is untouched: `/v1/usage.concurrent_sessions` stays
   within bounds throughout — this plan changes what we *say*, never what we *admit*.

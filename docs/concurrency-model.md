@@ -300,9 +300,29 @@ estimator keeps that true and documents *why*.
 
 ### Client reality (SDK cap verification)
 
-The 60-second cap is based on the public behavior of the Anthropic and OpenAI Python
-SDKs. The Anthropic SDK's retry logic parses `Retry-After` and uses it, but caps the
-maximum retry wait. The OpenAI SDK similarly honors `Retry-After` with an internal
-maximum. **These caps should be verified against the pinned SDK versions the actual
-clients use** (Claude Code, hermes, opencode, open-webui) — if a client ignores the
-header entirely, its behavior is unchanged and that's worth knowing too.
+The 60-second cap was verified against the source of the SDKs the sluice clients
+actually use:
+
+- **Anthropic Python SDK** (`src/anthropic/_base_client.py`): `_calculate_retry_timeout()`
+  uses a `Retry-After` header only if `0 < retry_after <= 60`; larger values are
+  ignored and the SDK falls back to its own exponential backoff (max ~8 s).
+- **OpenAI Python SDK** (`src/openai/_base_client.py`): identical logic — honored
+  only if `0 < retry_after <= 60`, otherwise falls back to exponential backoff.
+- **Anthropic TypeScript SDK** (`src/client.ts`): the header is honored only when
+  `0 <= timeoutMillis < 60 * 1000`; larger values are ignored.
+- **Claude Code** (`@anthropic-ai/claude-code`, recovered source
+  `source/src/services/api/withRetry.ts`): its wrapper does **not** globally cap
+  `Retry-After` at 60 s. Normal retries return `retry-after * 1000` verbatim, fast-mode
+  has a 20 s short-retry threshold before switching to cooldown, and persistent-mode
+  cooldowns are measured in minutes. So a 503 with a 30–60 s `Retry-After` may still
+  be honored, but fast-mode may override it.
+- **Open WebUI** (`backend/open_webui/routers/openai.py`): does not retry upstream
+  errors at all — it proxies the upstream response (including 503) straight to the
+  caller. A `Retry-After` header is therefore surfaced to the user, not acted on by
+  the client.
+- **umans / hermes**: no public repository was found; cap behavior is unknown.
+
+This is why the saturated value is capped at 60 s: values the major SDKs discard are
+noise, not honesty. `boxed` may still exceed 60 s because the body carries the real
+reset deadline for sophisticated clients, but the header still cannot exceed 60 s
+without being ignored by the Anthropic/OpenAI Python SDKs.
