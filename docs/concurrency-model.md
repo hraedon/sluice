@@ -308,21 +308,25 @@ actually use:
   ignored and the SDK falls back to its own exponential backoff (max ~8 s).
 - **OpenAI Python SDK** (`src/openai/_base_client.py`): identical logic — honored
   only if `0 < retry_after <= 60`, otherwise falls back to exponential backoff.
-- **Anthropic TypeScript SDK** (`src/client.ts`): the header is honored only when
-  `0 <= timeoutMillis < 60 * 1000`; larger values are ignored.
-- **Claude Code** (`@anthropic-ai/claude-code`, recovered source
-  `source/src/services/api/withRetry.ts`): its wrapper does **not** globally cap
-  `Retry-After` at 60 s. Normal retries return `retry-after * 1000` verbatim, fast-mode
-  has a 20 s short-retry threshold before switching to cooldown, and persistent-mode
-  cooldowns are measured in minutes. So a 503 with a 30–60 s `Retry-After` may still
-  be honored, but fast-mode may override it.
+- **Anthropic TypeScript SDK** (`src/client.ts`): honors `Retry-After` **verbatim**
+  with no 60 s cap. A header of `120` causes the SDK to wait 120 seconds. The
+  only cap is on the *fallback* exponential backoff path (`maxRetryDelay = 8.0 s`).
+- **Claude Code** (`@anthropic-ai/claude-code`, closed-source; values come from
+  recovered source, not a public release tag): its wrapper does **not** globally
+  cap `Retry-After` at 60 s. Normal retries return `retry-after * 1000` verbatim;
+  fast-mode has a 20 s short-retry threshold before switching to cooldown, and
+  persistent-mode cooldowns are measured in minutes. A 503 with a 30–60 s
+  `Retry-After` may be honored, but fast-mode paths may override it.
 - **Open WebUI** (`backend/open_webui/routers/openai.py`): does not retry upstream
-  errors at all — it proxies the upstream response (including 503) straight to the
-  caller. A `Retry-After` header is therefore surfaced to the user, not acted on by
-  the client.
+  errors at all — it re-wraps the upstream error response as a new
+  `JSONResponse` / `PlainTextResponse`, dropping upstream headers including
+  `Retry-After`. The status code and body are surfaced to the caller, but the
+  header is lost.
 - **umans / hermes**: no public repository was found; cap behavior is unknown.
 
-This is why the saturated value is capped at 60 s: values the major SDKs discard are
-noise, not honesty. `boxed` may still exceed 60 s because the body carries the real
-reset deadline for sophisticated clients, but the header still cannot exceed 60 s
-without being ignored by the Anthropic/OpenAI Python SDKs.
+This is why the saturated value is capped at 60 s: the two most widely used
+programmatic SDKs (Anthropic and OpenAI Python) discard values above 60 s and fall
+back to short exponential backoff. A cap the client ignores is noise, not honesty.
+`boxed` may still exceed 60 s in the JSON body because it carries the real window
+reset deadline for sophisticated clients; the header is still capped because the
+Anthropic/OpenAI Python SDKs would ignore anything larger.

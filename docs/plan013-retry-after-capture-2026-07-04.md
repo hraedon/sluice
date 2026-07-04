@@ -1,7 +1,7 @@
 # Plan 013 capture: honest Retry-After under local saturation (2026-07-04)
 
 Controlled local validation of Plan 013's pressure-derived Retry-After logic.
-The live instance (`sluice.k8s.hraedon.com`) is still running build `a7a3c70`
+The live instance (`sluice.k8s.REDACTED`) is still running build `a7a3c70`
 (pre-Plan 013), so this capture was run locally against the current source
 (`daef71e` + doc updates on `followup/sdk-cap-verification`) to prove the new
 503 behaviour before any prod deploy.
@@ -73,6 +73,20 @@ content-type: application/json
 {"error": "concurrency limit reached", "reason": "saturated", "retry_after": 52}
 ```
 
+## Notes on reading the snapshots
+
+The status snapshots were taken **after** the burst subsided, by which time every
+queued client that had not acquired a permit had already hit `queue_timeout` and
+cleared from the gate. That is why `queue_depth` reads `0` while `queue_timeouts`
+is non-zero. The `Retry-After` values stamped on the 503s reflect the queue
+depth **at the moment each request timed out**:
+
+- Moderate burst (`retry_after: 52`): peak depth was large enough that the
+  unjittered estimate reached ~52 s before the ±15 % jitter window.
+- Deep burst (`retry_after: 60`): peak depth produced an estimate well above
+  60 s, so the cap bit. The actual unjittered estimate would have been
+  `ceil((qd + 1) × 15 / 2)` for some `qd` at failure time.
+
 ## Findings
 
 1. **Retry-After is now pressure-scaled, not fixed at 5 s.** With real hold-time
@@ -84,9 +98,10 @@ content-type: application/json
 3. **`avg_hold_seconds` is populated** by hold-time sampling on successful
    upstream completions; the estimator uses it directly.
 
-4. **The 60 s cap is real and observable.** Deep saturation produced exactly
-   `60`, not the unbounded pressure estimate that would otherwise have been
-   emitted.
+4. **The 60 s cap is real and observable.** Early timeouts in the deep burst
+   produced the capped value `60`. Later timeouts in the same burst produced
+   smaller values as the queue drained; the captured value is the maximum
+   observed, not the only one.
 
 5. **All 503s carried `reason: "saturated"`** — the proxy fast-fail path for
    queue-timeout requests is wired correctly.

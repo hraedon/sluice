@@ -186,9 +186,9 @@ behaviour, not intent).
 - SDK `Retry-After` behaviour has been verified at source level (see
   `docs/concurrency-model.md` "Client reality"): Anthropic and OpenAI Python SDKs
   accept the header only if `<= 60` seconds and fall back to exponential backoff
-  otherwise; the Anthropic TypeScript SDK has the same 60 s cap; Claude Code's wrapper
-  does not globally cap it; Open WebUI does not retry upstream errors at all. Record
-  live per-client retry cadence if possible, but the cap is now grounded in pinned
-  source, not memory.
+  otherwise; the Anthropic TypeScript SDK honors it verbatim with no 60 s cap;
+  Claude Code's wrapper does not globally cap it; Open WebUI does not retry
+  upstream errors at all. Record live per-client retry cadence if possible, but
+  the cap is now grounded in pinned source, not memory.
 - Confirm the global invariant is untouched: `/v1/usage.concurrent_sessions` stays
   within bounds throughout — this plan changes what we *say*, never what we *admit*.
