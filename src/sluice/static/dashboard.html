@@ -418,6 +418,8 @@ function render(d){
     ['gateway_429s',d.gateway_429s,'Upstream 429s from CDN/gateway — not concurrency, not fed to the breaker (WI-024)'],
     ['queue_depth',d.queue_depth,'Requests currently waiting for a permit'],
     ['queue_wait',d.avg_wait_seconds+'s avg / '+d.p95_wait_seconds+'s p95','Wait time of recently granted requests that had to queue: mean and 95th percentile'],
+    ['hold_time',d.avg_hold_seconds+'s avg','Hold duration (acquire to release) of recently completed requests — used to estimate saturated Retry-After'],
+    ['retry_after_hint',d.retry_after_hint+'s','Un-jittered saturation Retry-After estimate from queue pressure — what we would tell a saturated client right now'],
     ['queue_timeouts',d.queue_timeouts,'Requests that gave up waiting for a permit, since startup; row highlights when a timeout occurred within the breaker window'],
     ['gate_closed',d.gate_closed_reason,'Why the gate refuses new work: open means it is not closed; otherwise boxed, breaker, or saturated'],
     ['ready',d.ready,'True once the first usage poll succeeded and this instance holds the singleton lock'],

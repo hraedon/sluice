@@ -24,6 +24,7 @@ from typing import Any, TYPE_CHECKING
 from urllib.parse import parse_qs
 
 from sluice import __version__
+from sluice.reconcile import RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
 from sluice.status import snapshot as status_snapshot
 from sluice.status import to_prometheus
@@ -492,7 +493,7 @@ async def handle_config_post(
         return
 
     if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT)
         return
 
     # CSRF defence: require application/json Content-Type so cross-origin
@@ -584,7 +585,7 @@ async def handle_config_delete(
         return
 
     if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": 5}, retry_after=5)
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT)
         return
 
     previous = reconcile.target

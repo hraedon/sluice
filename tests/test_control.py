@@ -24,6 +24,7 @@ from sluice.control import (
     breaker_on_tick,
     adaptive_effective_permits,
     validate_target_override,
+    saturation_retry_after,
 )
 
 NOW = 1_000_000.0
@@ -721,3 +722,128 @@ def test_effective_permits_not_clamped_by_hard_cap_when_stale():
     s = state(r, in_flight=0, phantom=0)
     # Stale: base = min(10, 10-1) = 9, clamped to [1, 10] = 9 (not clamped to 6)
     assert effective_permits(s, cfg, now=NOW) == 9
+
+
+# ---------------------------------------------------------------------------
+# Plan 013 WI-002: saturation_retry_after — pure estimator
+# ---------------------------------------------------------------------------
+
+
+def test_saturation_retry_after_basic():
+    """queue_depth=2, avg_hold=10s, capacity=4 → ceil(3×10/4) = ceil(7.5) = 8."""
+    assert saturation_retry_after(
+        queue_depth=2, capacity=4, avg_hold_seconds=10.0
+    ) == 8
+
+
+def test_saturation_retry_after_deep_queue_larger_than_shallow():
+    """A deeper queue yields a larger Retry-After."""
+    shallow = saturation_retry_after(
+        queue_depth=1, capacity=4, avg_hold_seconds=10.0
+    )
+    deep = saturation_retry_after(
+        queue_depth=10, capacity=4, avg_hold_seconds=10.0
+    )
+    assert deep > shallow
+
+
+def test_saturation_retry_after_higher_hold_larger():
+    """Higher avg_hold_seconds yields a larger Retry-After."""
+    low_hold = saturation_retry_after(
+        queue_depth=3, capacity=4, avg_hold_seconds=5.0
+    )
+    high_hold = saturation_retry_after(
+        queue_depth=3, capacity=4, avg_hold_seconds=20.0
+    )
+    assert high_hold > low_hold
+
+
+def test_saturation_retry_after_no_samples_returns_floor():
+    """avg_hold_seconds <= 0 (no samples) → floor."""
+    assert saturation_retry_after(
+        queue_depth=5, capacity=4, avg_hold_seconds=0.0
+    ) == 5
+    assert saturation_retry_after(
+        queue_depth=5, capacity=4, avg_hold_seconds=-1.0
+    ) == 5
+
+
+def test_saturation_retry_after_zero_capacity_returns_cap():
+    """capacity <= 0 (zero-width gate) → cap."""
+    assert saturation_retry_after(
+        queue_depth=0, capacity=0, avg_hold_seconds=10.0
+    ) == 60
+
+
+def test_saturation_retry_after_bounded_floor():
+    """Low pressure returns the floor (regression-compatible at low load)."""
+    result = saturation_retry_after(
+        queue_depth=0, capacity=4, avg_hold_seconds=1.0
+    )
+    assert result == 5  # ceil(1×1/4)=1, but floored at 5
+
+
+def test_saturation_retry_after_bounded_cap():
+    """Extreme pressure is capped at 60."""
+    result = saturation_retry_after(
+        queue_depth=100, capacity=1, avg_hold_seconds=30.0
+    )
+    assert result == 60  # ceil(101×30/1)=3030, but capped at 60
+
+
+def test_saturation_retry_after_plus_one_includes_retrying_client():
+    """The +1 is the retrying client rejoining the back of the queue."""
+    # queue_depth=0, capacity=1, avg_hold=10 → ceil(1×10/1) = 10
+    assert saturation_retry_after(
+        queue_depth=0, capacity=1, avg_hold_seconds=10.0
+    ) == 10
+
+
+def test_saturation_retry_after_monotone_in_queue_depth():
+    """Non-decreasing in queue_depth for fixed capacity and avg_hold."""
+    prev = saturation_retry_after(
+        queue_depth=0, capacity=3, avg_hold_seconds=7.0
+    )
+    for qd in range(1, 50):
+        val = saturation_retry_after(
+            queue_depth=qd, capacity=3, avg_hold_seconds=7.0
+        )
+        assert val >= prev
+        prev = val
+
+
+def test_saturation_retry_after_monotone_in_avg_hold():
+    """Non-decreasing in avg_hold_seconds for fixed queue_depth and capacity."""
+    prev = saturation_retry_after(
+        queue_depth=5, capacity=3, avg_hold_seconds=0.1
+    )
+    for hold in (0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0):
+        val = saturation_retry_after(
+            queue_depth=5, capacity=3, avg_hold_seconds=hold
+        )
+        assert val >= prev
+        prev = val
+
+
+def test_saturation_retry_after_bounded_for_all_inputs():
+    """Result is always in [floor, cap] for any non-negative inputs."""
+    for qd in range(0, 200, 10):
+        for cap in range(1, 20):
+            for hold in (0.0, 0.1, 1.0, 5.0, 10.0, 30.0, 60.0, 100.0):
+                result = saturation_retry_after(
+                    queue_depth=qd, capacity=cap, avg_hold_seconds=hold
+                )
+                assert 5 <= result <= 60
+
+
+def test_saturation_retry_after_custom_floor_and_cap():
+    """Custom floor and cap bounds are respected."""
+    result = saturation_retry_after(
+        queue_depth=0, capacity=4, avg_hold_seconds=1.0, floor=3, cap=30
+    )
+    assert result == 3
+
+    result = saturation_retry_after(
+        queue_depth=100, capacity=1, avg_hold_seconds=100.0, floor=3, cap=30
+    )
+    assert result == 30

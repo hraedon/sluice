@@ -330,3 +330,71 @@ async def test_acquire_timeout_zero_fast_path():
     assert await gate.acquire(timeout=0.1) is True
     assert await gate.acquire(timeout=0) is False
     assert gate.held == 1
+
+
+# ---------------------------------------------------------------------------
+# Plan 013 WI-001: Hold-time sampling
+# ---------------------------------------------------------------------------
+
+
+async def test_hold_seconds_sampled_on_release():
+    """When hold_seconds is passed to release(), it is sampled."""
+    gate = PermitGate(initial_capacity=1)
+
+    await gate.acquire(timeout=0.1)
+    assert gate.avg_hold_seconds == 0.0  # cold — no samples yet
+
+    await gate.release(hold_seconds=3.5)
+    assert gate.avg_hold_seconds == 3.5
+
+
+async def test_hold_seconds_none_not_sampled():
+    """When hold_seconds is None (default), nothing is sampled."""
+    gate = PermitGate(initial_capacity=1)
+
+    await gate.acquire(timeout=0.1)
+    await gate.release()  # hold_seconds defaults to None
+    assert gate.avg_hold_seconds == 0.0  # still cold
+
+
+async def test_hold_seconds_averaged():
+    """Multiple hold samples are averaged."""
+    gate = PermitGate(initial_capacity=1)
+
+    for hold in (2.0, 4.0, 6.0):
+        await gate.acquire(timeout=0.1)
+        await gate.release(hold_seconds=hold)
+
+    assert gate.avg_hold_seconds == 4.0  # (2+4+6)/3
+
+
+async def test_hold_seconds_window_eviction():
+    """Hold samples are capped at wait_window — oldest evicted."""
+    gate = PermitGate(initial_capacity=1, wait_window=3)
+
+    for hold in (1.0, 2.0, 3.0, 4.0):
+        await gate.acquire(timeout=0.1)
+        await gate.release(hold_seconds=hold)
+
+    # Window=3 → [2.0, 3.0, 4.0] (1.0 evicted)
+    assert gate.avg_hold_seconds == 3.0  # (2+3+4)/3
+
+
+async def test_hold_seconds_mixed_with_unsampled():
+    """Unsampled releases (hold_seconds=None) don't perturb the average."""
+    gate = PermitGate(initial_capacity=1)
+
+    await gate.acquire(timeout=0.1)
+    await gate.release(hold_seconds=5.0)
+
+    # An unsampled release — should not add a 0.0 sample
+    await gate.acquire(timeout=0.1)
+    await gate.release()  # hold_seconds=None
+
+    assert gate.avg_hold_seconds == 5.0  # unchanged
+
+
+async def test_hold_seconds_zero_when_empty():
+    """avg_hold_seconds is 0.0 when no samples exist."""
+    gate = PermitGate(initial_capacity=1)
+    assert gate.avg_hold_seconds == 0.0

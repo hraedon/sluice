@@ -158,6 +158,16 @@ the provider is imperfect.
 - Fairness beyond FIFO. Home-lab scale; a single FIFO queue across clients is enough.
   Per-client weighting is a possible later extension, explicitly out of the first build.
 - Model routing / failover. One upstream, passthrough only.
+- **`notify_all` → `notify(1)` FIFO handoff.** The release-side `notify_all` wakes all
+  waiters to race for (typically) one permit — a scramble, not FIFO, and retries don't
+  keep their place in line. Rejected: with QoS reserve classes (Plan 005 WI-002), a
+  single wakeup can land on a waiter whose class cannot use the freed permit → lost
+  wakeup. `notify_all` is the *safe* choice, and the scramble cost at home-lab queue
+  depths is nil.
+- **Per-client escalation state.** Server-side escalating backoff would need per-client
+  retry tracking. Clients already own escalation (SDK exponential backoff); an honest
+  global pressure signal composes with it. Stateless server, stateful client.
+- **Feeding wait/hold samples into permit math.** "Never a control input" stands.
 
 ## 7. Fairness and head-of-line blocking
 
@@ -231,3 +241,68 @@ tightens the gate. But precision is reduced off umans — sluice reacts to
 429s *after* they happen rather than preventing them via ground-truth
 reconciliation. Phantom absorption is umans-specific and requires
 `concurrent_sessions` from `/v1/usage`.
+
+## 10. Backpressure honesty — the Retry-After contract
+
+When sluice returns a `503`, it carries a `Retry-After` header and a matching
+`retry_after` field in the JSON body. Each `reason` has a distinct contract:
+
+| reason | What happened | Retry-After promise | Jittered? |
+|---|---|---|---|
+| **saturated** (queue-timeout) | Permits > 0 but all held; the request waited the full `queue_timeout` and lost. | Pressure-derived: `ceil((queue_depth + 1) × avg_hold_seconds / capacity)`, ±15 %, clamped to `[5, 60]`. | Yes — load estimate, not a deadline. |
+| **saturated** (structural, `_last_permits == 0`) | The reconcile loop set permits to 0 (e.g. phantoms ate all). Nothing can change until the next poll. | `max(pressure_estimate, ceil(poll_interval))`, ±15 %, clamped to `[max(5, ceil(poll_interval)), 60]`. | Yes. |
+| **boxed** | Account paused by the provider (`boxed_until`, reason ≠ `rate_limited`). | `ceil(resets_at - now)`, floored at 30 s. | No — a deadline. |
+| **breaker** | Circuit breaker open after sustained 429s. | Remaining breaker cooldown. | No — a deadline. |
+| **not_ready** | First usage poll not yet completed. | `max(2, ceil(poll_interval))` — tracks configuration. | No. |
+| **draining** / **not_leader** | Instance is shutting down / not the singleton leader. | Short constant (5 s) — the honest value is unknowable (routing concern). | No. |
+
+### Why the saturated value is pressure-derived
+
+The old fixed `Retry-After: 5` was worse than sending nothing: the Anthropic and OpenAI
+SDKs do exponential backoff with jitter by default, but when a plausible `Retry-After`
+header is present they use it *verbatim instead* — so the fixed header flattened every
+client's built-in escalating backoff into a constant 5-second hammer. Under sustained
+saturation the observed behaviour was exactly that: retry, re-queue, burn another
+`queue_timeout`, 503, retry in 5, repeat.
+
+The honest signal is forward-looking queue pressure:
+
+```
+expected_wait ≈ (queue_depth + 1) × avg_hold_seconds / capacity
+```
+
+The `+1` is the retrying client itself rejoining the back of the scramble. Hold-time
+sampling (acquire→release duration) is the missing observation, added symmetrically to
+the existing wait sampler. The estimate is floored at 5 s so it can never promise a
+*faster* retry than today, and capped at 60 s — both major SDKs ignore a `Retry-After`
+above ~60 s and fall back to exponential backoff. A cap the client discards is not
+honesty, it's noise.
+
+`boxed` may still exceed 60 s — its value is genuinely the window reset and the body
+carries it for sophisticated clients. Document the SDK-cap interplay rather than
+distort it.
+
+### Why jitter
+
+SDKs apply `Retry-After` verbatim with no client-side jitter. A shared exact value
+marches every rejected client back in a synchronized wave — retry storm, re-saturation,
+repeat. The ±15 % jitter spreads returns across a window. `boxed`/`breaker` values stay
+unjittered — they are deadlines, not load estimates.
+
+### Why not the existing queue-wait stats
+
+`PermitGate.avg_wait_seconds` / `p95_wait_seconds` sample only requests that blocked
+**and were eventually granted** — every sample is below `queue_timeout` by construction.
+The client receiving a saturated 503 is precisely one whose true wait *exceeded*
+`queue_timeout`; at the moment we stamp the header, those stats systematically
+underestimate. Their docstring already says "never a control input" — the pressure
+estimator keeps that true and documents *why*.
+
+### Client reality (SDK cap verification)
+
+The 60-second cap is based on the public behavior of the Anthropic and OpenAI Python
+SDKs. The Anthropic SDK's retry logic parses `Retry-After` and uses it, but caps the
+maximum retry wait. The OpenAI SDK similarly honors `Retry-After` with an internal
+maximum. **These caps should be verified against the pinned SDK versions the actual
+clients use** (Claude Code, hermes, opencode, open-webui) — if a client ignores the
+header entirely, its behavior is unchanged and that's worth knowing too.

@@ -1002,3 +1002,146 @@ async def test_record_response_headers_works_before_stop():
     loop.record_response_headers({"x-ratelimit-limit": "100"}, 200)
     assert len(tracking.record_calls) == 1
     assert tracking.record_calls[0][0] == {"x-ratelimit-limit": "100"}
+
+
+# ---------------------------------------------------------------------------
+# Plan 013 WI-003: saturation_retry_after — shell-side jittered estimator
+# ---------------------------------------------------------------------------
+
+
+def _make_loop_with_hold(
+    *,
+    queue_depth: int = 0,
+    capacity: int = 4,
+    avg_hold: float = 0.0,
+    permits: int = 3,
+    poll_interval: float = 5.0,
+    rng=None,
+):
+    """Build a loop with pre-populated gate hold samples and queue depth."""
+    from collections import deque
+
+    gate = PermitGate(initial_capacity=capacity)
+    # Populate hold samples by direct injection.
+    if avg_hold > 0:
+        gate._hold_samples = deque([avg_hold] * 10, maxlen=64)
+    # Simulate queue depth by setting _waiters.
+    gate._waiters = queue_depth
+
+    client = FakeUsageClient(_reading(concurrent_sessions=0))
+    loop = ReconciliationLoop(
+        truth_source=client,
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BCFG,
+        poll_interval=poll_interval,
+        monotonic_clock=lambda: 1000.0,
+        wall_clock=lambda: 1_000_000.0,
+        rng=rng or (lambda: 0.5),  # pinned mid-range by default
+    )
+    loop._first_poll_ok = True
+    loop._last_permits = permits
+    return loop, gate
+
+
+def test_saturation_retry_after_deep_queue_larger_than_shallow():
+    """A deeper queue yields a larger saturation Retry-After."""
+    shallow, _ = _make_loop_with_hold(
+        queue_depth=1, capacity=4, avg_hold=10.0, rng=lambda: 0.5
+    )
+    deep, _ = _make_loop_with_hold(
+        queue_depth=10, capacity=4, avg_hold=10.0, rng=lambda: 0.5
+    )
+    assert deep.saturation_retry_after() > shallow.saturation_retry_after()
+
+
+def test_saturation_retry_after_low_pressure_returns_floor():
+    """Idle/low-pressure saturation returns the floor (regression-compatible)."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=0, capacity=4, avg_hold=1.0, rng=lambda: 0.5
+    )
+    # ceil(1×1/4)=1, jittered: 1*1.0=1.0 → ceil=1, floored at 5
+    assert loop.saturation_retry_after() == 5
+
+
+def test_saturation_retry_after_no_hold_samples_returns_floor():
+    """No hold samples yet → floor (fail safe)."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=5, capacity=4, avg_hold=0.0, rng=lambda: 0.5
+    )
+    assert loop.saturation_retry_after() == 5
+
+
+def test_saturation_retry_after_jitter_bounds_pinned_rng():
+    """Jitter bounds hold with a pinned RNG."""
+    # rng=0.0 → jitter factor = 0.85 (minimum)
+    loop_min, _ = _make_loop_with_hold(
+        queue_depth=3, capacity=2, avg_hold=10.0, rng=lambda: 0.0
+    )
+    # rng=1.0 → jitter factor = 1.15 (maximum)
+    loop_max, _ = _make_loop_with_hold(
+        queue_depth=3, capacity=2, avg_hold=10.0, rng=lambda: 1.0
+    )
+    # Pure estimate: ceil(4×10/2) = 20
+    # Min jitter: ceil(20*0.85) = ceil(17.0) = 17
+    # Max jitter: ceil(20*1.15) = ceil(23.0) = 23
+    assert loop_min.saturation_retry_after() == 17
+    assert loop_max.saturation_retry_after() == 23
+
+
+def test_saturation_retry_after_capped_at_60():
+    """Extreme pressure is capped at 60."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=100, capacity=1, avg_hold=30.0, rng=lambda: 1.0
+    )
+    assert loop.saturation_retry_after() == 60
+
+
+def test_saturation_retry_after_floored_at_5():
+    """Low estimate is floored at 5 even with minimum jitter."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=0, capacity=4, avg_hold=2.0, rng=lambda: 0.0
+    )
+    # Pure: ceil(1×2/4)=1, jittered: ceil(1*0.85)=1, floored at 5
+    assert loop.saturation_retry_after() == 5
+
+
+def test_saturation_hint_is_unjittered():
+    """saturation_hint returns the pure estimator output (no jitter)."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=3, capacity=2, avg_hold=10.0, rng=lambda: 0.0
+    )
+    # Pure: ceil(4×10/2) = 20
+    assert loop.saturation_hint == 20
+
+
+def test_retry_after_seconds_saturated_never_below_poll_interval():
+    """Flavour (b): structurally saturated never advertises below the poll interval."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=0, capacity=4, avg_hold=0.1, permits=0,
+        poll_interval=10.0, rng=lambda: 0.0
+    )
+    # Pure estimate: ceil(1×0.1/4) = 1, floored at 5
+    # max(5, ceil(10)) = 10 — poll_floor = max(5, 10) = 10
+    # jittered: ceil(10 * 0.85) = ceil(8.5) = 9, but clamped to poll_floor=10 → 10
+    assert loop.retry_after_seconds() >= 10  # poll interval is the floor before jitter
+
+
+def test_retry_after_seconds_open_returns_floor():
+    """When the gate is open (permits > 0), retry_after is the floor."""
+    loop, _ = _make_loop_with_hold(
+        queue_depth=0, capacity=4, avg_hold=0.0, permits=3
+    )
+    assert loop.retry_after_seconds() == 5
+
+
+def test_saturation_retry_after_header_and_body_match():
+    """The header and body carry the same post-jitter value."""
+    # This is verified at the proxy level — here we verify the method returns
+    # a single int that would be used for both.
+    loop, _ = _make_loop_with_hold(
+        queue_depth=3, capacity=2, avg_hold=10.0, rng=lambda: 0.5
+    )
+    result = loop.saturation_retry_after()
+    assert isinstance(result, int)
+    assert 5 <= result <= 60

@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import random
 import time
 from collections import deque
 from collections.abc import Callable
@@ -43,6 +44,7 @@ from sluice.control import (
     effective_permits,
     is_hard_boxed,
     phantom_estimate,
+    saturation_retry_after,
     validate_target_override,
 )
 from sluice.gate import PermitGate
@@ -55,6 +57,9 @@ from sluice.usage import CachedReading
 log = logging.getLogger("sluice.reconcile")
 
 _RETRY_AFTER_STALE_CAP = 300
+_RETRY_AFTER_SATURATION_FLOOR = 5
+_RETRY_AFTER_SATURATION_CAP = 60
+RETRY_AFTER_SHORT = 5  # unknowable-timing default (draining, not_leader)
 _PRUNE_INTERVAL_TICKS = 60
 _DEFAULT_HISTORY_TTL = 604800.0
 _REQ_TS_MAXLEN = 10000  # safety cap for local request-timestamp deque
@@ -83,6 +88,7 @@ class ReconciliationLoop:
         history: History | None = None,
         history_store: HistoryStore | None = None,
         history_ttl: float = _DEFAULT_HISTORY_TTL,
+        rng: Callable[[], float] = random.random,
     ) -> None:
         self._truth = truth_source
         self._gate = gate
@@ -99,6 +105,7 @@ class ReconciliationLoop:
         self._history_store = history_store
         self._history_ttl = history_ttl
         self._tick_count = 0
+        self._rng = rng
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
@@ -581,6 +588,46 @@ class ReconciliationLoop:
         return self._gate.p95_wait_seconds
 
     @property
+    def avg_hold_seconds(self) -> float:
+        """Mean hold duration (acquire→release) from the gate (Plan 013 WI-001)."""
+        return self._gate.avg_hold_seconds
+
+    @property
+    def saturation_hint(self) -> int:
+        """Un-jittered saturation Retry-After estimate (Plan 013 WI-002/WI-005).
+
+        The current pure-estimator output before jitter is applied.
+        Used for /status.json and /metrics so operators see the trend,
+        not the per-response jitter.
+        """
+        return saturation_retry_after(
+            queue_depth=self._gate.queue_depth,
+            capacity=self._gate.capacity,
+            avg_hold_seconds=self._gate.avg_hold_seconds,
+            floor=_RETRY_AFTER_SATURATION_FLOOR,
+            cap=_RETRY_AFTER_SATURATION_CAP,
+        )
+
+    def saturation_retry_after(self) -> int:
+        """Pressure-derived, jittered Retry-After for saturated 503s (Plan 013 WI-003).
+
+        Feeds the pure estimator (``control.saturation_retry_after``) from live
+        gate pressure (``queue_depth`` / ``capacity`` / ``avg_hold_seconds``),
+        then applies ±15 % jitter so rejected clients don't return in a
+        synchronized wave.  Clamped to ``[5, 60]``.
+
+        Called by the proxy's queue-timeout 503 path (flavour a).  This path
+        can fire while ``gate_closed_reason()`` is ``"open"`` — do not dispatch
+        on the reason here.
+        """
+        estimate = self.saturation_hint
+        jittered = estimate * (0.85 + self._rng() * 0.30)
+        return max(
+            _RETRY_AFTER_SATURATION_FLOOR,
+            min(_RETRY_AFTER_SATURATION_CAP, math.ceil(jittered)),
+        )
+
+    @property
     def queue_timeouts(self) -> int:
         return self._gate.queue_timeouts
 
@@ -715,8 +762,19 @@ class ReconciliationLoop:
         - **boxed:** ``ceil(resets_at - now)``, floored at 30 s.
           When the reading is stale (``ok=False``), capped at 300 s — a stale
           ``resets_at`` could be hours in the future and mislead clients.
-        - **breaker:** remaining cooldown.
-        - **saturated / open:** short default (5 s).
+          Unjittered — a deadline, not a load estimate.
+        - **breaker:** remaining cooldown.  Unjittered — a deadline.
+        - **saturated** (``_last_permits == 0``): ``max(estimator, ceil(poll_interval))``,
+          then ±15 % jitter, clamped to ``[max(5, ceil(poll_interval)), 60]``.
+          Nothing can change until the reconcile loop next resizes, so the poll
+          cadence is the floor.  (The proxy's not_ready path also tracks the
+          poll interval: ``max(2, ceil(poll_interval))``.)
+        - **open:** ``_RETRY_AFTER_SATURATION_FLOOR`` (5 s).  The gate is open;
+          this is a fallback, not a pressure estimate.
+        - **draining / not_leader:** ``_RETRY_AFTER_SHORT`` (5 s).
+          The honest value is genuinely unknowable — the retry should land on a
+          replacement instance / the leader.  A short constant is kept because
+          the routing concern dominates the timing one.
         """
         reason = self.gate_closed_reason()
         if reason == "boxed":
@@ -734,5 +792,17 @@ class ReconciliationLoop:
                 elapsed = self._mono() - self._breaker.opened_at
                 cooldown_remaining = self._brk_cfg.cooldown_seconds - elapsed
                 return max(1, math.ceil(cooldown_remaining))
-            return 5
-        return 5  # saturated or open
+            return RETRY_AFTER_SHORT
+        if reason == "saturated":
+            # Flavour (b): structurally saturated — nothing can change until
+            # the reconcile loop next resizes, so the poll cadence is the floor.
+            # The cap always wins over the poll floor — a value above 60 s
+            # would be discarded by the SDK (noise, not honesty).
+            poll_floor = min(
+                _RETRY_AFTER_SATURATION_CAP,
+                max(_RETRY_AFTER_SATURATION_FLOOR, math.ceil(self._poll_interval)),
+            )
+            estimate = max(self.saturation_hint, poll_floor)
+            jittered = estimate * (0.85 + self._rng() * 0.30)
+            return max(poll_floor, min(_RETRY_AFTER_SATURATION_CAP, math.ceil(jittered)))
+        return _RETRY_AFTER_SATURATION_FLOOR  # open
