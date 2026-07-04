@@ -38,6 +38,7 @@ class StatusSnapshot:
     recent_429s: int
     total_429s: int
     gateway_429s: int
+    rate_limit_429s: int
 
     # Operational
     target: int
@@ -87,6 +88,7 @@ class StatusSnapshot:
             "recent_429s": self.recent_429s,
             "total_429s": self.total_429s,
             "gateway_429s": self.gateway_429s,
+            "rate_limit_429s": self.rate_limit_429s,
             "target": self.target,
             "queue_depth": self.queue_depth,
             "local_in_flight": self.local_in_flight,
@@ -137,6 +139,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         recent_429s=reconcile.recent_429_count,
         total_429s=reconcile.total_429s,
         gateway_429s=reconcile.gateway_429s,
+        rate_limit_429s=reconcile.rate_limit_429s,
         target=reconcile.target,
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
@@ -190,8 +193,9 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_observed_sessions", "Provider-reported concurrent sessions", snap.concurrent_sessions)
     gauge("sluice_phantom_estimate", "Windowed phantom estimate (sustained excess)", snap.phantom_estimate)
     gauge("sluice_recent_429s", "Recent 429 count (within breaker window)", snap.recent_429s)
-    gauge("sluice_total_429s", "Total 429s since startup", snap.total_429s)
+    gauge("sluice_total_429s", "Total concurrency 429s since startup (excludes rate-limit and gateway)", snap.total_429s)
     gauge("sluice_gateway_429s", "Upstream 429s from CDN/gateway (not fed to breaker)", snap.gateway_429s)
+    gauge("sluice_rate_limit_429s", "Upstream 429s classified as rate-limit (fed to breaker, tracked separately)", snap.rate_limit_429s)
     gauge(
         "sluice_breaker_half_open_age_seconds",
         "Seconds since breaker entered HALF_OPEN (None if not half-open)",

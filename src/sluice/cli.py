@@ -51,6 +51,7 @@ _DEFAULTS: dict[str, Any] = {
     "history_store": None,
     "history_ttl": 604800.0,
     "singleton_guard": "noop",
+    "drain_timeout": 25.0,
 }
 
 
@@ -71,7 +72,7 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 def _coerce(env_val: str, key: str) -> Any:
     if key in ("target", "history_size"):
         return int(env_val)
-    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl"):
+    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout"):
         return float(env_val)
     return env_val
 
@@ -125,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--history-store", default=None, help="path to SQLite file for history persistence (default: none — in-memory only). Survives restarts; enables crash forensics.")
     serve.add_argument("--history-ttl", type=float, default=None, help="seconds to retain entries in the SQLite store before pruning (default: 604800 = 7 days)")
     serve.add_argument("--singleton-guard", default=None, choices=["noop", "kube-lease"], help="singleton guard mode (default: noop; env: SLUICE_SINGLETON_GUARD)")
+    serve.add_argument("--drain-timeout", type=float, default=None, help="seconds to wait for in-flight requests on shutdown before closing upstream (default: 25)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -164,6 +166,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     release_cooldown = _resolve("release_cooldown", args)
     queue_timeout = _resolve("queue_timeout", args)
     retry_interval = _resolve("retry_interval", args)
+    drain_timeout = _resolve("drain_timeout", args)
     usage_key_env = _resolve("usage_key_env", args)
     usage_auth_header = _resolve("usage_auth_header", args)
     log_level = _resolve("log_level", args)
@@ -181,6 +184,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     if history_store_path and history_ttl is not None and history_ttl <= 0:
         print("sluice: error: --history-ttl must be positive", file=sys.stderr)
+        return 2
+
+    if drain_timeout is not None and drain_timeout < 0:
+        print("sluice: error: --drain-timeout must be >= 0", file=sys.stderr)
         return 2
 
     reserve_count = 0
@@ -290,6 +297,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         admin_token=admin_token,
         retry_interval=retry_interval,
         reserved_labels=reserved_labels,
+        drain_timeout=drain_timeout,
     )
 
     log.info("sluice %s starting", __version__)
@@ -302,6 +310,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     log.info("  release_cooldown:  %.1fs", release_cooldown)
     log.info("  queue_timeout:     %.1fs", queue_timeout)
     log.info("  retry_interval:    %.1fs", retry_interval)
+    log.info("  drain_timeout:     %.1fs", drain_timeout)
     if provider.needs_usage_key:
         log.info("  usage_key_env:     %s", usage_key_env)
         log.info("  usage_auth_header: %s", usage_auth_header)

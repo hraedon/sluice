@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 from collections.abc import AsyncIterator, Mapping
 
 import httpx
@@ -40,6 +39,7 @@ from sluice.admin import (
     serve_static,
 )
 from sluice.gate import PermitGate
+from sluice.lifecycle import LifecycleManager
 from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import SingletonGuard
 
@@ -75,6 +75,7 @@ _STRIP_REQUEST = _HOP_BY_HOP | _CONTROL_HEADERS | frozenset({"host"})
 _QUEUE_TIMEOUT_DEFAULT = 30.0
 _RETRY_AFTER_DEFAULT = 5
 _RETRY_ACQUIRE_INTERVAL = 10.0
+_DRAIN_TIMEOUT_DEFAULT = 25.0
 _RESERVED_LABEL = "interactive"
 
 # Headers that indicate a CDN/gateway layer, not the upstream application.
@@ -102,17 +103,23 @@ def _classify_429(
 
     1. **gateway** — CDN/gateway headers are present (``cf-ray``, ``server:
        cloudflare``, etc.).  The 429 was rejected at the edge, not by the
-       upstream's concurrency enforcement.  Tracked separately, not fed to
-       the breaker (WI-024).
+       upstream's concurrency enforcement.  Tracked separately, not fed
+       to the breaker (WI-024).
 
-    2. **concurrency** — no retry-after or retry-after <= 0.  Fed to the
-       breaker (fail-safe: ambiguous values default to concurrency).
+    2. **concurrency** — no retry-after or retry-after <= 0.
 
-    3. **rate_limit** — retry-after > 0.  Not fed to the breaker.
+    3. **rate_limit** — retry-after > 0.
 
-    Per AGENTS.md rule 1 (fail safe), any unparseable or ambiguous value
-    is treated as concurrency — tightening the gate rather than assuming
-    a rate-limit window.
+    .. warning::
+
+       The retry-after heuristic is **unreliable** for distinguishing
+       concurrency from rate-limit.  Capture 2026-07-03
+       (docs/wi-024-429-capture) proved umans sends ``retry_after=1`` on
+       genuine concurrency 429s — they are classified as ``rate_limit``
+       here.  Both ``concurrency`` and ``rate_limit`` are fed to the
+       breaker in the proxy (the distinction is for telemetry only).
+       Per AGENTS.md rule 1 (fail safe), any unparseable or ambiguous
+       value is treated as concurrency.
     """
     # 1. CDN/gateway detection (conservative: only known CDN headers).
     for cdn_header in _CDN_HEADERS:
@@ -123,23 +130,14 @@ def _classify_429(
         if cdn_server in server:
             return "gateway"
 
-    # 2. Retry-after heuristic (unchanged from _is_concurrency_429).
+    # 2. Retry-after heuristic: no retry-after or retry-after <= 0 means
+    #    concurrency rejection (fail-safe: ambiguous values default here).
     if retry_after is None:
         return "concurrency"
     try:
         return "concurrency" if int(retry_after.strip()) <= 0 else "rate_limit"
     except (ValueError, TypeError):
         return "concurrency"
-
-
-def _is_concurrency_429(retry_after: str | None) -> bool:
-    """Backward-compatible wrapper — prefer _classify_429 for three-way."""
-    if retry_after is None:
-        return True
-    try:
-        return int(retry_after.strip()) <= 0
-    except (ValueError, TypeError):
-        return True
 
 
 class ProxyApp:
@@ -157,6 +155,7 @@ class ProxyApp:
         admin_token: str | None = None,
         retry_interval: float = _RETRY_ACQUIRE_INTERVAL,
         reserved_labels: set[str] | None = None,
+        drain_timeout: float = _DRAIN_TIMEOUT_DEFAULT,
     ) -> None:
         self._upstream = upstream_base_url.rstrip("/")
         self._gate = gate
@@ -166,15 +165,22 @@ class ProxyApp:
         self._owns_client = upstream_client is None
         self._guard = guard
         self._admin_token = admin_token
-        self._guard_acquired = False
         self._retry_interval = retry_interval
         self._build_sha = os.environ.get("SLUICE_BUILD_SHA") or None
-        self._acquire_retry_task: asyncio.Task[None] | None = None
         self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
+        self._lifecycle = LifecycleManager(
+            guard=guard,
+            reconcile=reconcile,
+            client=self._client,
+            owns_client=self._owns_client,
+            retry_interval=retry_interval,
+            gate=gate,
+            drain_timeout=drain_timeout,
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            await self._handle_lifespan(receive, send)
+            await self._lifecycle.handle_lifespan(receive, send)
             return
         if scope["type"] != "http":
             return
@@ -234,81 +240,22 @@ class ProxyApp:
 
         await self._proxy_request(scope, receive, send)
 
-    async def _handle_lifespan(self, receive: Receive, send: Send) -> None:
-        while True:
-            event = await receive()
-            if event["type"] == "lifespan.startup":
-                if self._guard is not None:
-                    acquired = await self._guard.acquire()
-                    if not acquired:
-                        log.warning("singleton guard acquire failed — starting as non-leader, will retry")
-                        self._acquire_retry_task = asyncio.create_task(self._retry_acquire())
-                    else:
-                        try:
-                            await self._guard.start_renewer()
-                            await self._reconcile.start()
-                        except Exception:
-                            log.warning(
-                                "singleton guard start failed after acquire — releasing lease, will retry",
-                                exc_info=True,
-                            )
-                            await self._guard.stop_renewer()
-                            await self._guard.release()
-                            self._acquire_retry_task = asyncio.create_task(self._retry_acquire())
-                        else:
-                            self._guard_acquired = True
-                else:
-                    await self._reconcile.start()
-                await send({"type": "lifespan.startup.complete"})
-            elif event["type"] == "lifespan.shutdown":
-                if self._acquire_retry_task is not None:
-                    self._acquire_retry_task.cancel()
-                    try:
-                        await self._acquire_retry_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._acquire_retry_task = None
-                await self._reconcile.stop()
-                if self._guard is not None:
-                    await self._guard.stop_renewer()
-                    if self._guard_acquired:
-                        await self._guard.release()
-                if self._owns_client:
-                    await self._client.aclose()
-                await send({"type": "lifespan.shutdown.complete"})
-                return
-
-    async def _retry_acquire(self) -> None:
-        """Periodically retry lease acquisition when the initial acquire failed."""
-        guard = self._guard
-        if guard is None:
-            return
-        while not self._guard_acquired:
-            # Jitter (±50%) so multiple non-leader pods retrying after a leader
-            # crash don't stampede the apiserver in lockstep.
-            await asyncio.sleep(self._retry_interval * (0.5 + random.random()))
-            try:
-                acquired = await guard.acquire()
-                if acquired:
-                    try:
-                        await guard.start_renewer()
-                        await self._reconcile.start()
-                    except Exception:
-                        log.warning(
-                            "singleton guard start failed after acquire — releasing lease, will retry",
-                            exc_info=True,
-                        )
-                        await guard.stop_renewer()
-                        await guard.release()
-                        continue
-                    self._guard_acquired = True
-                    log.info("singleton guard acquired on retry — becoming leader")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.warning("singleton guard retry acquire failed", exc_info=True)
-
     async def _proxy_request(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Draining fast-fail: during shutdown, refuse new requests so the
+        # drain loop can wait for in-flight to finish and close the upstream
+        # client cleanly.  uvicorn stops accepting new connections at the same
+        # time, but in-flight requests that already entered the ASGI app are
+        # still dispatched here.
+        if self._lifecycle.is_draining:
+            log.info("draining — fast-failing 503")
+            await send_json(
+                send,
+                503,
+                {"error": "draining", "reason": "draining", "retry_after": _RETRY_AFTER_DEFAULT},
+                retry_after=_RETRY_AFTER_DEFAULT,
+            )
+            return
+
         # Non-leader fast-fail: if the singleton guard is not held, refuse admission.
         if self._guard is not None and not self._guard.is_held():
             log.info("not leader — fast-failing 503")
@@ -367,6 +314,20 @@ class ProxyApp:
                 send,
                 503,
                 {"error": "concurrency limit reached", "reason": "saturated", "retry_after": _RETRY_AFTER_DEFAULT},
+                retry_after=_RETRY_AFTER_DEFAULT,
+            )
+            return
+
+        # Post-acquire drain check: the draining flag may have been set
+        # while this request was blocked on gate.acquire().  Release the
+        # permit immediately and fast-fail so the drain loop can proceed.
+        if self._lifecycle.is_draining:
+            await self._gate.release(reserved=reserved)
+            log.info("draining — fast-failing 503 (post-acquire)")
+            await send_json(
+                send,
+                503,
+                {"error": "draining", "reason": "draining", "retry_after": _RETRY_AFTER_DEFAULT},
                 retry_after=_RETRY_AFTER_DEFAULT,
             )
             return
@@ -482,32 +443,34 @@ class ProxyApp:
                 # or not the client is still connected, and dropping it would
                 # prevent the breaker from tripping (WI-019 fail-open).
                 #
-                # Only concurrency 429s should trip the breaker (WI-019).
-                # Heuristic: concurrency 429s (the kind that accumulate toward
-                # the box) do not include a retry-after header; rate-limit 429s
-                # (request-count window exhausted) do.  We inspect headers only
-                # (never the body) to classify.
+                # All non-CDN 429s feed the breaker.  The retry-after heuristic
+                # (_classify_429) distinguishes 'concurrency' (no/zero retry-after)
+                # from 'rate_limit' (positive retry-after) for logging and separate
+                # telemetry counters, but BOTH classifications feed the breaker.
+                #
+                # This is fail-safe: capture 2026-07-03 (docs/wi-024-429-capture)
+                # proved umans sends retry_after=1 on genuine concurrency 429s.
+                # The old heuristic classified these as rate_limit and skipped
+                # the breaker — the breaker stayed CLOSED right into a 5-hour
+                # box.  Feeding all non-CDN 429s ensures the breaker trips on
+                # sustained enforcement regardless of the retry-after value.
+                # The breaker threshold (5 in 5 minutes) prevents a single
+                # rate-limit event from tripping; sustained rate-limiting should
+                # trip it.
                 #
                 # Edge case: retry-after: 0 (or "00", " 0 ", etc.) means
                 # "retry immediately" — a transient concurrency signal, not a
                 # rate-limit window.  The string "0" is truthy in Python, so a
                 # naive ``not header`` check would silently skip breaker
-                # recording (fail-open).  _is_concurrency_429 handles this and
+                # recording (fail-open).  _classify_429 handles this and
                 # all other parse edge cases fail-safe.
                 #
-                # Assumption (unverified against umans API): if umans sends
-                # a non-zero retry-after on concurrency 429s, the breaker will
-                # silently stop tripping — a fail-open.  The reconciliation
-                # loop's phantom absorption provides a backstop (sustained
-                # overload shrinks the gate regardless), but if this heuristic
-                # is wrong the breaker's fast trip is defeated.  Revisit when
-                # a real concurrency 429 is observed live.
-                #
                 # Monitoring hook (WI-024): classify every 429 as
-                # 'concurrency' (feed breaker), 'rate_limit' (skip), or
-                # 'gateway' (CDN/gateway rejection — tracked separately, not
-                # fed to the breaker).  Logs the classification and server
-                # header so CDN-originated 429s are visible.
+                # 'concurrency' (feed breaker), 'rate_limit' (also feed breaker,
+                # tracked separately), or 'gateway' (CDN/gateway rejection —
+                # tracked separately, NOT fed to the breaker).  Logs the
+                # classification and server header so CDN-originated 429s are
+                # visible.
                 if response.status_code == 429:
                     retry_after_raw = response.headers.get("retry-after")
                     classification = _classify_429(retry_after_raw, response.headers)
@@ -516,11 +479,21 @@ class ProxyApp:
                         retry_after_raw,
                         classification,
                         response.headers.get("server"),
+                        extra={
+                            "retry_after": retry_after_raw,
+                            "classification": classification,
+                            "upstream_server": response.headers.get("server"),
+                        },
                     )
                     if classification == "concurrency":
                         self._reconcile.record_429()
+                    elif classification == "rate_limit":
+                        self._reconcile.record_rate_limit_429()
                     elif classification == "gateway":
                         self._reconcile.record_gateway_429()
+                    else:
+                        log.warning("unknown 429 classification: %s — feeding breaker", classification)
+                        self._reconcile.record_429()
 
                 # WI-004: Feed response headers to the truth source.
                 # For polled truth (umans) this is a no-op; for header truth

@@ -104,6 +104,7 @@ class ReconciliationLoop:
         self._recent_429s: deque[float] = deque()
         self._total_429s = 0
         self._total_gateway_429s = 0
+        self._total_rate_limit_429s = 0
 
         self._phantom_samples: deque[tuple[int, int]] = deque(
             maxlen=controller_config.phantom_window
@@ -217,6 +218,31 @@ class ReconciliationLoop:
         enforcement).  Tracked separately — does NOT feed the breaker (WI-024).
         """
         self._total_gateway_429s += 1
+
+    def record_rate_limit_429(self) -> None:
+        """A rate-limit 429 was received from the upstream (positive retry-after).
+
+        Fed to the breaker because the retry-after heuristic is unreliable for
+        distinguishing concurrency from rate-limit (capture 2026-07-03: umans
+        sends ``retry_after=1`` on concurrency 429s, which the heuristic
+        misclassifies as rate-limit).  Sustained rate-limiting is a backoff
+        signal regardless — the breaker threshold (5 in 5 minutes) prevents
+        a single event from tripping, but sustained rate-limiting should
+        trip it.
+
+        Tracked in a separate counter for telemetry so ``total_429s`` remains
+        concurrency-only.
+        """
+        now = self._mono()
+        self._recent_429s.append(now)
+        self._total_rate_limit_429s += 1
+        self._prune_429s(now)
+        self._breaker = breaker_on_429(
+            self._breaker,
+            self._recent_429s,
+            now=now,
+            config=self._brk_cfg,
+        )
 
     def record_success(self) -> None:
         """An upstream request completed normally."""
@@ -377,6 +403,7 @@ class ReconciliationLoop:
                 stale=not cached.ok,
                 recent_429s=len(self._recent_429s),
                 total_429s=self._total_429s,
+                rate_limit_429s=self._total_rate_limit_429s,
                 queue_depth=self._gate.queue_depth,
                 queue_timeouts=self._gate.queue_timeouts,
                 requests_in_window=reading.requests_in_window if cached.ok else None,
@@ -449,6 +476,7 @@ class ReconciliationLoop:
             stale=True,
             recent_429s=len(self._recent_429s),
             total_429s=self._total_429s,
+            rate_limit_429s=self._total_rate_limit_429s,
             queue_depth=self._gate.queue_depth,
             queue_timeouts=self._gate.queue_timeouts,
             requests_in_window=reading.requests_in_window if reading else None,
@@ -509,6 +537,10 @@ class ReconciliationLoop:
     @property
     def gateway_429s(self) -> int:
         return self._total_gateway_429s
+
+    @property
+    def rate_limit_429s(self) -> int:
+        return self._total_rate_limit_429s
 
     @property
     def recent_429_count(self) -> int:

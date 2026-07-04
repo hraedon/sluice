@@ -69,6 +69,7 @@ src/sluice/
   usage.py     # /v1/usage client + parser (borrows usage-dashboard's umans logic)
   providers.py # provider registry: truth sources + controller choice per upstream
   proxy.py     # async reverse proxy shell (streaming, both routes, disconnect→cancel)
+  lifecycle.py # ASGI lifespan + singleton lease management (startup/shutdown, retry)
   admin.py     # admin route handlers: health, ready, status, metrics, history, dashboard, static
   gate.py      # resizable permit gate (FIFO queue, optional QoS reserve)
   reconcile.py # background loop: fetch truth → core decides → resize gate

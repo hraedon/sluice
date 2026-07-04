@@ -17,7 +17,7 @@ import pytest
 
 from sluice.control import BreakerConfig, ControllerConfig, UsageReading
 from sluice.gate import PermitGate
-from sluice.proxy import ProxyApp, _classify_429, _is_concurrency_429
+from sluice.proxy import ProxyApp, _classify_429
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
@@ -505,12 +505,13 @@ async def test_429_reported_to_reconcile():
 
 
 async def test_429_with_retry_after_not_recorded_as_concurrency():
-    """A 429 with a non-zero retry-after is classified as rate-limit, not concurrency.
+    """A 429 with a non-zero retry-after is classified as rate_limit, not concurrency.
 
-    The breaker must not trip on rate-limit 429s — only on concurrency 429s.
-    This is the classification path the monitoring hook watches: if umans ever
-    sends a non-zero retry-after on a concurrency 429, this test documents the
-    expected (fail-open) behaviour and the log would show the regression.
+    Rate-limit 429s are tracked in a separate counter (``rate_limit_429s``)
+    but still feed the breaker — the retry-after heuristic is unreliable
+    (capture 2026-07-03: umans sends retry_after=1 on concurrency 429s).
+    A single rate-limit 429 must not trip the breaker (threshold=5), but
+    it counts toward ``recent_429s``.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -522,14 +523,17 @@ async def test_429_with_retry_after_not_recorded_as_concurrency():
         response = await client.post("/v1/messages", json={"prompt": "hi"})
 
     assert response.status_code == 429
-    assert reconcile.total_429s == 0, "rate-limit 429 (retry-after=60) must not trip the breaker"
+    assert reconcile.total_429s == 0, "rate-limit 429 must not increment concurrency counter"
+    assert reconcile.rate_limit_429s == 1, "rate-limit 429 must be tracked separately"
+    assert reconcile.recent_429_count == 1, "rate-limit 429 must feed the breaker window"
+    assert reconcile.breaker_state.value == "closed", "single rate-limit 429 must not trip breaker"
 
 
 async def test_429_with_zero_retry_after_recorded_as_concurrency():
     """A 429 with retry-after:0 is classified as concurrency (retry immediately).
 
     The string "0" is truthy in Python, so a naive ``not header`` check would
-    silently skip breaker recording (fail-open).  _is_concurrency_429 handles
+    silently skip breaker recording (fail-open).  _classify_429 handles
     this edge case.
     """
 
@@ -681,6 +685,92 @@ async def test_concurrency_429_still_trips_breaker():
 
     assert reconcile.total_429s == 3
     assert reconcile.gateway_429s == 0
+
+
+async def test_rate_limit_429_trips_breaker_when_sustained():
+    """Sustained rate-limit 429s trip the breaker (capture 2026-07-03 fix).
+
+    The retry-after heuristic is unreliable — umans sends retry_after=1 on
+    concurrency 429s.  Rate-limit 429s must feed the breaker so sustained
+    enforcement trips it, even if a single event doesn't.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "overloaded"}, headers={"retry-after": "1"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+    reconcile._brk_cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+
+    async with _asgi_client(app) as client:
+        for _ in range(3):
+            await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.rate_limit_429s == 3
+    assert reconcile.total_429s == 0, "rate-limit 429s must not increment concurrency counter"
+    assert reconcile.recent_429_count == 3
+    assert reconcile.breaker_state.value == "open", "sustained rate-limit 429s must trip the breaker"
+
+
+async def test_rate_limit_429_in_status_json():
+    """Rate-limit 429s are visible in /status.json."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "rate_limit"}, headers={"retry-after": "30"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+        response = await client.get("/status.json")
+
+    data = response.json()
+    assert data["rate_limit_429s"] == 1
+    assert data["total_429s"] == 0
+
+
+async def test_rate_limit_429_in_prometheus():
+    """Rate-limit 429s appear in /metrics as sluice_rate_limit_429s."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(429, json_data={"error": "rate_limit"}, headers={"retry-after": "30"})
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+        response = await client.get("/metrics")
+
+    assert "sluice_rate_limit_429s" in response.text
+
+
+async def test_mixed_concurrency_and_rate_limit_429s_trip_breaker():
+    """Both concurrency and rate_limit 429s share the breaker window.
+
+    2 concurrency 429s + 3 rate_limit 429s = 5 entries in recent_429s,
+    which should trip the breaker (threshold=5).  The counters stay separate
+    but the breaker window is shared.
+    """
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        # First 2: no retry-after (concurrency), next 3: retry-after=1 (rate_limit)
+        if call_count <= 2:
+            return _resp(429, json_data={"error": "concurrency"})
+        return _resp(429, json_data={"error": "overloaded"}, headers={"retry-after": "1"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+    reconcile._brk_cfg = BreakerConfig(threshold=5, window_seconds=300.0, cooldown_seconds=60.0)
+
+    async with _asgi_client(app) as client:
+        for _ in range(5):
+            await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert reconcile.total_429s == 2, "concurrency counter"
+    assert reconcile.rate_limit_429s == 3, "rate_limit counter"
+    assert reconcile.recent_429_count == 5, "shared breaker window"
+    assert reconcile.breaker_state.value == "open", "mixed 429s must trip the breaker"
 
 
 # ---------------------------------------------------------------------------
@@ -1449,21 +1539,21 @@ async def test_retry_acquire_after_failed_startup():
     """When initial acquire fails, the proxy retries and becomes leader."""
     guard = _FakeGuardRetryable()
     app, _, reconcile = _make_app_with_guard(guard)
-    app._retry_interval = 0.01
+    app._lifecycle._retry_interval = 0.01
 
-    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+    app._lifecycle._retry_task = asyncio.create_task(app._lifecycle._retry_acquire())
 
     await asyncio.sleep(0.2)
 
-    assert app._guard_acquired is True
+    assert app._lifecycle.acquired is True
     assert guard.renewer_started is True
     assert reconcile._task is not None
 
     await reconcile.stop()
-    if app._acquire_retry_task and not app._acquire_retry_task.done():
-        app._acquire_retry_task.cancel()
+    if app._lifecycle._retry_task and not app._lifecycle._retry_task.done():
+        app._lifecycle._retry_task.cancel()
         try:
-            await app._acquire_retry_task
+            await app._lifecycle._retry_task
         except asyncio.CancelledError:
             pass
 
@@ -1472,22 +1562,22 @@ async def test_retry_acquire_cancelled_on_shutdown():
     """The retry task is properly cancelled during shutdown."""
     guard = _FakeGuard(held=False, acquire_result=False)
     app, _, _ = _make_app_with_guard(guard)
-    app._retry_interval = 0.01
+    app._lifecycle._retry_interval = 0.01
 
-    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+    app._lifecycle._retry_task = asyncio.create_task(app._lifecycle._retry_acquire())
 
     await asyncio.sleep(0.05)
 
     # Simulate shutdown cancelling the task.
-    assert app._acquire_retry_task is not None
-    app._acquire_retry_task.cancel()
+    assert app._lifecycle._retry_task is not None
+    app._lifecycle._retry_task.cancel()
     try:
-        await app._acquire_retry_task
+        await app._lifecycle._retry_task
     except asyncio.CancelledError:
         pass
 
-    assert app._acquire_retry_task.cancelled()
-    assert app._guard_acquired is False
+    assert app._lifecycle._retry_task.cancelled()
+    assert app._lifecycle.acquired is False
 
 
 async def test_retry_acquire_releases_lease_if_start_fails():
@@ -1499,22 +1589,22 @@ async def test_retry_acquire_releases_lease_if_start_fails():
     guard = _FakeGuardRetryable()
     guard._start_renewer_fail_count = 1  # fail first start_renewer call
     app, _, reconcile = _make_app_with_guard(guard)
-    app._retry_interval = 0.01
+    app._lifecycle._retry_interval = 0.01
 
-    app._acquire_retry_task = asyncio.create_task(app._retry_acquire())
+    app._lifecycle._retry_task = asyncio.create_task(app._lifecycle._retry_acquire())
 
     await asyncio.sleep(0.3)
 
-    assert app._guard_acquired is True
+    assert app._lifecycle.acquired is True
     assert guard.renewer_started is True
     assert reconcile._task is not None
     assert guard._release_count >= 1  # lease was released after the failed start
 
     await reconcile.stop()
-    if app._acquire_retry_task and not app._acquire_retry_task.done():
-        app._acquire_retry_task.cancel()
+    if app._lifecycle._retry_task and not app._lifecycle._retry_task.done():
+        app._lifecycle._retry_task.cancel()
         try:
-            await app._acquire_retry_task
+            await app._lifecycle._retry_task
         except asyncio.CancelledError:
             pass
 
@@ -1774,29 +1864,6 @@ async def test_fast_fail_when_not_ready():
 # --- unit tests for the classifier ------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "retry_after, expected",
-    [
-        (None, True),
-        ("0", True),
-        ("00", True),
-        (" 0 ", True),
-        (" 0", True),
-        ("0 ", True),
-        ("-1", True),
-        ("", True),
-        ("abc", True),
-        ("60", False),
-        ("1", False),
-        (" 30 ", False),
-        ("300", False),
-    ],
-)
-def test_is_concurrency_429(retry_after, expected):
-    """The 429 classifier handles edge cases fail-safe (rule 1)."""
-    assert _is_concurrency_429(retry_after) is expected
-
-
 # --- integration tests through the proxy ------------------------------------
 
 
@@ -1815,7 +1882,7 @@ async def test_concurrency_429_without_retry_after_is_recorded():
 
 
 async def test_rate_limit_429_with_retry_after_is_not_recorded():
-    """A 429 with retry-after (rate-limit) is NOT recorded as a concurrency 429."""
+    """A 429 with retry-after (rate-limit) is tracked separately but still feeds the breaker."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         resp = _resp(429, json_data={"error": "rate_limit_exceeded"})
@@ -1827,7 +1894,9 @@ async def test_rate_limit_429_with_retry_after_is_not_recorded():
     async with _asgi_client(app) as client:
         await client.post("/v1/messages", json={"prompt": "hi"})
 
-    assert reconcile.total_429s == 0, "rate-limit 429s must not trip the breaker"
+    assert reconcile.total_429s == 0, "rate-limit 429s must not increment concurrency counter"
+    assert reconcile.rate_limit_429s == 1, "rate-limit 429s must be tracked separately"
+    assert reconcile.recent_429_count == 1, "rate-limit 429s must feed the breaker window"
 
 
 @pytest.mark.parametrize("retry_after", ["0", "00", " 0 ", " 0", "0 "])
@@ -2768,7 +2837,7 @@ async def test_response_hop_by_hop_headers_stripped():
 
 
 async def test_lifespan_startup_and_shutdown():
-    """ProxyApp._handle_lifespan starts/stops the reconcile loop and closes owned client."""
+    """ASGI lifespan handler starts/stops the reconcile loop and closes owned client."""
     gate = PermitGate(initial_capacity=3)
     usage = FakeUsageClient()
     reconcile = ReconciliationLoop(
@@ -2814,6 +2883,200 @@ async def test_lifespan_startup_and_shutdown():
     assert len(shutdown_complete) == 1
     assert reconcile._task is None
     assert app._client.is_closed
+
+
+async def test_drain_waits_for_in_flight_requests():
+    """Shutdown drain waits for in-flight requests before closing the client."""
+
+    release_event = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def gen():
+            yield b'{"partial": true}'
+            await release_event.wait()
+            yield b'{"done": true}'
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    app, gate, reconcile = _make_app(upstream_handler=handler)
+    reconcile._first_poll_ok = True
+
+    # Start lifespan
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_scope = {"type": "lifespan"}
+    lifespan_task = asyncio.create_task(app(lifespan_scope, lifespan_receive_fn, lifespan_send_fn))
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    # Start a request (will block on release_event)
+    async with _asgi_client(app) as client:
+        request_task = asyncio.create_task(client.post("/v1/messages", json={"prompt": "hi"}))
+
+        # Wait for the request to acquire a permit
+        await asyncio.sleep(0.2)
+        assert gate.held == 1, "request should be in-flight"
+
+        # Start shutdown — should block waiting for the in-flight request
+        await lifespan_receive.put({"type": "lifespan.shutdown"})
+
+        # Give shutdown time to reach the drain loop
+        await asyncio.sleep(0.2)
+        assert not lifespan_task.done(), "shutdown must wait for in-flight request"
+        assert app._lifecycle.is_draining
+
+        # Release the request — drain should complete
+        release_event.set()
+        await asyncio.wait_for(request_task, timeout=5.0)
+        await asyncio.wait_for(lifespan_task, timeout=5.0)
+
+    shutdown_complete = [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.complete"]
+    assert len(shutdown_complete) == 1
+    assert app._lifecycle.is_draining is True  # draining flag stays set
+
+
+async def test_drain_timeout_closes_with_in_flight():
+    """Drain timeout expires and closes the client even if requests are still in-flight."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def gen():
+            await asyncio.sleep(10.0)  # won't complete within drain timeout
+            yield b'{"ok": true}'
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    gate = PermitGate(initial_capacity=3)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        drain_timeout=0.2,
+    )
+    # Inject custom transport into the owned client
+    app._client = httpx.AsyncClient(
+        transport=_StreamingMockTransport(handler),
+        timeout=None,
+    )
+    app._lifecycle._client = app._client
+
+    # Start lifespan
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_scope = {"type": "lifespan"}
+    lifespan_task = asyncio.create_task(app(lifespan_scope, lifespan_receive_fn, lifespan_send_fn))
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    # Start a request (will block for 10s)
+    async with _asgi_client(app) as client:
+        request_task = asyncio.create_task(client.post("/v1/messages", json={"prompt": "hi"}))
+        await asyncio.sleep(0.2)
+        assert gate.held == 1
+
+        # Start shutdown — drain timeout is 0.2s
+        await lifespan_receive.put({"type": "lifespan.shutdown"})
+
+        # Shutdown should complete after ~0.2s drain timeout, not 10s
+        await asyncio.wait_for(lifespan_task, timeout=5.0)
+
+    shutdown_complete = [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.complete"]
+    assert len(shutdown_complete) == 1
+    assert app._client.is_closed, "owned client must be closed after shutdown"
+
+    request_task.cancel()
+    try:
+        await request_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def test_new_requests_503_during_drain():
+    """New requests get 503 when the draining flag is set."""
+    app, _, _ = _make_app()
+    app._lifecycle._draining = True
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.json()["reason"] == "draining"
+
+
+async def test_request_blocked_on_acquire_during_drain():
+    """A request blocked on gate.acquire() when drain starts gets 503 post-acquire.
+
+    Race: request passes is_draining check (False), blocks on acquire (all
+    permits held), drain starts and sees held==1, permit is released, the
+    blocked request acquires it — but must check draining again, release
+    the permit, and return 503 instead of forwarding.
+    """
+    gate = PermitGate(initial_capacity=1, release_cooldown=0.0)
+    usage = FakeUsageClient()
+    reconcile = ReconciliationLoop(
+        truth_source=usage,  # type: ignore[arg-type]
+        gate=gate,
+        controller_config=ControllerConfig(),
+        breaker_config=BreakerConfig(),
+    )
+    reconcile._first_poll_ok = True
+    app = ProxyApp(
+        upstream_base_url="https://upstream.example.com",
+        gate=gate,
+        reconcile=reconcile,
+        queue_timeout=10.0,
+    )
+
+    # Hold the only permit so the next request blocks
+    await gate.acquire(timeout=0.1)
+    assert gate.held == 1
+
+    # Start a request — it will block on acquire
+    request_task = asyncio.create_task(_send_request(app, "/v1/messages"))
+    await asyncio.sleep(0.1)
+    assert gate.queue_depth == 1, "request should be waiting"
+
+    # Set draining, then release the permit
+    app._lifecycle._draining = True
+    await gate.release()
+    assert gate.held == 0
+
+    # The blocked request acquires the permit, but the post-acquire drain
+    # check should fire → release it and return 503
+    result = await asyncio.wait_for(request_task, timeout=5.0)
+    assert result.status_code == 503
+    assert result.json()["reason"] == "draining"
+    assert gate.held == 0, "permit must be released back by the post-acquire check"
+
+
+async def _send_request(app: ProxyApp, path: str):
+    async with _asgi_client(app) as client:
+        return await client.post(path, json={"prompt": "hi"})
 
 
 # ---------------------------------------------------------------------------

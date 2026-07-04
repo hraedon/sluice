@@ -58,6 +58,7 @@ def test_history_entry_to_dict_keys():
     assert d["stl"] is False
     assert d["r429"] == 0
     assert d["t429"] == 0
+    assert d["rl429"] == 0
     assert d["qd"] == 0
     assert d["qt"] == 0
     assert d["err"] is False
@@ -98,6 +99,32 @@ def test_history_entry_request_window_fields():
     assert d["rrem"] == 152
     assert d["rlw"] == 40
     assert d["rdelta"] == 8
+
+
+def test_history_entry_rate_limit_429s_field():
+    e = HistoryEntry(
+        timestamp=1700000000.0,
+        concurrent_sessions=3,
+        local_in_flight=2,
+        phantom_estimate=1,
+        effective_permits=2,
+        limit=4,
+        hard_cap=8,
+        band="normal",
+        breaker="closed",
+        priority_low=False,
+        usage_age=1.5,
+        stale=False,
+        recent_429s=5,
+        total_429s=3,
+        rate_limit_429s=7,
+        queue_depth=0,
+        queue_timeouts=0,
+    )
+    d = e.to_dict()
+    assert d["rl429"] == 7
+    assert d["r429"] == 5
+    assert d["t429"] == 3
 
 
 def test_history_entry_to_dict_roundtrip():

@@ -203,6 +203,7 @@ def test_store_roundtrip_all_fields():
             stale=True,
             recent_429s=3,
             total_429s=15,
+            rate_limit_429s=7,
             queue_depth=5,
             queue_timeouts=2,
             tick_failed=True,
@@ -225,6 +226,7 @@ def test_store_roundtrip_all_fields():
         assert e.stale is True
         assert e.recent_429s == 3
         assert e.total_429s == 15
+        assert e.rate_limit_429s == 7
         assert e.queue_depth == 5
         assert e.queue_timeouts == 2
         assert e.tick_failed is True

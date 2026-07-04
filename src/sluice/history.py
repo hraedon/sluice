@@ -35,6 +35,7 @@ Compact field names in ``to_dict()`` (used by /history.json):
     stl  stale (reading ok flag)
     r429 recent_429s
     t429 total_429s
+    rl429 rate_limit_429s
     qd   queue_depth
     qt   queue_timeouts
     err  tick_failed (true if this entry was recorded during a tick exception)
@@ -77,6 +78,7 @@ class HistoryEntry:
     total_429s: int
     queue_depth: int
     queue_timeouts: int
+    rate_limit_429s: int = 0  # 429s classified as rate-limit (fed to breaker, tracked separately)
     # Request-window budget (None when provider reports no request limit)
     requests_in_window: int | None = None
     requests_limit: int | None = None
@@ -101,6 +103,7 @@ class HistoryEntry:
             "stl": self.stale,
             "r429": self.recent_429s,
             "t429": self.total_429s,
+            "rl429": self.rate_limit_429s,
             "qd": self.queue_depth,
             "qt": self.queue_timeouts,
             "err": self.tick_failed,

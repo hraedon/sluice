@@ -97,13 +97,22 @@ class ControllerConfig:
 
 @dataclass(frozen=True)
 class ControllerState:
-    """Everything the decision needs, assembled by the shell each tick."""
+    """Everything the decision needs, assembled by the shell each tick.
+
+    ``recent_429_count`` is populated only for the adaptive controller path
+    (``adaptive_effective_permits``); the concurrency reconciler leaves it
+    at 0 because the breaker state alone drives its decisions.  This is
+    intentional — the two controllers consume different signal sets — but
+    means ``effective_permits()`` never sees a non-zero 429 count on the
+    umans path.  Tests that exercise the adaptive path should set it
+    explicitly; tests of ``effective_permits`` can leave the default.
+    """
 
     reading: LimitState
     local_in_flight: int
     breaker: BreakerState = BreakerState.CLOSED
     phantom_estimate: int = 0  # pre-computed windowed estimate (Plan 003)
-    recent_429_count: int = 0  # windowed 429 count for AIMD backoff (Plan 006)
+    recent_429_count: int = 0  # windowed 429 count — adaptive path only (Plan 006)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +325,7 @@ def breaker_on_429(
     now: float,
     config: BreakerConfig,
 ) -> BreakerSnapshot:
-    """Event: a concurrency 429 was received from the upstream.
+    """Event: a 429 was received from the upstream (concurrency or rate-limit).
 
     Trips immediately if the threshold is met (don't wait for the next tick).
     If half-open (probing), the probe failed → back to OPEN.
