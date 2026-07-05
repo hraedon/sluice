@@ -74,7 +74,7 @@ jobs:
       # Only after the scan gates do we authenticate and publish the multi-arch
       # image. The amd64 layers are reused from the gha cache, so this does not
       # rebuild what was just scanned.
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
