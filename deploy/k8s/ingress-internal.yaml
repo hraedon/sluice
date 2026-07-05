@@ -10,10 +10,10 @@ metadata:
 spec:
   ingressClassName: traefik-internal
   tls:
-    - hosts: [sluice.k8s.hraedon.com]
+    - hosts: [sluice.k8s.example.internal]
       secretName: sluice-internal-tls
   rules:
-    - host: sluice.k8s.hraedon.com
+    - host: sluice.k8s.example.internal
       http:
         paths:
           - path: /

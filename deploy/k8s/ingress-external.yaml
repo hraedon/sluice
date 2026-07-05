@@ -19,10 +19,10 @@ metadata:
 spec:
   ingressClassName: traefik-external
   tls:
-    - hosts: [sluice.hraedon.com]
+    - hosts: [sluice.example.com]
       secretName: sluice-external-tls
   rules:
-    - host: sluice.hraedon.com
+    - host: sluice.example.com
       http:
         paths:
           - path: /
