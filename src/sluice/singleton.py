@@ -279,11 +279,6 @@ class KubeLeaseGuard(SingletonGuard):
             # server's optimistic concurrency control rejects a stale
             # write with 409 Conflict if another pod modified the lease
             # between our GET and PUT — the TOCTOU window is closed.
-            # The PUT sends the full lease object (including
-            # metadata.resourceVersion from the GET), so the K8s API
-            # server's optimistic concurrency control rejects a stale
-            # write with 409 Conflict if another pod modified the lease
-            # between our GET and PUT — the TOCTOU window is closed.
             lease["spec"]["renewTime"] = now
             resp = await client.put(self._lease_url, json=lease)
             if resp.status_code == 409:

@@ -763,7 +763,9 @@ class ReconciliationLoop:
           When the reading is stale (``ok=False``), capped at 300 s — a stale
           ``resets_at`` could be hours in the future and mislead clients.
           Unjittered — a deadline, not a load estimate.
-        - **breaker:** remaining cooldown.  Unjittered — a deadline.
+        - **breaker:** remaining cooldown (``ceil(cooldown - elapsed)``), or
+          ``RETRY_AFTER_SHORT`` (5 s) if ``opened_at`` is unknown.
+          Unjittered — a deadline.
         - **saturated** (``_last_permits == 0``): ``max(estimator, ceil(poll_interval))``,
           then ±15 % jitter, clamped to ``[max(5, ceil(poll_interval)), 60]``.
           Nothing can change until the reconcile loop next resizes, so the poll
@@ -771,10 +773,11 @@ class ReconciliationLoop:
           poll interval: ``max(2, ceil(poll_interval))``.)
         - **open:** ``_RETRY_AFTER_SATURATION_FLOOR`` (5 s).  The gate is open;
           this is a fallback, not a pressure estimate.
-        - **draining / not_leader:** ``_RETRY_AFTER_SHORT`` (5 s).
-          The honest value is genuinely unknowable — the retry should land on a
-          replacement instance / the leader.  A short constant is kept because
-          the routing concern dominates the timing one.
+
+        ``draining`` / ``not_leader`` are not returned by :meth:`gate_closed_reason`
+        and so are not handled here — the proxy emits ``RETRY_AFTER_SHORT`` (5 s)
+        directly for them (the routing concern dominates the timing one; the
+        honest value is genuinely unknowable).
         """
         reason = self.gate_closed_reason()
         if reason == "boxed":
