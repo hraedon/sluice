@@ -182,8 +182,8 @@ behaviour, not intent).
 
 - Drive real saturation (hermes/opencode flood) and capture an actual saturated 503
   with headers, before and after — the "before" artifact shows the fixed 5, the
-  "after" shows a pressure-scaled, jittered value. Save alongside
-  `docs/wi-024-429-capture-2026-07-03.md`.
+  "after" shows a pressure-scaled, jittered value. Saved as
+  `docs/plan013-retry-after-capture-2026-07-04.md`.
 - SDK `Retry-After` behaviour has been verified at source level (see
   `docs/concurrency-model.md` "Client reality"): Anthropic and OpenAI Python SDKs
   accept the header only if `<= 60` seconds and fall back to exponential backoff

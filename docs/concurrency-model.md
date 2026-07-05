@@ -250,7 +250,7 @@ When sluice returns a `503`, it carries a `Retry-After` header and a matching
 | reason | What happened | Retry-After promise | Jittered? |
 |---|---|---|---|
 | **saturated** (queue-timeout) | Permits > 0 but all held; the request waited the full `queue_timeout` and lost. | Pressure-derived: `ceil((queue_depth + 1) × avg_hold_seconds / capacity)`, ±15 %, clamped to `[5, 60]`. | Yes — load estimate, not a deadline. |
-| **saturated** (structural, `_last_permits == 0`) | The reconcile loop set permits to 0 (e.g. phantoms ate all). Nothing can change until the next poll. | `max(pressure_estimate, ceil(poll_interval))`, ±15 %, clamped to `[max(5, ceil(poll_interval)), 60]`. | Yes. |
+| **saturated** (structural, `_last_permits == 0`) | The reconcile loop set permits to 0 (e.g. phantoms ate all). Nothing can change until the next poll. | `max(pressure_estimate, ceil(poll_interval))`, ±15 %, clamped to `[max(5, min(60, ceil(poll_interval))), 60]`. | Yes. |
 | **boxed** | Account paused by the provider (`boxed_until`, reason ≠ `rate_limited`). | `ceil(resets_at - now)`, floored at 30 s. | No — a deadline. |
 | **breaker** | Circuit breaker open after sustained 429s. | Remaining breaker cooldown. | No — a deadline. |
 | **not_ready** | First usage poll not yet completed. | `max(2, ceil(poll_interval))` — tracks configuration. | No. |
@@ -322,6 +322,10 @@ actually use:
   `JSONResponse` / `PlainTextResponse`, dropping upstream headers including
   `Retry-After`. The status code and body are surfaced to the caller, but the
   header is lost.
+- **opencode (via Vercel AI SDK / `@ai-sdk/openai-compatible`)**: the Vercel
+  AI SDK does not currently honor upstream `Retry-After` headers and uses its own
+  exponential backoff instead (vercel/ai#7247). The header is therefore ignored
+  by opencode regardless of the cap.
 - **umans / hermes**: no public repository was found; cap behavior is unknown.
 
 This is why the saturated value is capped at 60 s: the two most widely used

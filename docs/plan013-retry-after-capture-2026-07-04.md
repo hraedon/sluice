@@ -81,8 +81,8 @@ cleared from the gate. That is why `queue_depth` reads `0` while `queue_timeouts
 is non-zero. The `Retry-After` values stamped on the 503s reflect the queue
 depth **at the moment each request timed out**:
 
-- Moderate burst (`retry_after: 52`): peak depth was large enough that the
-  unjittered estimate reached ~52 s before the ±15 % jitter window.
+- Moderate burst (`retry_after: 52`): peak depth produced an unjittered estimate
+  near 52 s (e.g. `ceil((6 + 1) × 15.02 / 2) = 53`, then jittered slightly down).
 - Deep burst (`retry_after: 60`): peak depth produced an estimate well above
   60 s, so the cap bit. The actual unjittered estimate would have been
   `ceil((qd + 1) × 15 / 2)` for some `qd` at failure time, so the cap applied.
