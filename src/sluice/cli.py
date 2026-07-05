@@ -27,10 +27,46 @@ from sluice.providers import get_provider, make_truth_source
 from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
 from sluice.singleton import KubeLeaseGuard, NoopGuard, SingletonGuard
+from sluice.trust import parse_trusted_proxies
 
 log = logging.getLogger("sluice.cli")
 
 _ENV_PREFIX = "SLUICE_"
+
+
+class _JSONFormatter(logging.Formatter):
+    """Minimal stdlib-only JSON log formatter (WI-028 finding 7).
+
+    Emits one JSON object per log record with ``ts``, ``level``, ``logger``,
+    ``msg``, and (when present) ``exc_info``.  No third-party deps — the
+    pure-core / stdlib-only convention extends to the logging surface.  The
+    ``extra`` dict on the log record (used by the 429 classifier) is merged
+    into the top level so structured-log consumers can query fields like
+    ``classification`` directly.
+    """
+
+    _RESERVED = {"name", "msg", "args", "levelname", "levelno", "pathname",
+                  "filename", "module", "exc_info", "exc_text", "stack_info",
+                  "lineno", "funcName", "created", "msecs", "relativeCreated",
+                  "thread", "threadName", "processName", "process", "message",
+                  "asctime", "taskName"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        import time as _time
+        out: dict[str, object] = {
+            "ts": _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime(record.created))
+                  + f".{int(record.msecs):03d}Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for k, v in record.__dict__.items():
+            if k not in self._RESERVED and not k.startswith("_"):
+                out[k] = v
+        if record.exc_info:
+            out["exc_info"] = self.formatException(record.exc_info)
+        return _json.dumps(out, default=str)
 
 _DEFAULTS: dict[str, Any] = {
     "upstream": None,
@@ -43,6 +79,7 @@ _DEFAULTS: dict[str, Any] = {
     "usage_key_env": "SLUICE_USAGE_KEY",
     "usage_auth_header": "authorization",
     "log_level": "INFO",
+    "log_format": "text",
     "config": None,
     "admin_token": None,
     "reserve": None,
@@ -52,6 +89,10 @@ _DEFAULTS: dict[str, Any] = {
     "history_ttl": 604800.0,
     "singleton_guard": "noop",
     "drain_timeout": 25.0,
+    "trusted_proxies": None,
+    "max_request_body_bytes": None,
+    "upstream_idle_timeout": None,
+    "cors_allow_origin": None,
 }
 
 
@@ -70,9 +111,9 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 
 
 def _coerce(env_val: str, key: str) -> Any:
-    if key in ("target", "history_size"):
+    if key in ("target", "history_size", "max_request_body_bytes"):
         return int(env_val)
-    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout"):
+    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout", "upstream_idle_timeout"):
         return float(env_val)
     return env_val
 
@@ -119,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="auth header for /v1/usage (default: authorization)",
     )
     serve.add_argument("--log-level", default=None, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="logging level (default: INFO)")
+    serve.add_argument("--log-format", default=None, choices=["text", "json"], help="logging format: text (human-readable, default) or json (structured, for log aggregators)")
     serve.add_argument("--config", default=None, help="path to TOML config file with a [serve] section")
     serve.add_argument("--admin-token", default=None, help="token gating admin routes (/, /status.json, /metrics, /history.json) — accepts a browser login-page session cookie, a Bearer header, or a Basic auth password")
     serve.add_argument("--reserve", default=None, help="reserve permits for a QoS class, e.g. 'interactive=1' (default: none → pure FIFO)")
@@ -127,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--history-ttl", type=float, default=None, help="seconds to retain entries in the SQLite store before pruning (default: 604800 = 7 days)")
     serve.add_argument("--singleton-guard", default=None, choices=["noop", "kube-lease"], help="singleton guard mode (default: noop; env: SLUICE_SINGLETON_GUARD)")
     serve.add_argument("--drain-timeout", type=float, default=None, help="seconds to wait for in-flight requests on shutdown before closing upstream (default: 25)")
+    serve.add_argument("--trusted-proxies", default=None, help="comma-separated CIDR/IP allowlist of peers trusted to set x-sluice-client-label and X-Forwarded-Proto (default: empty → loopback only). Set to the ingress CIDR in deployments. (WI-028)")
+    serve.add_argument("--max-request-body-bytes", type=int, default=None, help="reject proxied requests whose body exceeds this many bytes (default: no limit — streaming). -1 disables the cap.")
+    serve.add_argument("--upstream-idle-timeout", type=float, default=None, help="abort a streaming upstream response if no chunk arrives within this many seconds (default: no idle timeout — matches _UPSTREAM_TIMEOUT read=None). Resets on each chunk, so slow-but-steady streams are unaffected; only a silent upstream trips it.")
+    serve.add_argument("--cors-allow-origin", default=None, help="emit Access-Control-Allow-Origin on admin routes with this value (e.g. '*' or 'https://grafana.example.com'). Default: none (same-origin only). (WI-028 finding 10)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -181,6 +227,19 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     history_size = _resolve("history_size", args)
     history_store_path = _resolve("history_store", args)
     history_ttl = _resolve("history_ttl", args)
+    trusted_proxies_raw = _resolve("trusted_proxies", args)
+    max_request_body_bytes = _resolve("max_request_body_bytes", args)
+    upstream_idle_timeout = _resolve("upstream_idle_timeout", args)
+    cors_allow_origin = _resolve("cors_allow_origin", args)
+
+    if max_request_body_bytes is not None and max_request_body_bytes == -1:
+        max_request_body_bytes = None
+
+    try:
+        trusted_proxies = parse_trusted_proxies(trusted_proxies_raw)
+    except ValueError as exc:
+        print(f"sluice: error: --trusted-proxies: {exc}", file=sys.stderr)
+        return 2
 
     if history_store_path and history_ttl is not None and history_ttl <= 0:
         print("sluice: error: --history-ttl must be positive", file=sys.stderr)
@@ -205,10 +264,20 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             return 2
         reserved_labels = {label}
 
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_format = _resolve("log_format", args)
+    if log_format not in ("text", "json"):
+        log.warning("invalid log format %r — falling back to text", log_format)
+        log_format = "text"
+
+    if log_format == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(_JSONFormatter())
+        logging.basicConfig(level=getattr(logging, log_level), handlers=[handler])
+    else:
+        logging.basicConfig(
+            level=getattr(logging, log_level),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
     usage_key = os.environ.get(usage_key_env) or ""
 
@@ -298,6 +367,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         retry_interval=retry_interval,
         reserved_labels=reserved_labels,
         drain_timeout=drain_timeout,
+        trusted_proxies=trusted_proxies,
+        max_request_body_bytes=max_request_body_bytes,
+        upstream_idle_timeout=upstream_idle_timeout,
+        cors_allow_origin=cors_allow_origin,
     )
 
     log.info("sluice %s starting", __version__)
@@ -322,6 +395,17 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     if history_store_path:
         log.info("  history_store:     %s", history_store_path)
         log.info("  history_ttl:       %.0fs", history_ttl)
+    if trusted_proxies:
+        log.info("  trusted_proxies:   %s", ", ".join(str(n) for n in trusted_proxies))
+    else:
+        log.info("  trusted_proxies:   loopback-only (QoS labels / XFP untrusted from non-loopback)")
+    if max_request_body_bytes is not None:
+        log.info("  max_request_body:  %d bytes", max_request_body_bytes)
+    if upstream_idle_timeout is not None:
+        log.info("  upstream_idle:     %.1fs", upstream_idle_timeout)
+    if cors_allow_origin:
+        log.info("  cors_allow_origin: %s", cors_allow_origin)
+    log.info("  log_format:        %s", log_format)
 
     import uvicorn
 

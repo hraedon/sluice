@@ -29,6 +29,7 @@ introduce their own locking.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from typing import Protocol, runtime_checkable
 
@@ -37,6 +38,23 @@ from sluice.history import HistoryEntry
 log = logging.getLogger("sluice.history_store")
 
 _CONNECT_TIMEOUT = 5.0
+
+
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names already present in ``table``.
+
+    Uses ``PRAGMA table_info`` (the SQLite-canonical schema introspection)
+    rather than a bare ``except Exception: pass`` around ``ALTER TABLE``.
+    A bare except silently swallows *any* failure (disk full, locked DB,
+    syntax error in a future migration) as "column already exists"; this
+    narrows the check to the actual condition we care about.
+    """
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        return {str(row[1]) for row in cur.fetchall()}
+    except sqlite3.Error:
+        log.warning("PRAGMA table_info(%s) failed — skipping migrations", table, exc_info=True)
+        return set()
 
 
 @runtime_checkable
@@ -133,11 +151,32 @@ class SQLiteHistoryStore:
             self._conn.execute("PRAGMA wal_autocheckpoint=1000")
             self._conn.execute(_CREATE_TABLE)
             self._conn.execute(_CREATE_INDEX)
+            # WI-028 finding 8: introspect existing columns and only run
+            # the ALTER for columns that are missing, instead of a bare
+            # ``except Exception: pass`` that would swallow disk-full /
+            # locked-DB / future-migration failures as "column exists".
+            existing = _existing_columns(self._conn, "history")
             for stmt in _MIGRATIONS:
+                # _MIGRATIONS entries are all "ALTER TABLE history ADD COLUMN <name> ...".
+                # Use a regex to extract the column name robustly (handles quoted
+                # names, extra spaces, and trailing type clauses).
+                m = re.search(r"ADD\s+COLUMN\s+(\S+)", stmt, re.IGNORECASE)
+                if m:
+                    colname = m.group(1).strip('"')
+                    if colname in existing:
+                        continue
                 try:
                     self._conn.execute(stmt)
-                except Exception:
-                    pass  # column already exists
+                except sqlite3.OperationalError as exc:
+                    # sqlite3.OperationalError "duplicate column name" is the
+                    # only expected failure (a race between two writers); any
+                    # other OperationalError or a different exception type
+                    # (DatabaseError, IntegrityError, …) propagates to the
+                    # outer except below, which logs and disables the store
+                    # rather than silently swallowing.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+                    log.debug("migration skipped (column exists): %s", stmt)
         except Exception:
             log.exception("failed to open history store at %s — store disabled", path)
             if self._conn is not None:

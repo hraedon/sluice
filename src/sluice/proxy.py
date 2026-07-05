@@ -14,6 +14,7 @@ key of its own beyond the usage poller's.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import math
 import os
@@ -27,6 +28,7 @@ from sluice.admin import (
     Receive,
     Send,
     Scope,
+    _cors_extra_headers,
     check_admin_auth,
     handle_config_delete,
     handle_config_post,
@@ -51,6 +53,7 @@ from sluice.reconcile import ReconciliationLoop, RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle
 from sluice.session import SESSION_COOKIE as _SESSION_COOKIE
 from sluice.singleton import SingletonGuard
+from sluice.trust import peer_is_trusted
 
 log = logging.getLogger("sluice.proxy")
 
@@ -189,6 +192,10 @@ class ProxyApp:
         retry_interval: float = _RETRY_ACQUIRE_INTERVAL,
         reserved_labels: set[str] | None = None,
         drain_timeout: float = _DRAIN_TIMEOUT_DEFAULT,
+        trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = None,
+        max_request_body_bytes: int | None = None,
+        upstream_idle_timeout: float | None = None,
+        cors_allow_origin: str | None = None,
     ) -> None:
         self._upstream = upstream_base_url.rstrip("/")
         self._gate = gate
@@ -202,6 +209,10 @@ class ProxyApp:
         self._build_sha = os.environ.get("SLUICE_BUILD_SHA") or None
         self._login_throttle = LoginThrottle()
         self._reserved_labels = reserved_labels or ({_RESERVED_LABEL} if gate.reserve > 0 else set())
+        self._trusted_proxies = trusted_proxies or frozenset()
+        self._max_request_body_bytes = max_request_body_bytes
+        self._upstream_idle_timeout = upstream_idle_timeout
+        self._cors_allow_origin = cors_allow_origin
         self._lifecycle = LifecycleManager(
             guard=guard,
             reconcile=reconcile,
@@ -227,6 +238,21 @@ class ProxyApp:
             await handle_readyz(send, self._reconcile, self._guard)
             return
 
+        # CORS preflight (WI-028 finding 10): answer OPTIONS on admin routes
+        # with the configured allow-origin so a cross-origin dashboard (e.g.
+        # embedded in a Grafana iframe) can read the response.  Only emitted
+        # when --cors-allow-origin is set; otherwise OPTIONS falls through.
+        if scope["method"] == "OPTIONS" and self._cors_allow_origin and path in (
+            "/", "/status.json", "/metrics", "/history.json",
+            "/admin/config", "/admin/config/target",
+            "/login", "/logout",
+        ):
+            await send_text(
+                send, 204, "",
+                extra_headers=_cors_extra_headers(self._cors_allow_origin, None),
+            )
+            return
+
         # Static assets (patina design system: tokens.css, theme.js, fonts).
         # These are served unauthenticated — they contain no secrets.
         if path.startswith("/static/"):
@@ -236,17 +262,20 @@ class ProxyApp:
         # Login / logout routes (Plan 012) — 404 when no token configured.
         if path == "/login":
             if scope["method"] == "GET":
-                await handle_login_get(send, self._admin_token)
+                await handle_login_get(send, self._admin_token, self._cors_allow_origin)
             elif scope["method"] == "POST":
                 await handle_login_post(
-                    send, receive, self._admin_token, scope, self._login_throttle
+                    send, receive, self._admin_token, scope, self._login_throttle,
+                    self._trusted_proxies,
                 )
             else:
                 await send_text(send, 405, "Method not allowed")
             return
         if path == "/logout":
             if scope["method"] == "POST":
-                await handle_logout(send, self._admin_token, scope)
+                await handle_logout(
+                    send, self._admin_token, scope, self._trusted_proxies,
+                )
             else:
                 await send_text(send, 405, "Method not allowed")
             return
@@ -254,12 +283,14 @@ class ProxyApp:
         # Config mutation endpoints (Plan 011) — own auth/disabled checks.
         if path == "/admin/config" and scope["method"] == "POST":
             await handle_config_post(
-                send, receive, self._reconcile, self._admin_token, scope, self._guard
+                send, receive, self._reconcile, self._admin_token, scope, self._guard,
+                self._cors_allow_origin,
             )
             return
         if path == "/admin/config/target" and scope["method"] == "DELETE":
             await handle_config_delete(
-                send, self._reconcile, self._admin_token, scope, self._guard
+                send, self._reconcile, self._admin_token, scope, self._guard,
+                self._cors_allow_origin,
             )
             return
 
@@ -270,22 +301,32 @@ class ProxyApp:
         if path in ("/", "/status.json", "/metrics", "/history.json"):
             authed = check_admin_auth(scope, self._admin_token)
             if not authed and path != "/":
-                await send_json(send, 401, {"error": "unauthorized"})
+                await send_json(
+                    send, 401, {"error": "unauthorized"},
+                    extra_headers=_cors_extra_headers(self._cors_allow_origin, None),
+                )
                 return
             if path == "/":
                 if authed or not self._admin_token:
-                    await send_dashboard(send)
+                    await send_dashboard(send, self._cors_allow_origin)
                 else:
-                    await send_login_page(send)
+                    await send_login_page(send, self._cors_allow_origin)
                 return
             if path == "/status.json":
-                await send_status_json(send, self._reconcile, self._guard, self._build_sha)
+                await send_status_json(
+                    send, self._reconcile, self._guard, self._build_sha,
+                    self._cors_allow_origin,
+                )
                 return
             if path == "/metrics":
-                await send_prometheus(send, self._reconcile, self._guard)
+                await send_prometheus(
+                    send, self._reconcile, self._guard, self._cors_allow_origin,
+                )
                 return
             if path == "/history.json":
-                await send_history_json(send, scope, self._reconcile)
+                await send_history_json(
+                    send, scope, self._reconcile, self._cors_allow_origin,
+                )
                 return
 
         await self._proxy_request(scope, receive, send)
@@ -348,12 +389,36 @@ class ProxyApp:
             )
             return
 
+        # Request body size cap (WI-028 finding 3).  Config mutations are
+        # already bounded by _MAX_CONFIG_BODY in admin.py; the proxy path
+        # streams bytes and so has no natural bound.  An explicit cap prevents
+        # a single oversized upload from pinning a permit for the duration of
+        # a slow body transfer.  Default off (None) preserves streaming for
+        # deployments that genuinely send large bodies; set via
+        # --max-request-body-bytes to enforce.
+        if self._max_request_body_bytes is not None:
+            declared = self._declared_content_length(scope)
+            if declared is not None and declared > self._max_request_body_bytes:
+                log.info(
+                    "request body too large (declared %d > limit %d) — returning 413",
+                    declared, self._max_request_body_bytes,
+                )
+                await send_json(send, 413, {"error": "request body too large"})
+                return
+
         # Read QoS class from the sluice control header (stripped before
         # forwarding by _filter_request_headers).  If the label matches a
         # reserved class and the gate has a reserve, the request may use
         # reserved slots (Plan 005 WI-002).
+        #
+        # WI-028: the label is honoured only when the immediate peer is a
+        # trusted proxy (or loopback, when no trusted-proxies are configured).
+        # Without this check any client could spoof ``x-sluice-client-label:
+        # interactive`` and consume the reserved slots.  A spoofed label from
+        # a non-trusted peer is still stripped before forwarding (cache-
+        # transparency) but does not grant reserve access.
         reserved = False
-        if self._reserved_labels:
+        if self._reserved_labels and peer_is_trusted(scope, self._trusted_proxies):
             for k, v in scope.get("headers", []):
                 if k == b"x-sluice-client-label":
                     label = v.decode("latin-1")
@@ -413,6 +478,7 @@ class ProxyApp:
 
         disconnect = asyncio.Event()
         body_done = asyncio.Event()
+        body_overflow = asyncio.Event()
 
         async def body_stream() -> AsyncIterator[bytes]:
             """Consume ASGI receive() directly — no intermediate queue.
@@ -424,7 +490,16 @@ class ProxyApp:
             unbounded queue and the disconnect-detection delay of a bounded
             one (the pump could block on body_queue.put() and miss
             http.disconnect events).
+
+            WI-028 finding 3: when ``max_request_body_bytes`` is set, a
+            running byte counter enforces the cap on chunked-encoding requests
+            that lack a Content-Length (the pre-acquire check only sees the
+            declared length).  On overflow, we stop consuming the request
+            body and signal via ``body_overflow`` so the caller can send a
+            413 response to the (still-connected) client.
             """
+            seen = 0
+            limit = self._max_request_body_bytes
             while True:
                 event = await receive()
                 etype = event["type"]
@@ -435,6 +510,16 @@ class ProxyApp:
                 if etype == "http.request":
                     data = event.get("body", b"")
                     if data:
+                        if limit is not None:
+                            seen += len(data)
+                            if seen > limit:
+                                log.info(
+                                    "request body exceeded limit (%d > %d) — aborting",
+                                    seen, limit,
+                                )
+                                body_overflow.set()
+                                body_done.set()
+                                return
                         yield data
                     if not event.get("more_body", False):
                         body_done.set()
@@ -488,6 +573,24 @@ class ProxyApp:
                         await stream_cm.__aexit__(None, None, None)
                     except Exception:
                         pass
+                return
+
+            # WI-028 finding 3: if the body-size counter tripped during upload,
+            # cancel the upstream request and send a 413 to the client.  The
+            # entry race above may have completed (upstream accepted the partial
+            # body) — close the stream context and respond.
+            if body_overflow.is_set() and not response_started:
+                if not entry_task.done():
+                    entry_task.cancel()
+                    try:
+                        await entry_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                await send_json(send, 413, {"error": "request body too large"})
                 return
 
             # Entry completed (or raised) — cancel the disconnect wait.
@@ -586,8 +689,26 @@ class ProxyApp:
                     disconnect.set()
                     return
 
-                async for chunk in response.aiter_raw():
+                idle = self._upstream_idle_timeout
+                chunk_iter = response.aiter_raw()
+                upstream_idle = False
+                while True:
                     if disconnect.is_set():
+                        break
+                    try:
+                        if idle is not None:
+                            chunk = await asyncio.wait_for(
+                                chunk_iter.__anext__(), timeout=idle
+                            )
+                        else:
+                            chunk = await chunk_iter.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "upstream idle timeout (%.1fs) — aborting stream", idle,
+                        )
+                        upstream_idle = True
                         break
                     try:
                         await send(
@@ -601,14 +722,19 @@ class ProxyApp:
                         disconnect.set()
                         break
 
+                # Close the response body.  When the upstream went idle (not a
+                # client disconnect) the client is still connected and needs a
+                # final ``more_body=False`` event so the ASGI transport doesn't
+                # hang.  When the client disconnected, sending is futile.
                 if not disconnect.is_set():
                     await send(
                         {"type": "http.response.body", "body": b"", "more_body": False}
                     )
                     # Success only after the full stream completed without
-                    # a client disconnect — a half-open breaker probe that
-                    # disconnects mid-stream must not count as success.
-                    if 200 <= response.status_code < 400:
+                    # a client disconnect or an upstream idle timeout — an
+                    # idle-aborted stream is a degraded result, not a clean
+                    # success (the breaker should not see it as healthy).
+                    if 200 <= response.status_code < 400 and not upstream_idle:
                         self._reconcile.record_success()
             finally:
                 # Close the stream context to cancel the upstream request
@@ -642,6 +768,21 @@ class ProxyApp:
         if qs:
             path += "?" + qs.decode("latin-1")
         return self._upstream + path
+
+    @staticmethod
+    def _declared_content_length(scope: Scope) -> int | None:
+        """Return the Content-Length declared by the client, or None if absent/invalid.
+
+        Used for the pre-acquire body-size fast-fail.  Chunked-encoding requests
+        (no Content-Length) are caught by the running counter in body_stream().
+        """
+        for k, v in scope.get("headers", []):
+            if k == b"content-length":
+                try:
+                    return int(v.decode("latin-1").strip())
+                except (ValueError, UnicodeDecodeError):
+                    return None
+        return None
 
     def _filter_request_headers(self, scope_headers: list[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []

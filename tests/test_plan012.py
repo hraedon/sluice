@@ -114,13 +114,37 @@ class TestCookieHelpers:
         scope = {"type": "http", "scheme": "https", "headers": []}
         assert _should_set_secure(scope) is True
 
-    def test_should_set_secure_forwarded_proto(self):
+    def test_should_set_secure_forwarded_proto_loopback(self):
         scope = {
             "type": "http",
             "scheme": "http",
             "headers": [(b"x-forwarded-proto", b"https")],
+            "client": ("127.0.0.1", 12345),
         }
         assert _should_set_secure(scope) is True
+
+    def test_should_set_secure_forwarded_proto_trusted_proxy(self):
+        import ipaddress
+        scope = {
+            "type": "http",
+            "scheme": "http",
+            "headers": [(b"x-forwarded-proto", b"https")],
+            "client": ("10.0.0.5", 12345),
+        }
+        trusted = frozenset({ipaddress.ip_network("10.0.0.0/8")})
+        assert _should_set_secure(scope, trusted) is True
+
+    def test_should_not_set_secure_forwarded_proto_untrusted_peer(self):
+        import ipaddress
+        scope = {
+            "type": "http",
+            "scheme": "http",
+            "headers": [(b"x-forwarded-proto", b"https")],
+            "client": ("203.0.113.9", 12345),
+        }
+        assert _should_set_secure(scope, frozenset()) is False
+        trusted = frozenset({ipaddress.ip_network("10.0.0.0/8")})
+        assert _should_set_secure(scope, trusted) is False
 
     def test_should_set_secure_localhost(self):
         scope = {"type": "http", "scheme": "http", "headers": [], "server": ("127.0.0.1", 8800)}

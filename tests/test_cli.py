@@ -253,3 +253,102 @@ def test_listen_ipv4_parses_host_port(monkeypatch):
 
     assert captured["host"] == "0.0.0.0"
     assert captured["port"] == 8800
+
+
+# ---------------------------------------------------------------------------
+# New security-hardening flags (WI-028)
+# ---------------------------------------------------------------------------
+
+
+def test_trusted_proxies_flag_parsed():
+    """--trusted-proxies is accepted by the parser."""
+    from sluice.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--trusted-proxies", "10.0.0.0/8,127.0.0.1"])
+    assert args.trusted_proxies == "10.0.0.0/8,127.0.0.1"
+
+
+def test_trusted_proxies_env(monkeypatch):
+    """SLUICE_TRUSTED_PROXIES env var is resolved when no flag is set."""
+    monkeypatch.setenv("SLUICE_TRUSTED_PROXIES", "10.0.0.0/8")
+    args = _make_args()
+    assert _resolve("trusted_proxies", args) == "10.0.0.0/8"
+
+
+def test_trusted_proxies_default_is_none(monkeypatch):
+    """The default is None (→ empty allowlist → loopback-only)."""
+    monkeypatch.delenv("SLUICE_TRUSTED_PROXIES", raising=False)
+    args = _make_args()
+    assert _resolve("trusted_proxies", args) is None
+
+
+def test_max_request_body_bytes_flag_parsed():
+    from sluice.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--max-request-body-bytes", "65536"])
+    assert args.max_request_body_bytes == 65536
+
+
+def test_upstream_idle_timeout_flag_parsed():
+    from sluice.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--upstream-idle-timeout", "60"])
+    assert args.upstream_idle_timeout == 60.0
+
+
+def test_cors_allow_origin_flag_parsed():
+    from sluice.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--cors-allow-origin", "*"])
+    assert args.cors_allow_origin == "*"
+
+
+def test_log_format_flag_parsed():
+    from sluice.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--log-format", "json"])
+    assert args.log_format == "json"
+
+
+def test_log_format_default_is_text(monkeypatch):
+    monkeypatch.delenv("SLUICE_LOG_FORMAT", raising=False)
+    args = _make_args()
+    assert _resolve("log_format", args) == "text"
+
+
+def test_serve_with_trusted_proxies_bad_cidr_exits_2(monkeypatch, capsys):
+    """An invalid CIDR in --trusted-proxies causes serve to exit with code 2."""
+    monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
+    monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
+    monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+
+    from sluice.cli import main
+
+    rc = main(["serve", "--trusted-proxies", "not-a-cidr"])
+    assert rc == 2
+    assert "trusted-proxies" in capsys.readouterr().err.lower()
+
+
+def test_max_request_body_bytes_env_coerced_to_int(monkeypatch):
+    """SLUICE_MAX_REQUEST_BODY_BYTES env var is coerced to int."""
+    monkeypatch.setenv("SLUICE_MAX_REQUEST_BODY_BYTES", "65536")
+    args = _make_args()
+    val = _resolve("max_request_body_bytes", args)
+    assert val == 65536
+    assert isinstance(val, int)
+
+
+def test_upstream_idle_timeout_env_coerced_to_float(monkeypatch):
+    """SLUICE_UPSTREAM_IDLE_TIMEOUT env var is coerced to float."""
+    monkeypatch.setenv("SLUICE_UPSTREAM_IDLE_TIMEOUT", "60")
+    args = _make_args()
+    val = _resolve("upstream_idle_timeout", args)
+    assert val == 60.0
+    assert isinstance(val, float)
+
+
+def test_cors_allow_origin_env_passthrough(monkeypatch):
+    """SLUICE_CORS_ALLOW_ORIGIN env var is resolved as a string (no coercion)."""
+    monkeypatch.setenv("SLUICE_CORS_ALLOW_ORIGIN", "https://grafana.example.com")
+    args = _make_args()
+    assert _resolve("cors_allow_origin", args) == "https://grafana.example.com"

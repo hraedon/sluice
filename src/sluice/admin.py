@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import ipaddress
 import json
 import logging
 import time
@@ -28,6 +29,7 @@ from sluice.reconcile import RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
 from sluice.status import snapshot as status_snapshot
 from sluice.status import to_prometheus
+from sluice.trust import forwarded_proto_https
 
 if TYPE_CHECKING:
     from sluice.reconcile import ReconciliationLoop
@@ -56,6 +58,35 @@ _LOGIN_HTML = (_STATIC_DIR / "login.html").read_text(encoding="utf-8")
 
 _SESSION_COOKIE = SESSION_COOKIE
 _SESSION_TTL = 2_592_000  # 30 days
+
+
+def _cors_extra_headers(
+    cors_allow_origin: str | None,
+    existing: list[tuple[bytes, bytes]] | None,
+) -> list[tuple[bytes, bytes]]:
+    """Append CORS headers when an allow-origin is configured (WI-028 finding 10).
+
+    Emits ``Access-Control-Allow-Origin`` (the configured value, or ``*``),
+    ``Access-Control-Allow-Methods`` for the common admin verbs, and
+    ``Access-Control-Allow-Headers`` for the headers the dashboard / API
+    clients send (Authorization, Content-Type, Cookie).  ``Vary: Origin`` is
+    emitted when the origin is not ``*`` so caches don't serve a
+    cross-origin response to the wrong origin.  When the origin is specific
+    (not ``*``), ``Access-Control-Allow-Credentials: true`` is emitted so
+    cross-origin cookie-based session auth works.  ``Access-Control-Max-Age:
+    600`` avoids a preflight on every poll.
+    """
+    if not cors_allow_origin:
+        return existing or []
+    headers = list(existing or [])
+    headers.append((b"access-control-allow-origin", cors_allow_origin.encode("latin-1")))
+    headers.append((b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"))
+    headers.append((b"access-control-allow-headers", b"Authorization, Content-Type, Cookie"))
+    headers.append((b"access-control-max-age", b"600"))
+    if cors_allow_origin != "*":
+        headers.append((b"vary", b"Origin"))
+        headers.append((b"access-control-allow-credentials", b"true"))
+    return headers
 
 
 # ---------------------------------------------------------------------------
@@ -146,39 +177,41 @@ def _get_session_cookie(scope: Scope) -> str | None:
     return None
 
 
-def _should_set_secure(scope: Scope) -> bool:
+def _should_set_secure(
+    scope: Scope,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
+) -> bool:
     """Determine whether the Secure cookie attribute should be set.
 
-    Secure is set when the scheme is https (directly or via X-Forwarded-Proto,
-    which is the k8s truth behind Traefik's TLS termination) or the host is
-    localhost/127.0.0.1 (secure contexts per spec).  A plain-HTTP LAN origin
-    gets a non-Secure cookie (browsers silently drop Secure cookies on http).
+    Secure is set when the scheme is https (directly or via a trusted
+    ``X-Forwarded-Proto: https`` header), or the host is localhost/127.0.0.1
+    (secure contexts per spec).  A plain-HTTP LAN origin gets a non-Secure
+    cookie (browsers silently drop Secure cookies on http).
 
-    .. warning::
-
-       Trusting X-Forwarded-Proto is not strictly correct: if a misconfigured
-       intermediate hop injects ``X-Forwarded-Proto: https`` on an actually
-       plain-HTTP origin, the Secure attribute is set and the browser drops
-       the cookie → silent login loop.  This is low-likelihood in the Traefik
-       deployment (Traefik sets XFP correctly and ingress is internal-only)
-       but the risk is real, not "harmless" as an earlier draft claimed.
-       Uvicorn's ``--forwarded-allow-ips`` should be configured to restrict
-       which clients can set XFP headers.
+    WI-028 finding 9: ``X-Forwarded-Proto`` is honoured only when the immediate
+    peer is a trusted proxy (or loopback, when no trusted-proxies are
+    configured).  Without this check, a non-trusted client can inject
+    ``X-Forwarded-Proto: https`` on an actually-plain-HTTP origin and trigger
+    a silent login loop (browser drops the Secure cookie).  The deployment
+    must configure ``--trusted-proxies`` to the ingress CIDR for the
+    forwarded-header path to take effect on non-loopback peers.
     """
     if scope.get("scheme") == "https":
         return True
-    for k, v in scope.get("headers", []):
-        if k == b"x-forwarded-proto":
-            first = v.decode("latin-1").split(",")[0].strip().lower()
-            if first == "https":
-                return True
+    if forwarded_proto_https(scope, trusted_proxies):
+        return True
     server = scope.get("server")
     if server and server[0] in ("127.0.0.1", "localhost", "::1"):
         return True
     return False
 
 
-def _build_set_cookie(value: str, max_age: int, scope: Scope) -> bytes:
+def _build_set_cookie(
+    value: str,
+    max_age: int,
+    scope: Scope,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
+) -> bytes:
     """Build a Set-Cookie header value for the session cookie."""
     parts = [
         f"{_SESSION_COOKIE}={value}",
@@ -187,7 +220,7 @@ def _build_set_cookie(value: str, max_age: int, scope: Scope) -> bytes:
         "Path=/",
         f"Max-Age={max_age}",
     ]
-    if _should_set_secure(scope):
+    if _should_set_secure(scope, trusted_proxies):
         parts.append("Secure")
     return "; ".join(parts).encode("latin-1")
 
@@ -237,23 +270,35 @@ async def send_status_json(
     reconcile: ReconciliationLoop,
     guard: SingletonGuard | None,
     build_sha: str | None,
+    cors_allow_origin: str | None = None,
 ) -> None:
     snap = status_snapshot(reconcile, guard)
     payload = snap.to_dict()
     payload["version"] = __version__
     payload["build"] = build_sha
-    await send_json(send, 200, payload)
+    await send_json(
+        send, 200, payload,
+        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+    )
 
 
 async def send_prometheus(
-    send: Send, reconcile: ReconciliationLoop, guard: SingletonGuard | None
+    send: Send, reconcile: ReconciliationLoop, guard: SingletonGuard | None,
+    cors_allow_origin: str | None = None,
 ) -> None:
     snap = status_snapshot(reconcile, guard)
     text = to_prometheus(snap)
-    await send_text(send, 200, text, content_type="text/plain; version=0.0.4; charset=utf-8")
+    await send_text(
+        send, 200, text,
+        content_type="text/plain; version=0.0.4; charset=utf-8",
+        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+    )
 
 
-async def send_history_json(send: Send, scope: Scope, reconcile: ReconciliationLoop) -> None:
+async def send_history_json(
+    send: Send, scope: Scope, reconcile: ReconciliationLoop,
+    cors_allow_origin: str | None = None,
+) -> None:
     history = reconcile.history
     if history is not None:
         qs = scope.get("query_string", b"").decode("latin-1")
@@ -270,23 +315,40 @@ async def send_history_json(send: Send, scope: Scope, reconcile: ReconciliationL
     else:
         entries = []
     body = {"entries": entries, "count": len(entries), "enabled": history is not None}
-    await send_json(send, 200, body, extra_headers=[(b"cache-control", b"no-store")])
+    await send_json(
+        send, 200, body,
+        extra_headers=_cors_extra_headers(cors_allow_origin, [(b"cache-control", b"no-store")]),
+    )
 
 
-async def send_dashboard(send: Send) -> None:
-    await send_text(send, 200, _DASHBOARD_HTML, content_type="text/html; charset=utf-8")
+async def send_dashboard(
+    send: Send, cors_allow_origin: str | None = None,
+) -> None:
+    await send_text(
+        send, 200, _DASHBOARD_HTML,
+        content_type="text/html; charset=utf-8",
+        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+    )
 
 
-async def send_login_page(send: Send) -> None:
-    await send_text(send, 200, _LOGIN_HTML, content_type="text/html; charset=utf-8")
+async def send_login_page(
+    send: Send, cors_allow_origin: str | None = None,
+) -> None:
+    await send_text(
+        send, 200, _LOGIN_HTML,
+        content_type="text/html; charset=utf-8",
+        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+    )
 
 
-async def handle_login_get(send: Send, admin_token: str | None) -> None:
+async def handle_login_get(
+    send: Send, admin_token: str | None, cors_allow_origin: str | None = None,
+) -> None:
     """GET /login — serve the login form, or 404 if no token configured."""
     if not admin_token:
         await send_text(send, 404, "Not found")
         return
-    await send_login_page(send)
+    await send_login_page(send, cors_allow_origin)
 
 
 async def handle_login_post(
@@ -295,6 +357,7 @@ async def handle_login_post(
     admin_token: str | None,
     scope: Scope,
     throttle: LoginThrottle,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
 ) -> None:
     """POST /login — verify token, set session cookie, redirect to /."""
     if not admin_token:
@@ -342,8 +405,8 @@ async def handle_login_post(
 
     throttle.record_success(now)
     cookie_value = mint_session(admin_token, now, _SESSION_TTL)
-    set_cookie = _build_set_cookie(cookie_value, _SESSION_TTL, scope)
-    if not _should_set_secure(scope):
+    set_cookie = _build_set_cookie(cookie_value, _SESSION_TTL, scope, trusted_proxies)
+    if not _should_set_secure(scope, trusted_proxies):
         log.warning(
             "session cookie set without Secure — plain-HTTP origin (remote=%s)",
             _extract_remote(scope),
@@ -360,6 +423,7 @@ async def handle_logout(
     send: Send,
     admin_token: str | None,
     scope: Scope,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
 ) -> None:
     """POST /logout — clear session cookie and redirect to /login."""
     if not admin_token:
@@ -368,7 +432,7 @@ async def handle_logout(
     if not check_csrf(scope, admin_token):
         await send_text(send, 403, "cross-site request blocked")
         return
-    set_cookie = _build_set_cookie("", 0, scope)
+    set_cookie = _build_set_cookie("", 0, scope, trusted_proxies)
     await send_text(
         send,
         303,
@@ -473,6 +537,7 @@ async def handle_config_post(
     admin_token: str | None,
     scope: Scope,
     guard: SingletonGuard | None = None,
+    cors_allow_origin: str | None = None,
 ) -> None:
     """POST /admin/config — apply a runtime config override.
 
@@ -480,20 +545,21 @@ async def handle_config_post(
     Requires a valid admin token; disabled (405) when no token is configured.
     Leader-only (Plan 011 §5): non-leaders return 503.
     """
+    cors = _cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
-        await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"})
+        await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
         return
 
     if not check_admin_auth(scope, admin_token):
-        await send_json(send, 403, {"error": "unauthorized"})
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
         return
 
     if not check_csrf(scope, admin_token):
-        await send_json(send, 403, {"error": "cross-site request blocked"})
+        await send_json(send, 403, {"error": "cross-site request blocked"}, extra_headers=cors)
         return
 
     if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT)
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT, extra_headers=cors)
         return
 
     # CSRF defence: require application/json Content-Type so cross-origin
@@ -505,24 +571,24 @@ async def handle_config_post(
         "",
     )
     if not ct.lower().startswith("application/json"):
-        await send_json(send, 415, {"error": "Content-Type must be application/json"})
+        await send_json(send, 415, {"error": "Content-Type must be application/json"}, extra_headers=cors)
         return
 
     try:
         body = await _read_body(receive)
     except ValueError:
-        await send_json(send, 413, {"error": "request body too large"})
+        await send_json(send, 413, {"error": "request body too large"}, extra_headers=cors)
         return
     except ConnectionError:
         return
     try:
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
-        await send_json(send, 400, {"error": "invalid JSON body"})
+        await send_json(send, 400, {"error": "invalid JSON body"}, extra_headers=cors)
         return
 
     if not isinstance(data, dict) or "target" not in data:
-        await send_json(send, 400, {"error": "missing required field 'target'"})
+        await send_json(send, 400, {"error": "missing required field 'target'"}, extra_headers=cors)
         return
 
     value = data["target"]
@@ -533,18 +599,18 @@ async def handle_config_post(
         user = _extract_audit_user(scope)
         remote = _extract_remote(scope)
         log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
-        await send_json(send, 200, {"target": reconcile.target, "overridden": False})
+        await send_json(send, 200, {"target": reconcile.target, "overridden": False}, extra_headers=cors)
         return
 
     if not isinstance(value, int) or isinstance(value, bool):
-        await send_json(send, 400, {"error": "target must be an integer"})
+        await send_json(send, 400, {"error": "target must be an integer"}, extra_headers=cors)
         return
 
     previous = reconcile.target
     try:
         warning = reconcile.apply_override("target", value)
     except ValueError as exc:
-        await send_json(send, 400, {"error": str(exc)})
+        await send_json(send, 400, {"error": str(exc)}, extra_headers=cors)
         return
 
     user = _extract_audit_user(scope)
@@ -561,7 +627,7 @@ async def handle_config_post(
     response: dict[str, Any] = {"target": value, "overridden": True}
     if warning:
         response["warning"] = warning
-    await send_json(send, 200, response)
+    await send_json(send, 200, response, extra_headers=cors)
 
 
 async def handle_config_delete(
@@ -570,22 +636,24 @@ async def handle_config_delete(
     admin_token: str | None,
     scope: Scope,
     guard: SingletonGuard | None = None,
+    cors_allow_origin: str | None = None,
 ) -> None:
     """DELETE /admin/config/target — revert a runtime override."""
+    cors = _cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
-        await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"})
+        await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
         return
 
     if not check_admin_auth(scope, admin_token):
-        await send_json(send, 403, {"error": "unauthorized"})
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
         return
 
     if not check_csrf(scope, admin_token):
-        await send_json(send, 403, {"error": "cross-site request blocked"})
+        await send_json(send, 403, {"error": "cross-site request blocked"}, extra_headers=cors)
         return
 
     if guard is not None and not guard.is_held():
-        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT)
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT, extra_headers=cors)
         return
 
     previous = reconcile.target
@@ -593,4 +661,4 @@ async def handle_config_delete(
     user = _extract_audit_user(scope)
     remote = _extract_remote(scope)
     log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
-    await send_json(send, 200, {"target": reconcile.target, "overridden": False})
+    await send_json(send, 200, {"target": reconcile.target, "overridden": False}, extra_headers=cors)
