@@ -46,7 +46,7 @@ silently dropped.
 5. **Both surfaces, identically gated.** `/v1/messages` and `/v1/chat/completions` are the
    same concurrency unit; the gate is surface-agnostic. Don't special-case one.
 6. **Validate on CI early; distrust green local gates.** Push to a branch and watch CI
-   (3.12 + 3.13) before trusting. Async/streaming behaviour is easy to get locally-green
+   (3.12 + 3.13 + 3.14) before trusting. Async/streaming behaviour is easy to get locally-green
    and actually-broken.
 7. **Cache-transparency — be indistinguishable from a direct client.** Prompt caching
    lives entirely upstream and is keyed off the request the provider receives. So the

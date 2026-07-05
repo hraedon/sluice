@@ -10,14 +10,31 @@ on:
     - cron: "0 6 * * 1"  # Monday 06:00 UTC
 
 jobs:
+  identifier-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      # No-op until the repository secret SLUICE_FORBIDDEN_IDENTIFIERS is
+      # configured; the script exits 0 when the env var is unset (AGENTS.md:
+      # no work-domain identifiers in committed files).
+      - name: Check for committed work-domain identifiers
+        env:
+          SLUICE_FORBIDDEN_IDENTIFIERS: ${{ secrets.SLUICE_FORBIDDEN_IDENTIFIERS }}
+        run: python scripts/check_committed_identifiers.py
+
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # AGENTS.md rule 6: async/streaming is easy to get locally-green and
-        # actually-broken, so gate on both supported interpreters.
-        python-version: ["3.12", "3.13"]
+        # actually-broken, so gate on all supported interpreters.
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0

@@ -1,0 +1,30 @@
+name: dependabot-auto-merge
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    # Auto-merge Dependabot PRs once CI is green. Uses GitHub's native
+    # auto-merge (``gh pr merge --auto``): the PR merges only after all
+    # required status checks pass, so a breaking dependency update keeps the
+    # PR open for a human to fix — the safety valve. Requires BOTH:
+    #   1. repo setting "Allow auto-merge" enabled; AND
+    #   2. branch protection on main requiring the ci status checks.
+    # Without (2), auto-merge fires immediately on PR open (no safety valve);
+    # without (1), this step fails non-zero (visible, PR stays open).
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge (squash) for Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash
