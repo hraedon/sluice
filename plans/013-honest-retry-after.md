@@ -44,12 +44,13 @@ existing wait sampler.
 - **Fail safe means don't advertise too soon.** Floor at the current default (5 s) so
   the estimator can never promise a *faster* retry than today; when there is no data
   (no hold samples yet), fall back to the floor, not to zero.
-- **Stay actionable at the client.** Cap the saturated value at 60 s: both major SDKs
-  ignore a `Retry-After` above ~60 s and fall back to exponential backoff (verify the
-  exact thresholds against the pinned SDK versions during WI-006 — do not trust this
-  from memory). A cap the client discards is not honesty, it's noise. (`boxed` may
-  still exceed 60 s — its value is genuinely the window reset and the body carries it
-  for sophisticated clients; document the SDK-cap interplay rather than distort it.)
+- **Stay actionable at the client.** Cap the saturated value at 60 s: the Anthropic
+  and OpenAI Python SDKs ignore a `Retry-After` above ~60 s and fall back to exponential
+  backoff (verify the exact thresholds against the pinned SDK versions during WI-006 —
+  do not trust this from memory). A cap the client discards is not honesty, it's noise.
+  (`boxed` may still exceed 60 s — its value is genuinely the window reset and the body
+  carries it for sophisticated clients; document the SDK-cap interplay rather than
+  distort it.)
 - **Cache-transparency (hard rule 7) is untouched.** Everything here is response-side
   on sluice's own 503s; no request byte changes.
 
@@ -181,12 +182,14 @@ behaviour, not intent).
 
 - Drive real saturation (hermes/opencode flood) and capture an actual saturated 503
   with headers, before and after — the "before" artifact shows the fixed 5, the
-  "after" shows a pressure-scaled, jittered value. Save alongside
-  `docs/wi-024-429-capture-2026-07-03.md`.
-- Watch a real SDK client's retry cadence change: before = metronomic 5 s; after =
-  spread and scaled with queue depth. Confirm per-client which of the live clients
-  (Claude Code / hermes / opencode / open-webui) actually honor `Retry-After` on 503,
-  and record the findings — if a client ignores the header entirely, its behaviour is
-  unchanged and that's worth knowing too.
+  "after" shows a pressure-scaled, jittered value. Saved as
+  `docs/plan013-retry-after-capture-2026-07-04.md`.
+- SDK `Retry-After` behaviour has been verified at source level (see
+  `docs/concurrency-model.md` "Client reality"): Anthropic and OpenAI Python SDKs
+  accept the header only if `<= 60` seconds and fall back to exponential backoff
+  otherwise; the Anthropic TypeScript SDK honors it verbatim with no 60 s cap;
+  Claude Code's wrapper does not globally cap it; Open WebUI does not retry
+  upstream errors at all. Record live per-client retry cadence if possible, but
+  the cap is now grounded in pinned source, not memory.
 - Confirm the global invariant is untouched: `/v1/usage.concurrent_sessions` stays
   within bounds throughout — this plan changes what we *say*, never what we *admit*.

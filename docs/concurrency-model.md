@@ -250,7 +250,7 @@ When sluice returns a `503`, it carries a `Retry-After` header and a matching
 | reason | What happened | Retry-After promise | Jittered? |
 |---|---|---|---|
 | **saturated** (queue-timeout) | Permits > 0 but all held; the request waited the full `queue_timeout` and lost. | Pressure-derived: `ceil((queue_depth + 1) × avg_hold_seconds / capacity)`, ±15 %, clamped to `[5, 60]`. | Yes — load estimate, not a deadline. |
-| **saturated** (structural, `_last_permits == 0`) | The reconcile loop set permits to 0 (e.g. phantoms ate all). Nothing can change until the next poll. | `max(pressure_estimate, ceil(poll_interval))`, ±15 %, clamped to `[max(5, ceil(poll_interval)), 60]`. | Yes. |
+| **saturated** (structural, `_last_permits == 0`) | The reconcile loop set permits to 0 (e.g. phantoms ate all). Nothing can change until the next poll. | `max(pressure_estimate, ceil(poll_interval))`, ±15 %, clamped to `[max(5, min(60, ceil(poll_interval))), 60]`. | Yes. |
 | **boxed** | Account paused by the provider (`boxed_until`, reason ≠ `rate_limited`). | `ceil(resets_at - now)`, floored at 30 s. | No — a deadline. |
 | **breaker** | Circuit breaker open after sustained 429s. | Remaining breaker cooldown. | No — a deadline. |
 | **not_ready** | First usage poll not yet completed. | `max(2, ceil(poll_interval))` — tracks configuration. | No. |
@@ -300,9 +300,40 @@ estimator keeps that true and documents *why*.
 
 ### Client reality (SDK cap verification)
 
-The 60-second cap is based on the public behavior of the Anthropic and OpenAI Python
-SDKs. The Anthropic SDK's retry logic parses `Retry-After` and uses it, but caps the
-maximum retry wait. The OpenAI SDK similarly honors `Retry-After` with an internal
-maximum. **These caps should be verified against the pinned SDK versions the actual
-clients use** (Claude Code, hermes, opencode, open-webui) — if a client ignores the
-header entirely, its behavior is unchanged and that's worth knowing too.
+The 60-second cap was verified against the source of the SDKs the sluice clients
+actually use:
+
+- **Anthropic Python SDK** (`src/anthropic/_base_client.py`): `_calculate_retry_timeout()`
+  uses a `Retry-After` header only if `0 < retry_after <= 60`; larger values are
+  ignored and the SDK falls back to its own exponential backoff (max ~8 s).
+- **OpenAI Python SDK** (`src/openai/_base_client.py`): identical logic — honored
+  only if `0 < retry_after <= 60`, otherwise falls back to exponential backoff.
+- **Anthropic TypeScript SDK** (`src/client.ts`): honors `Retry-After` **verbatim**
+  with no 60 s cap. A header of `120` causes the SDK to wait 120 seconds. The
+  only cap is on the *fallback* exponential backoff path (`maxRetryDelay = 8.0 s`).
+- **Claude Code** (`@anthropic-ai/claude-code`, closed-source; values come from
+  recovered source, not a public release tag): its wrapper does **not** globally
+  cap `Retry-After` at 60 s. Normal retries return `retry-after * 1000` verbatim;
+  fast-mode has a 20 s short-retry threshold before switching to cooldown, and
+  persistent-mode cooldowns are measured in minutes. A 503 with a 30–60 s
+  `Retry-After` may be honored, but fast-mode paths may override it.
+- **Open WebUI** (`backend/open_webui/routers/openai.py`): does not retry upstream
+  errors at all — it re-wraps the upstream error response as a new
+  `JSONResponse` / `PlainTextResponse`, dropping upstream headers including
+  `Retry-After`. The status code and body are surfaced to the caller, but the
+  header is lost.
+- **opencode (via Vercel AI SDK / `@ai-sdk/openai-compatible`)**: the Vercel
+  AI SDK added upstream `Retry-After`/`Retry-After-Ms` support in
+  vercel/ai#7246 (merged 2025-07-16), honoring values in the 0–60 s range. With
+  a recent SDK, opencode will respect the saturated header and the 60 s cap is
+  relevant; older pinned versions ignore the header and fall back to exponential
+  backoff.
+- **umans / hermes**: no public repository was found; cap behavior is unknown.
+
+This is why the saturated value is capped at 60 s: the two most widely used
+programmatic SDKs (Anthropic and OpenAI Python) discard values above 60 s and fall
+back to short exponential backoff. A cap the client ignores is noise, not honesty.
+`boxed` may still exceed 60 s in both the `Retry-After` header and the JSON body
+because it is a genuine window-reset deadline; sluice does not distort it. The
+Anthropic/OpenAI Python SDKs will ignore a header above 60 s, but the body still
+carries the real deadline for clients that read it.
