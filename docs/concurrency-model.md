@@ -323,14 +323,17 @@ actually use:
   `Retry-After`. The status code and body are surfaced to the caller, but the
   header is lost.
 - **opencode (via Vercel AI SDK / `@ai-sdk/openai-compatible`)**: the Vercel
-  AI SDK does not currently honor upstream `Retry-After` headers and uses its own
-  exponential backoff instead (vercel/ai#7247). The header is therefore ignored
-  by opencode regardless of the cap.
+  AI SDK added upstream `Retry-After`/`Retry-After-Ms` support in
+  vercel/ai#7246 (merged 2025-07-16), honoring values in the 0–60 s range. With
+  a recent SDK, opencode will respect the saturated header and the 60 s cap is
+  relevant; older pinned versions ignore the header and fall back to exponential
+  backoff.
 - **umans / hermes**: no public repository was found; cap behavior is unknown.
 
 This is why the saturated value is capped at 60 s: the two most widely used
 programmatic SDKs (Anthropic and OpenAI Python) discard values above 60 s and fall
 back to short exponential backoff. A cap the client ignores is noise, not honesty.
-`boxed` may still exceed 60 s in the JSON body because it carries the real window
-reset deadline for sophisticated clients; the header is still capped because the
-Anthropic/OpenAI Python SDKs would ignore anything larger.
+`boxed` may still exceed 60 s in both the `Retry-After` header and the JSON body
+because it is a genuine window-reset deadline; sluice does not distort it. The
+Anthropic/OpenAI Python SDKs will ignore a header above 60 s, but the body still
+carries the real deadline for clients that read it.
