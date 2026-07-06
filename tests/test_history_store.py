@@ -818,3 +818,97 @@ def test_store_duplicate_timestamp_ordering():
         assert entries[1].concurrent_sessions == 2
         assert entries[2].concurrent_sessions == 3
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Schema migration: old database without `tp` column (WI-023)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_adds_tp_column_to_old_db():
+    """Opening a database created with the old schema (no `tp` column)
+    must migrate it and backfill DEFAULT 0 for existing rows.
+
+    Simulates an in-place upgrade: the operator had a pre-WI-023 sluice
+    running, wrote history entries, then upgraded the binary.  The new
+    code must ALTER TABLE and add the column without losing data.
+    """
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "old_schema.db")
+        # Create a database with the old schema (no `tp` column)
+        conn = sqlite3.connect(path)
+        conn.execute("""\
+CREATE TABLE history (
+    ts  REAL    NOT NULL,
+    obs INTEGER,
+    loc INTEGER NOT NULL,
+    ph  INTEGER NOT NULL,
+    ep  INTEGER NOT NULL,
+    lim INTEGER,
+    hc  INTEGER,
+    band TEXT    NOT NULL,
+    brk  TEXT    NOT NULL,
+    pl   INTEGER NOT NULL,
+    age  REAL    NOT NULL,
+    stl  INTEGER NOT NULL,
+    r429 INTEGER NOT NULL,
+    t429 INTEGER NOT NULL,
+    rl429 INTEGER NOT NULL DEFAULT 0,
+    qd   INTEGER NOT NULL,
+    qt   INTEGER NOT NULL,
+    err  INTEGER NOT NULL,
+    rwin INTEGER,
+    rlim INTEGER,
+    rrem INTEGER,
+    rlw  INTEGER,
+    rdelta INTEGER
+)
+""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)")
+        # Insert a row with the old schema (no tp column)
+        conn.execute(
+            "INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta) "
+            "VALUES (1000.0, 3, 2, 0, 3, 4, 8, 'normal', 'closed', 0, 1.0, 0, 0, 0, 0, 0, 0, 0, 10, 200, 190, 8, 2)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with the new code — migration should run automatically
+        store = SQLiteHistoryStore(path)
+        assert store.is_available, "store should be available after migration"
+
+        # Old row should be loadable with throughput=0 (DEFAULT 0 backfill)
+        entries = store.load_recent(10)
+        assert len(entries) == 1
+        assert entries[0].concurrent_sessions == 3
+        assert entries[0].throughput == 0, "old rows should have throughput=0 after migration"
+
+        # New row should store the throughput value correctly
+        store.append(_entry(timestamp=1001.0, concurrent_sessions=1, throughput=5))
+        entries = store.load_recent(10)
+        assert len(entries) == 2
+        assert entries[0].throughput == 0, "old row throughput still 0"
+        assert entries[1].throughput == 5, "new row throughput should be 5"
+
+        store.close()
+
+
+def test_migration_idempotent_when_tp_already_exists():
+    """Opening a database that already has the `tp` column should not
+    error or duplicate the migration."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "new_schema.db")
+        # Create with the new code (which creates the full schema including tp)
+        store1 = SQLiteHistoryStore(path)
+        store1.append(_entry(timestamp=1000.0, throughput=3))
+        store1.close()
+
+        # Reopen — migration should be a no-op
+        store2 = SQLiteHistoryStore(path)
+        assert store2.is_available
+        entries = store2.load_recent(10)
+        assert len(entries) == 1
+        assert entries[0].throughput == 3
+        store2.close()

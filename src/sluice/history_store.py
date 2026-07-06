@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS history (
     rlim INTEGER,
     rrem INTEGER,
     rlw  INTEGER,
-    rdelta INTEGER
+    rdelta INTEGER,
+    tp   INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -116,15 +117,16 @@ _MIGRATIONS = [
     "ALTER TABLE history ADD COLUMN rlw INTEGER",
     "ALTER TABLE history ADD COLUMN rdelta INTEGER",
     "ALTER TABLE history ADD COLUMN rl429 INTEGER DEFAULT 0",
+    "ALTER TABLE history ADD COLUMN tp INTEGER NOT NULL DEFAULT 0",
 ]
 
 _INSERT = """\
-INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT = """\
-SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta
+SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp
 FROM history ORDER BY ts DESC, rowid DESC LIMIT ?
 """
 
@@ -222,6 +224,7 @@ class SQLiteHistoryStore:
                     entry.requests_remaining,
                     entry.local_requests_in_window,
                     entry.request_window_delta,
+                    entry.throughput,
                 ),
             )
         except Exception:
@@ -263,6 +266,7 @@ class SQLiteHistoryStore:
                 requests_remaining=row[20] if len(row) > 20 else None,
                 local_requests_in_window=row[21] if len(row) > 21 else None,
                 request_window_delta=row[22] if len(row) > 22 else None,
+                throughput=row[23] if len(row) > 23 and row[23] is not None else 0,
             )
             for row in rows
         ]

@@ -63,6 +63,10 @@ class StatusSnapshot:
     local_requests_in_window: int | None
     request_window_delta: int | None
     total_requests_forwarded: int
+    throughput: int
+    idle: bool
+    poll_interval_idle: float | None
+    client_metrics: dict[str, dict[str, int]] | None
 
     # Runtime overrides (Plan 011)
     overrides: dict[str, Any]
@@ -111,11 +115,20 @@ class StatusSnapshot:
             "local_requests_in_window": self.local_requests_in_window,
             "request_window_delta": self.request_window_delta,
             "total_requests_forwarded": self.total_requests_forwarded,
+            "throughput": self.throughput,
+            "idle": self.idle,
+            "poll_interval_idle": self.poll_interval_idle,
+            "client_metrics": self.client_metrics,
             "overrides": self.overrides,
         }
 
 
-def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None) -> StatusSnapshot:
+def snapshot(
+    reconcile: ReconciliationLoop,
+    guard: SingletonGuard | None = None,
+    *,
+    client_metrics: dict[str, dict[str, int]] | None = None,
+) -> StatusSnapshot:
     """Build a :class:`StatusSnapshot` from the reconciliation loop's current state."""
     reading = None
     if reconcile.last_reading is not None:
@@ -159,6 +172,7 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
             "target": reconcile.target,
             "min_floor": reconcile.min_floor,
             "poll_interval": reconcile.poll_interval,
+            "poll_interval_idle": reconcile.poll_interval_idle,
             "usage_fresh_ttl": reconcile.usage_fresh_ttl,
             "phantom_window": reconcile.phantom_window,
             "breaker_threshold": reconcile.breaker_threshold,
@@ -175,6 +189,10 @@ def snapshot(reconcile: ReconciliationLoop, guard: SingletonGuard | None = None)
         local_requests_in_window=reconcile.local_requests_in_window,
         request_window_delta=reconcile.request_window_delta,
         total_requests_forwarded=reconcile.total_requests_forwarded,
+        throughput=reconcile.last_throughput,
+        idle=reconcile.is_idle,
+        poll_interval_idle=reconcile.poll_interval_idle,
+        client_metrics=client_metrics,
         overrides=reconcile.overrides,
     )
 
@@ -240,6 +258,32 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_local_requests_in_window", "Sluice forwarded requests within the provider's window", snap.local_requests_in_window)
     gauge("sluice_request_window_delta", "Provider requests_in_window minus sluice local count (leakage)", snap.request_window_delta)
     gauge("sluice_total_requests_forwarded", "Total requests forwarded upstream since startup", snap.total_requests_forwarded)
+    gauge("sluice_throughput", "Requests forwarded in the last tick interval", snap.throughput)
+    gauge("sluice_idle", "1 when the system is idle (no traffic, no 429s, normal band, no phantoms, breaker closed)", 1 if snap.idle else 0)
+
+    # Per-client metrics (WI-023 feature #4)
+    # One HELP/TYPE per metric name, one line per label value (H-2 fix).
+    if snap.client_metrics:
+        client_metric_names = (
+            ("sluice_client_forwarded", "Total requests forwarded per client label", "forwarded"),
+            ("sluice_client_succeeded", "Total requests succeeded per client label", "succeeded"),
+            ("sluice_client_concurrency_429", "Total concurrency 429s per client label", "concurrency_429"),
+            ("sluice_client_rate_limit_429", "Total rate-limit 429s per client label", "rate_limit_429"),
+            ("sluice_client_gateway_429", "Total gateway 429s per client label", "gateway_429"),
+            ("sluice_client_queue_timeouts", "Total queue timeouts per client label", "queue_timeouts"),
+        )
+        for metric_name, help_text, attr in client_metric_names:
+            has_data = any(c.get(attr, 0) > 0 for c in snap.client_metrics.values())
+            if not has_data:
+                continue
+            lines.append(f"# HELP {metric_name} {help_text}")
+            lines.append(f"# TYPE {metric_name} counter")
+            for label, counters in snap.client_metrics.items():
+                val = counters.get(attr, 0)
+                if val > 0:
+                    # Escape label value for Prometheus (H-3 fix)
+                    escaped = label.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                    lines.append(f'{metric_name}{{label="{escaped}"}} {val}')
 
     # Config + overrides (Plan 011)
     gauge("sluice_config_target", "Current target concurrency (boot or overridden)", snap.target)

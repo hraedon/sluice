@@ -44,6 +44,7 @@ Compact field names in ``to_dict()`` (used by /history.json):
     rrem requests_remaining
     rlw  local_requests_in_window
     rdelta request_window_delta
+    tp   throughput (requests forwarded since previous tick)
     ===  ==========================
     """
 
@@ -85,6 +86,7 @@ class HistoryEntry:
     requests_remaining: int | None = None
     local_requests_in_window: int | None = None
     request_window_delta: int | None = None
+    throughput: int = 0  # requests forwarded since the previous tick (WI-023)
     tick_failed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -112,6 +114,7 @@ class HistoryEntry:
             "rrem": self.requests_remaining,
             "rlw": self.local_requests_in_window,
             "rdelta": self.request_window_delta,
+            "tp": self.throughput,
         }
 
 

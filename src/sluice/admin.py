@@ -271,8 +271,9 @@ async def send_status_json(
     guard: SingletonGuard | None,
     build_sha: str | None,
     cors_allow_origin: str | None = None,
+    client_metrics: dict[str, dict[str, int]] | None = None,
 ) -> None:
-    snap = status_snapshot(reconcile, guard)
+    snap = status_snapshot(reconcile, guard, client_metrics=client_metrics)
     payload = snap.to_dict()
     payload["version"] = __version__
     payload["build"] = build_sha
@@ -285,8 +286,9 @@ async def send_status_json(
 async def send_prometheus(
     send: Send, reconcile: ReconciliationLoop, guard: SingletonGuard | None,
     cors_allow_origin: str | None = None,
+    client_metrics: dict[str, dict[str, int]] | None = None,
 ) -> None:
-    snap = status_snapshot(reconcile, guard)
+    snap = status_snapshot(reconcile, guard, client_metrics=client_metrics)
     text = to_prometheus(snap)
     await send_text(
         send, 200, text,
@@ -662,3 +664,57 @@ async def handle_config_delete(
     remote = _extract_remote(scope)
     log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
     await send_json(send, 200, {"target": reconcile.target, "overridden": False}, extra_headers=cors)
+
+
+async def handle_reload(
+    send: Send,
+    app: Any,
+    admin_token: str | None,
+    scope: Scope,
+    guard: SingletonGuard | None = None,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """POST /admin/reload — re-read the config file and apply safe changes.
+
+    Requires admin auth.  Returns a summary of what changed.
+    Returns 400 if no config file was specified at startup.
+    """
+    cors = _cors_extra_headers(cors_allow_origin, None)
+    if not admin_token:
+        await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
+        return
+
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 403, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    if not check_csrf(scope, admin_token):
+        await send_json(send, 403, {"error": "cross-site request blocked"}, extra_headers=cors)
+        return
+
+    if guard is not None and not guard.is_held():
+        await send_json(send, 503, {"error": "not_leader", "reason": "not_leader", "retry_after": RETRY_AFTER_SHORT}, retry_after=RETRY_AFTER_SHORT, extra_headers=cors)
+        return
+
+    reload_fn = getattr(app, "_reload_from_config", None)
+    config_path = getattr(app, "_config_path", None)
+    if reload_fn is None or not config_path:
+        await send_json(send, 400, {"error": "no config file — reload unavailable (start with --config)"}, extra_headers=cors)
+        return
+
+    # Run in executor to avoid blocking the event loop with file I/O (H-1)
+    loop = asyncio.get_running_loop()
+    try:
+        changes = await loop.run_in_executor(None, reload_fn)
+    except Exception as exc:
+        log.warning("config reload failed: %s", exc, exc_info=True)
+        await send_json(send, 500, {"error": f"reload failed: {exc}"}, extra_headers=cors)
+        return
+
+    user = _extract_audit_user(scope)
+    remote = _extract_remote(scope)
+    if changes:
+        log.info("config reloaded (user=%s, remote=%s): %s", user, remote, changes)
+    else:
+        log.info("config reloaded — no changes (user=%s, remote=%s)", user, remote)
+    await send_json(send, 200, {"reloaded": True, "changes": changes}, extra_headers=cors)

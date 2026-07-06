@@ -77,6 +77,7 @@ class LifecycleManager:
         self._acquired = False
         self._retry_task: asyncio.Task[None] | None = None
         self._draining = False
+        self._app_ref: Any = None  # set by ProxyApp for SIGHUP reload
 
     @property
     def acquired(self) -> bool:
@@ -87,6 +88,39 @@ class LifecycleManager:
     def is_draining(self) -> bool:
         """True during shutdown drain — new requests should be fast-failed."""
         return self._draining
+
+    def _register_sighup(self) -> None:
+        """Register SIGHUP handler for config reload (H-1 fix).
+
+        Uses ``loop.add_signal_handler`` so the handler runs on the event
+        loop thread (not in a signal handler context), and the file I/O
+        is dispatched to an executor to avoid blocking.
+        """
+        import signal
+
+        app = getattr(self, "_app_ref", None)
+        if app is None or not getattr(app, "_config_path", None):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(self._async_reload(app)),
+            )
+        except (AttributeError, ValueError, NotImplementedError):
+            log.warning("SIGHUP handler not available on this platform")
+
+    async def _async_reload(self, app: Any) -> None:
+        """Run config reload in an executor to avoid blocking I/O (H-1)."""
+        loop = asyncio.get_running_loop()
+        try:
+            changes = await loop.run_in_executor(None, app._reload_from_config)
+            if changes:
+                log.info("SIGHUP: config reloaded — %s", changes)
+            else:
+                log.info("SIGHUP: config reloaded — no changes")
+        except Exception as exc:
+            log.warning("SIGHUP: config reload failed: %s", exc, exc_info=True)
 
     async def handle_lifespan(self, receive: Receive, send: Send) -> None:
         while True:
@@ -113,6 +147,9 @@ class LifecycleManager:
                             self._acquired = True
                 else:
                     await self._reconcile.start()
+                # Register SIGHUP handler for config reload (H-1: runs in
+                # executor to avoid blocking the event loop with file I/O).
+                self._register_sighup()
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
                 try:

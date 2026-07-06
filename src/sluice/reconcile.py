@@ -89,6 +89,7 @@ class ReconciliationLoop:
         history_store: HistoryStore | None = None,
         history_ttl: float = _DEFAULT_HISTORY_TTL,
         rng: Callable[[], float] = random.random,
+        poll_interval_idle: float | None = None,
     ) -> None:
         self._truth = truth_source
         self._gate = gate
@@ -106,6 +107,11 @@ class ReconciliationLoop:
         self._history_ttl = history_ttl
         self._tick_count = 0
         self._rng = rng
+        # Idle poll backoff (WI-022): when idle, sleep at poll_interval_idle
+        # instead of poll_interval.  None disables the backoff (always fast).
+        self._poll_interval_idle_cfg: float | None = poll_interval_idle
+        self._idle = False
+        self._poll_now: asyncio.Event | None = None  # created in start()
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
@@ -125,8 +131,10 @@ class ReconciliationLoop:
         # cap — at typical home-lab rates this is never hit.
         self._request_timestamps: deque[float] = deque(maxlen=_REQ_TS_MAXLEN)
         self._total_requests_forwarded = 0
+        self._prev_total_requests_forwarded = 0  # for per-tick throughput (WI-023)
         self._last_local_requests_in_window: int | None = None
         self._last_request_window_delta: int | None = None
+        self._last_throughput: int = 0  # requests forwarded since previous tick (WI-023)
 
         self._adaptive = AdaptiveSnapshot()
 
@@ -220,6 +228,7 @@ class ReconciliationLoop:
             now=now,
             config=self._brk_cfg,
         )
+        self._wake_poll()
 
     def record_gateway_429(self) -> None:
         """A gateway/CDN 429 was received (not from the upstream's concurrency
@@ -251,6 +260,7 @@ class ReconciliationLoop:
             now=now,
             config=self._brk_cfg,
         )
+        self._wake_poll()
 
     def record_success(self) -> None:
         """An upstream request completed normally."""
@@ -292,11 +302,23 @@ class ReconciliationLoop:
         now = self._mono()
         self._request_timestamps.append(now)
         self._total_requests_forwarded += 1
+        self._wake_poll()
 
     def _prune_429s(self, now: float) -> None:
         cutoff = now - self._brk_cfg.window_seconds
         while self._recent_429s and self._recent_429s[0] < cutoff:
             self._recent_429s.popleft()
+
+    def _wake_poll(self) -> None:
+        """Signal the reconcile loop to wake from an idle sleep (WI-022).
+
+        No-op when the loop hasn't started yet (``_poll_now`` is None) or
+        when the loop is already using the fast interval (the event is
+        cleared after each tick, so setting it is harmless if the loop
+        is already awake).
+        """
+        if self._poll_now is not None:
+            self._poll_now.set()
 
     # -- the tick ------------------------------------------------------------
 
@@ -375,6 +397,12 @@ class ReconciliationLoop:
         self._last_reading_cached = cached
         self._last_age = age
 
+        # Throughput: requests forwarded since the previous tick (WI-023).
+        # Computed as the delta of the cumulative counter, so it reflects
+        # actual traffic in this tick interval — zero means idle.
+        self._last_throughput = self._total_requests_forwarded - self._prev_total_requests_forwarded
+        self._prev_total_requests_forwarded = self._total_requests_forwarded
+
         # Request-window reconciliation: prune local timestamps to the
         # provider's window and compute the delta against requests_in_window.
         window_s = reading.requests_window_seconds
@@ -396,6 +424,22 @@ class ReconciliationLoop:
 
         if cached.ok:
             self._first_poll_ok = True
+
+        # Idle detection (WI-022): when the system is quiescent, the next
+        # poll can happen at the slower idle interval.  Idle means no traffic,
+        # no recent 429s, normal band, no phantoms, and a closed breaker.
+        # Also requires a fresh reading — if the usage fetch is failing, stay
+        # on the fast cadence so recovery is detected promptly (M-1).
+        # The _poll_now event lets activity (record_request_forwarded /
+        # record_429) wake the loop early from an idle sleep.
+        self._idle = (
+            cached.ok
+            and self._gate.held == 0
+            and len(self._recent_429s) == 0
+            and self._last_band is Band.NORMAL
+            and self._last_phantom_estimate == 0
+            and self._breaker.state is BreakerState.CLOSED
+        )
 
         # Record this tick's state for trend analysis.  The entry is frozen at
         # capture time so the history forms an immutable time series.  Recorded
@@ -425,6 +469,7 @@ class ReconciliationLoop:
                 requests_remaining=reading.requests_remaining if cached.ok else None,
                 local_requests_in_window=self._last_local_requests_in_window,
                 request_window_delta=self._last_request_window_delta,
+                throughput=self._last_throughput,
             )
             if self._history is not None:
                 self._history.append(entry)
@@ -432,7 +477,15 @@ class ReconciliationLoop:
                 self._history_store.append(entry)
 
     async def run(self) -> None:
-        """Run the reconciliation loop forever (until cancelled)."""
+        """Run the reconciliation loop forever (until cancelled).
+
+        Uses a two-speed poll cadence (WI-022): the fast interval when
+        active, the slow idle interval when quiescent.  An asyncio.Event
+        lets activity (request forwarded, 429) wake the loop early from an
+        idle sleep so the gate resizes promptly when traffic resumes.
+        """
+        if self._poll_now is None:
+            self._poll_now = asyncio.Event()
         while True:
             try:
                 await self.tick()
@@ -461,7 +514,13 @@ class ReconciliationLoop:
                         self._record_failed_tick()
                     except Exception:
                         log.warning("_record_failed_tick failed", exc_info=True)
-            await asyncio.sleep(self._poll_interval)
+            # Dynamic sleep: slow when idle, fast when active (WI-022).
+            interval = self._effective_poll_interval()
+            self._poll_now.clear()
+            try:
+                await asyncio.wait_for(self._poll_now.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
 
     def _record_failed_tick(self) -> None:
         """Record a fail-safe history entry when tick() raises.
@@ -498,6 +557,7 @@ class ReconciliationLoop:
             requests_remaining=reading.requests_remaining if reading else None,
             local_requests_in_window=self._last_local_requests_in_window,
             request_window_delta=self._last_request_window_delta,
+            throughput=0,
             tick_failed=True,
         )
         if self._history is not None:
@@ -508,6 +568,8 @@ class ReconciliationLoop:
     async def start(self) -> None:
         """Start the background loop as a task."""
         self._stopped = False
+        if self._poll_now is None:
+            self._poll_now = asyncio.Event()
         if self._task is None:
             self._task = asyncio.create_task(self.run())
 
@@ -715,9 +777,36 @@ class ReconciliationLoop:
         return self._poll_interval
 
     @property
+    def poll_interval_idle(self) -> float | None:
+        """The configured idle poll interval, or None if backoff is disabled (WI-022)."""
+        return self._poll_interval_idle_cfg
+
+    @property
+    def is_idle(self) -> bool:
+        """True when the system was idle at the last tick (WI-022)."""
+        return self._idle
+
+    def _effective_poll_interval(self) -> float:
+        """The sleep interval for the next poll cycle (WI-022).
+
+        When idle and idle backoff is enabled, returns ``poll_interval_idle``
+        capped at ``usage_fresh_ttl * 0.8`` so the usage reading does not go
+        stale before the next poll.  Otherwise returns ``poll_interval``.
+        """
+        if self._idle and self._poll_interval_idle_cfg is not None:
+            cap = self._ctrl_cfg.usage_fresh_ttl * 0.8
+            return min(self._poll_interval_idle_cfg, cap)
+        return self._poll_interval
+
+    @property
     def total_requests_forwarded(self) -> int:
         """Total requests forwarded upstream since startup."""
         return self._total_requests_forwarded
+
+    @property
+    def last_throughput(self) -> int:
+        """Requests forwarded in the last tick interval (WI-023)."""
+        return self._last_throughput
 
     @property
     def local_requests_in_window(self) -> int | None:

@@ -73,6 +73,7 @@ _DEFAULTS: dict[str, Any] = {
     "listen": "127.0.0.1:8800",
     "target": 3,
     "poll_interval": 5.0,
+    "poll_interval_idle": 30.0,
     "release_cooldown": 2.0,
     "queue_timeout": 30.0,
     "retry_interval": 10.0,
@@ -113,7 +114,7 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 def _coerce(env_val: str, key: str) -> Any:
     if key in ("target", "history_size", "max_request_body_bytes"):
         return int(env_val)
-    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout", "upstream_idle_timeout"):
+    if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout", "upstream_idle_timeout", "poll_interval_idle"):
         return float(env_val)
     return env_val
 
@@ -149,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--listen", default=None, help="host:port to listen on (default: 127.0.0.1:8800)")
     serve.add_argument("--target", type=int, default=None, help="target max observed concurrency (default: 3)")
     serve.add_argument("--poll-interval", type=float, default=None, help="seconds between /v1/usage polls (default: 5)")
+    serve.add_argument("--poll-interval-idle", type=float, default=None, help="seconds between polls when idle — no traffic, no 429s, normal band (default: 30, capped at usage_fresh_ttl*0.8; WI-022)")
     serve.add_argument("--release-cooldown", type=float, default=None, help="seconds a freed permit rests (default: 2)")
     serve.add_argument("--queue-timeout", type=float, default=None, help="max seconds to wait for a permit (default: 30)")
     serve.add_argument("--retry-interval", type=float, default=None, help="seconds between singleton-lease re-acquire attempts when not leader (default: 10)")
@@ -209,6 +211,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     listen = _resolve("listen", args)
     target = _resolve("target", args)
     poll_interval = _resolve("poll_interval", args)
+    poll_interval_idle = _resolve("poll_interval_idle", args)
     release_cooldown = _resolve("release_cooldown", args)
     queue_timeout = _resolve("queue_timeout", args)
     retry_interval = _resolve("retry_interval", args)
@@ -234,6 +237,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     if max_request_body_bytes is not None and max_request_body_bytes == -1:
         max_request_body_bytes = None
+
+    # 0 or -1 disables idle poll backoff (WI-022)
+    if poll_interval_idle is not None and poll_interval_idle <= 0:
+        poll_interval_idle = None
 
     try:
         trusted_proxies = parse_trusted_proxies(trusted_proxies_raw)
@@ -356,6 +363,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         history=history,
         history_store=history_store,
         history_ttl=history_ttl,
+        poll_interval_idle=poll_interval_idle,
     )
     app = ProxyApp(
         upstream_base_url=upstream,
@@ -372,6 +380,15 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         upstream_idle_timeout=upstream_idle_timeout,
         cors_allow_origin=cors_allow_origin,
     )
+    app._config_path = config_path
+
+    # SIGHUP handler: re-read config file and apply safe changes (WI-022 feature #3)
+    # Registered in the ASGI lifespan startup via loop.add_signal_handler()
+    # to avoid blocking the event loop with file I/O (H-1).
+    if config_path:
+        log.info("  config_reload:     SIGHUP (path=%s)", config_path)
+    else:
+        log.info("  config_reload:     disabled (no --config)")
 
     log.info("sluice %s starting", __version__)
     log.info("  upstream:          %s", upstream)
@@ -380,6 +397,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     log.info("  listen:            %s:%d", host, port)
     log.info("  target:            %d", target)
     log.info("  poll_interval:     %.1fs", poll_interval)
+    if poll_interval_idle is not None:
+        log.info("  poll_interval_idle: %.1fs (WI-022)", poll_interval_idle)
     log.info("  release_cooldown:  %.1fs", release_cooldown)
     log.info("  queue_timeout:     %.1fs", queue_timeout)
     log.info("  retry_interval:    %.1fs", retry_interval)
@@ -450,6 +469,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"gate_closed_reason: {d.get('gate_closed_reason', '?')}")
     print(f"total_429s:         {d['total_429s']}")
     print(f"queue_depth:        {d['queue_depth']}")
+    print(f"throughput:         {d.get('throughput', '?')} req/tick")
     print(f"queue_wait:         {d.get('avg_wait_seconds', '?')}s avg / {d.get('p95_wait_seconds', '?')}s p95")
     print(f"queue_timeouts:     {d.get('queue_timeouts', '?')}")
     print(f"ready:              {d.get('ready', '?')}")

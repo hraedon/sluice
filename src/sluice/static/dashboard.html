@@ -50,6 +50,8 @@ tr.row-crit td{color:var(--crit)}
 .banner.boxed{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit)}
 .banner.breaker{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
 .banner.deprio{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
+.banner.error{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit);cursor:pointer}
+.banner.error:hover{opacity:.8}
 #countdown{font-weight:600}
 #deprio-countdown{font-weight:600}
 .gauge{position:relative;height:24px;background:var(--inset);border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
@@ -127,6 +129,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
     <button id="btn-logout" onclick="doLogout()" title="log out">logout</button>
   </div>
 </div>
+<div id="banner-error" class="banner error" onclick="this.style.display='none'" title="click to dismiss"></div>
 <div id="banner-boxed" class="banner boxed">ACCOUNT BOXED — retry after <span id="countdown">?</span>s</div>
 <div id="banner-deprio" class="banner deprio">DEPRIORITIZED (rate_limited) — serving at reduced permits, window ends in <span id="deprio-countdown">?</span>s</div>
 <div id="banner-breaker" class="banner breaker">CIRCUIT BREAKER OPEN — backing off</div>
@@ -156,6 +159,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <span title="queue_depth on the lower spark, on its own scale"><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
       <span title="tick where queue_timeouts incremented between samples"><span class="dot" style="background:var(--warn)"></span> timeout</span>
       <span title="tick where total_429s incremented between samples"><span class="dot" style="background:var(--crit)"></span> 429</span>
+      <span title="throughput - requests forwarded per tick interval; bars at the bottom of the spark show traffic, distinguishing idle from healthy (WI-023)"><span class="dot" style="background:var(--ok);opacity:.4"></span> throughput</span>
     </div>
     <div id="req-section" class="req-section">
       <div class="req-head">
@@ -176,8 +180,8 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
         <tr><th>time</th><td id="tip-ts" colspan="5">-</td></tr>
         <tr><th>obs</th><td id="tip-obs">-</td><th>loc</th><td id="tip-loc">-</td><th>ep</th><td id="tip-ep">-</td></tr>
         <tr><th>qd</th><td id="tip-qd">-</td><th>band</th><td id="tip-band" colspan="3">-</td></tr>
-        <tr><th>age</th><td id="tip-age">-</td><th>lim</th><td id="tip-lim">-</td><th>hc</th><td id="tip-hc">-</td></tr>
-        <tr><th>brk</th><td id="tip-brk" colspan="5">-</td></tr>
+        <tr><th>tp</th><td id="tip-tp">-</td><th>age</th><td id="tip-age">-</td><th>lim</th><td id="tip-lim">-</td></tr>
+        <tr><th>hc</th><td id="tip-hc">-</td><th>brk</th><td id="tip-brk" colspan="3">-</td></tr>
       </table>
     </div>
   </div>
@@ -209,7 +213,7 @@ function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocale
 function fromHistEntry(e){
   return {ts:e.ts,obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep,lim:e.lim,hc:e.hc,
           band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429,
-          rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta};
+          rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta,tp:e.tp||0};
 }
 
 async function initHistory(){
@@ -231,6 +235,18 @@ function doLogout(){
   f.action='/logout';
   document.body.appendChild(f);
   f.submit();
+}
+
+function showError(msg){
+  var el=document.getElementById('banner-error');
+  if(!el) return;
+  el.textContent=msg;
+  el.style.display='block';
+}
+
+function hideError(){
+  var el=document.getElementById('banner-error');
+  if(el) el.style.display='none';
 }
 
 function setRange(rg){
@@ -278,7 +294,7 @@ async function doPoll(){
                qt:d.queue_timeouts,t429:d.total_429s,
                rwin:d.requests_in_window,rlim:d.requests_limit,
                rrem:d.requests_remaining,rlw:d.local_requests_in_window,
-               rdelta:d.request_window_delta});
+               rdelta:d.request_window_delta,tp:d.throughput||0});
     if(hist.length>HIST_MAX) hist.shift();
     if(viewRange==='5m'){renderSparks();}
     else{fetchLong(false);}
@@ -315,6 +331,7 @@ function togglePause(){
 async function stepTarget(delta){
   if(mutationsDisabled||configSaving||!lastD) return;
   configSaving=true;
+  hideError();
   render(lastD);
   var cur=lastD.config.target;
   var newVal=cur+delta;
@@ -327,12 +344,15 @@ async function stepTarget(delta){
     });
     if(r.status===405){
       mutationsDisabled=true;
+      showError('Config mutations disabled — set SLUICE_ADMIN_TOKEN to enable');
     }else if(r.status===403){
       window.location.href='/';return;
     }else if(!r.ok){
-      try{var b=await r.json();console.warn('target override failed: '+(b.error||r.status));}catch(e){}
+      var msg='target override failed ('+r.status+')';
+      try{var b=await r.json();if(b.error)msg=b.error;}catch(e){}
+      showError(msg);
     }
-  }catch(e){}
+  }catch(e){showError('network error: '+e.message);}
   configSaving=false;
   await doPoll();
 }
@@ -340,6 +360,7 @@ async function stepTarget(delta){
 async function revertTarget(){
   if(mutationsDisabled||configSaving) return;
   configSaving=true;
+  hideError();
   render(lastD);
   try{
     var r=await fetch('/admin/config/target',{
@@ -348,12 +369,15 @@ async function revertTarget(){
     });
     if(r.status===405){
       mutationsDisabled=true;
+      showError('Config mutations disabled — set SLUICE_ADMIN_TOKEN to enable');
     }else if(r.status===403){
       window.location.href='/';return;
     }else if(!r.ok){
-      try{var b=await r.json();console.warn('target revert failed: '+(b.error||r.status));}catch(e){}
+      var msg='target revert failed ('+r.status+')';
+      try{var b=await r.json();if(b.error)msg=b.error;}catch(e){}
+      showError(msg);
     }
-  }catch(e){}
+  }catch(e){showError('network error: '+e.message);}
   configSaving=false;
   await doPoll();
 }
@@ -467,6 +491,7 @@ function render(d){
   var crows=[
     ['min_floor',c.min_floor,'Effective permits never drop below this'],
     ['poll_interval',c.poll_interval!=null?c.poll_interval+'s':null,'How often the provider usage endpoint is polled'],
+    ['poll_interval_idle',c.poll_interval_idle!=null?c.poll_interval_idle+'s (idle)':'disabled','Slow poll interval when idle (WI-022) — capped at usage_fresh_ttl*0.8 to avoid stale readings'],
     ['usage_fresh_ttl',c.usage_fresh_ttl!=null?c.usage_fresh_ttl+'s':null,'Maximum age of a usage reading before the controller stops trusting it'],
     ['phantom_window',c.phantom_window,'Number of polls in the windowed-min phantom estimate; higher is slower but surer absorption'],
     ['breaker_threshold',c.breaker_threshold,'Recent 429s that trip the breaker open'],
@@ -555,7 +580,8 @@ function withIncs(samples){
     return {ts:s.ts,obs:s.obs,loc:s.loc,ph:s.ph,ep:s.ep,lim:s.lim,hc:s.hc,
             qd:s.qd||0,band:s.band||'normal',brk:s.brk||'closed',stl:!!s.stl,age:s.age||0,
             qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429),
-            rwin:s.rwin,rlim:s.rlim,rrem:s.rrem,rlw:s.rlw,rdelta:s.rdelta};
+            rwin:s.rwin,rlim:s.rlim,rrem:s.rrem,rlw:s.rlw,rdelta:s.rdelta,
+            tp:s.tp||0};
   });
 }
 
@@ -569,7 +595,7 @@ function bucketize(samples,n){
   for(var i=0;i<samples.length;i+=k){
     var b={ts:0,obs:null,loc:0,ph:0,ep:0,lim:null,hc:null,qd:0,
            band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false,
-           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null};
+           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null,tp:0};
     for(var j=i;j<Math.min(i+k,samples.length);j++){
       var s=samples[j];
       b.ts=s.ts||b.ts;
@@ -590,6 +616,7 @@ function bucketize(samples,n){
       if(s.rrem!=null) b.rrem=s.rrem;
       if(s.rlw!=null&&(b.rlw==null||s.rlw>b.rlw)) b.rlw=s.rlw;
       if(s.rdelta!=null&&(b.rdelta==null||s.rdelta>b.rdelta)) b.rdelta=s.rdelta;
+      b.tp+=s.tp||0;
     }
     out.push(b);
   }
@@ -667,6 +694,20 @@ function renderSparks(){
   }
   // Keep crosshair line on top and off-canvas by default
   s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/>';
+  // Throughput bars at the bottom of the spark (WI-023)
+  var maxTp=0;
+  for(var ti=0;ti<valid.length;ti++){if(valid[ti].tp>maxTp)maxTp=valid[ti].tp;}
+  if(maxTp>0){
+    var tpBarH=10;
+    var tpBase=H-pad;
+    for(var tb=0;tb<valid.length;tb++){
+      if(valid[tb].tp>0){
+        var bh=Math.max(1,(valid[tb].tp/maxTp)*tpBarH);
+        var bx=xAt(tb).toFixed(1);
+        s+='<rect x="'+(bx-0.5)+'" y="'+(tpBase-bh).toFixed(1)+'" width="1" height="'+bh.toFixed(1)+'" fill="var(--ok)" opacity="0.4"/>';
+      }
+    }
+  }
   svg.innerHTML=s;
   // -- band ribbon: one segment per non-normal sample
   var rb='';
@@ -691,7 +732,7 @@ function renderSparks(){
     else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
   }
   document.getElementById('qspark').innerHTML=qs;
-  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ;
+  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ+(maxTp>0?' · throughput max '+maxTp:'');
   // -- reconciliation spark: provider requests_in_window vs sluice local count
   var rspark=document.getElementById('rspark');
   var rinfo=document.getElementById('rspark-info');
@@ -765,6 +806,7 @@ function onSparkHover(e){
   document.getElementById('tip-loc').textContent=s.loc;
   document.getElementById('tip-ep').textContent=s.ep;
   document.getElementById('tip-qd').textContent=s.qd;
+  document.getElementById('tip-tp').textContent=s.tp!=null?s.tp:'-';
   document.getElementById('tip-band').textContent=s.band;
   var ageEl=document.getElementById('tip-age');
   ageEl.textContent=(s.age!=null?s.age+'s':'-')+(s.stl?' stale':'');

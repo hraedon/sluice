@@ -5,6 +5,8 @@ Uses a fake clock and a fake usage source — no network.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from sluice.control import (
@@ -1145,3 +1147,265 @@ def test_saturation_retry_after_header_and_body_match():
     result = loop.saturation_retry_after()
     assert isinstance(result, int)
     assert 5 <= result <= 60
+
+
+# --- WI-022: idle poll backoff -----------------------------------------------
+
+
+async def test_idle_detection_after_quiescent_tick():
+    """The loop sets _idle=True when no traffic, no 429s, normal band, no phantoms."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.is_idle is True
+    assert loop._idle is True
+
+
+async def test_not_idle_when_traffic_in_flight():
+    """Not idle when local_in_flight > 0."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.is_idle is True
+    # Simulate a held permit
+    await gate.acquire(timeout=0.01)
+    await loop.tick()
+    assert loop.is_idle is False
+    await gate.release()
+
+
+async def test_not_idle_when_recent_429():
+    """Not idle when there are recent 429s."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.is_idle is True
+    loop.record_429()
+    await loop.tick()
+    assert loop.is_idle is False
+
+
+async def test_not_idle_when_phantom_estimate_nonzero():
+    """Not idle when phantom estimate > 0."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=5))
+    await loop.tick()
+    # 5 observed, 0 local → phantom=5 → not idle
+    assert loop.is_idle is False
+
+
+async def test_not_idle_when_band_not_normal():
+    """Not idle when band is not NORMAL (e.g. LOW)."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(concurrent_sessions=6, priority_low=True)
+    )
+    await loop.tick()
+    assert loop.is_idle is False
+
+
+async def test_not_idle_when_breaker_open():
+    """Not idle when breaker is OPEN."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    # Trip the breaker by recording enough 429s
+    for _ in range(BCFG.threshold):
+        loop.record_429()
+    await loop.tick()
+    assert loop.is_idle is False
+
+
+def test_effective_poll_interval_fast_when_active():
+    """When not idle, the effective interval is the fast poll_interval."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._idle = False
+    assert loop._effective_poll_interval() == 5.0
+
+
+def test_effective_poll_interval_slow_when_idle():
+    """When idle, the effective interval is poll_interval_idle."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_interval_idle_cfg = 30.0
+    loop._idle = True
+    # Capped at usage_fresh_ttl * 0.8 = 15 * 0.8 = 12
+    assert loop._effective_poll_interval() == 12.0
+
+
+def test_effective_poll_interval_disabled_when_none():
+    """When poll_interval_idle is None, always uses fast interval."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_interval_idle_cfg = None
+    loop._idle = True
+    assert loop._effective_poll_interval() == 5.0
+
+
+def test_effective_poll_interval_capped_at_fresh_ttl():
+    """The idle interval is capped at usage_fresh_ttl * 0.8."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_interval_idle_cfg = 100.0  # very slow
+    loop._idle = True
+    # usage_fresh_ttl = 15 → cap = 12
+    assert loop._effective_poll_interval() == 12.0
+
+
+async def test_record_request_forwarded_wakes_poll():
+    """record_request_forwarded sets the _poll_now event (WI-022)."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_now = asyncio.Event()
+    assert not loop._poll_now.is_set()
+    loop.record_request_forwarded()
+    assert loop._poll_now.is_set()
+
+
+async def test_record_429_wakes_poll():
+    """record_429 sets the _poll_now event (WI-022)."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_now = asyncio.Event()
+    assert not loop._poll_now.is_set()
+    loop.record_429()
+    assert loop._poll_now.is_set()
+
+
+async def test_record_rate_limit_429_wakes_poll():
+    """record_rate_limit_429 also sets the _poll_now event (H-1 fix)."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_now = asyncio.Event()
+    assert not loop._poll_now.is_set()
+    loop.record_rate_limit_429()
+    assert loop._poll_now.is_set()
+
+
+async def test_not_idle_when_reading_stale():
+    """Not idle when the usage reading is stale — stay on fast cadence to
+    detect recovery (M-1 fix)."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.is_idle is True
+    # Simulate a fetch failure
+    client.set_fail(True)
+    await loop.tick()
+    assert loop.is_idle is False
+
+
+async def test_wake_poll_noop_when_not_started():
+    """_wake_poll is a no-op when _poll_now is None (before start())."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    loop._poll_now = None
+    # Should not raise
+    loop.record_request_forwarded()
+    loop.record_429()
+
+
+async def test_throughput_zero_on_first_tick():
+    """Throughput is 0 on the first tick (no previous baseline)."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.last_throughput == 0
+
+
+async def test_throughput_counts_forwarded_requests():
+    """Throughput reflects requests forwarded since the last tick."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.last_throughput == 0
+    # Forward 3 requests
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+    await loop.tick()
+    assert loop.last_throughput == 3
+    # Next tick with no new requests → throughput 0
+    await loop.tick()
+    assert loop.last_throughput == 0
+
+
+# --- WI-022: integration test for run() loop with idle backoff (M-2) --------
+
+
+async def test_run_loop_idle_backoff_wakes_on_activity():
+    """Integration test: the run() loop uses the slow idle interval when idle,
+    and wakes promptly when record_request_forwarded() is called.
+
+    Uses real asyncio timing with very short intervals.  The idle interval
+    (1.0s) is much longer than the active interval (0.01s), so we can
+    distinguish them by counting ticks within a short wall-clock window.
+    """
+    import asyncio as _aio
+
+    m = [1000.0]
+    w = [1_000_000.0]
+    client = FakeUsageClient(_reading(concurrent_sessions=0))
+    gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0, clock=lambda: m[0])
+    loop = ReconciliationLoop(
+        truth_source=client,
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BCFG,
+        poll_interval=0.01,
+        poll_interval_idle=1.0,  # long idle interval
+        monotonic_clock=lambda: m[0],
+        wall_clock=lambda: w[0],
+    )
+
+    task = _aio.create_task(loop.run())
+    try:
+        # Let the loop tick once and go idle.
+        await _aio.sleep(0.05)
+        assert loop._tick_count >= 1, "loop should have ticked at least once"
+        assert loop.is_idle, "loop should be idle after first tick"
+
+        # Wait a bit — the loop should be sleeping at the idle interval (1.0s),
+        # so no additional ticks should happen.
+        ticks_after_idle = loop._tick_count
+        await _aio.sleep(0.05)
+        assert loop._tick_count == ticks_after_idle, (
+            "loop should not tick during idle sleep"
+        )
+
+        # Wake the loop by simulating a forwarded request.
+        loop.record_request_forwarded()
+        await _aio.sleep(0.05)
+        assert loop._tick_count > ticks_after_idle, (
+            "loop should have ticked after wake signal"
+        )
+        # The system goes idle again after the tick (no held permits),
+        # but the wake signal caused an immediate tick — that's the
+        # behaviour we're verifying.
+    finally:
+        task.cancel()
+        try:
+            await task
+        except _aio.CancelledError:
+            pass
+
+
+async def test_run_loop_fast_interval_when_active():
+    """When active (not idle), the loop ticks at the fast interval."""
+    import asyncio as _aio
+
+    m = [1000.0]
+    w = [1_000_000.0]
+    client = FakeUsageClient(_reading(concurrent_sessions=0))
+    gate = PermitGate(initial_capacity=CFG.target, release_cooldown=0.0, clock=lambda: m[0])
+    loop = ReconciliationLoop(
+        truth_source=client,
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BCFG,
+        poll_interval=0.01,
+        poll_interval_idle=1.0,
+        monotonic_clock=lambda: m[0],
+        wall_clock=lambda: w[0],
+    )
+
+    task = _aio.create_task(loop.run())
+    try:
+        # Keep the loop active by forwarding requests continuously.
+        for _ in range(10):
+            loop.record_request_forwarded()
+            await _aio.sleep(0.02)
+
+        # The loop should have ticked many times (fast interval = 0.01s).
+        assert loop._tick_count >= 5, (
+            f"loop should have ticked at least 5 times at fast interval, got {loop._tick_count}"
+        )
+    finally:
+        task.cancel()
+        try:
+            await task
+        except _aio.CancelledError:
+            pass

@@ -329,3 +329,223 @@ def test_dashboard_has_render_class_styles() -> None:
     assert "queue_timeouts" in html and "row-warn" in html
     assert "total_429s" in html and "row-crit" in html
     assert "recent_429s" in html and "row-crit" in html
+
+
+def test_dashboard_has_half_open_banner_logic() -> None:
+    """The dashboard HTML must contain JS logic that renders
+    breaker_half_open_age_seconds when the breaker is HALF_OPEN (WI-021).
+
+    This is a static-content assertion so it runs even when Node is unavailable.
+    """
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    # The banner-breaker element must exist
+    assert 'id="banner-breaker"' in html, "banner-breaker element must exist"
+
+    # The JS must reference breaker_half_open_age_seconds in the render function
+    assert "breaker_half_open_age_seconds" in html, (
+        "dashboard JS must reference breaker_half_open_age_seconds"
+    )
+
+    # The JS must conditionally render the HALF_OPEN banner text with the age
+    assert "HALF_OPEN" in html, (
+        "dashboard JS must render HALF_OPEN banner text"
+    )
+    assert "probing" in html, (
+        "dashboard JS must render 'probing' text for HALF_OPEN state"
+    )
+
+    # The stats table must include a breaker_half_open_age row
+    assert "breaker_half_open_age" in html, (
+        "stats table must include breaker_half_open_age row"
+    )
+
+
+def test_dashboard_has_error_banner() -> None:
+    """The dashboard HTML must contain a visible error banner for config
+    override failures (WI-026).
+
+    This is a static-content assertion so it runs even when Node is unavailable.
+    """
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    # The error banner element must exist
+    assert 'id="banner-error"' in html, (
+        "banner-error element must exist in dashboard HTML"
+    )
+
+    # The CSS class for the error banner must be defined
+    assert ".banner.error" in html, (
+        "CSS class .banner.error must be defined"
+    )
+
+    # The showError and hideError functions must be defined
+    assert "function showError" in html, (
+        "showError function must be defined"
+    )
+    assert "function hideError" in html, (
+        "hideError function must be defined"
+    )
+
+    # stepTarget and revertTarget must call hideError on entry
+    assert "hideError()" in html, (
+        "hideError must be called in config mutation functions"
+    )
+
+
+# ---------------------------------------------------------------------------
+# JS render test: HALF_OPEN breaker state (WI-021)
+# ---------------------------------------------------------------------------
+
+_NODE_HALF_OPEN_PREFIX = r"""
+function _escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function _mockEl(id){
+  var _tc='',_ih='',_cn='';
+  return {
+    id:id,
+    style:{display:''},
+    classList:{add:function(){},remove:function(){},toggle:function(){},contains:function(){return false;}},
+    get textContent(){return _tc;},
+    set textContent(v){_tc=String(v);_ih=_escapeHtml(_tc);},
+    get innerHTML(){return _ih;},
+    set innerHTML(v){_ih=String(v);},
+    get className(){return _cn;},
+    set className(v){_cn=String(v);},
+    setAttribute:function(){},
+    getAttribute:function(){return null;},
+    getBoundingClientRect:function(){return{left:0,top:0,width:200,height:120};},
+    addEventListener:function(){},
+    removeEventListener:function(){},
+    offsetWidth:100,
+    offsetHeight:20,
+    appendChild:function(){},
+    removeChild:function(){},
+    querySelectorAll:function(){return [];},
+    querySelector:function(){return null;},
+  };
+}
+var _elements={};
+var document={
+  createElement:function(tag){return _mockEl('');},
+  getElementById:function(id){if(!_elements[id])_elements[id]=_mockEl(id);return _elements[id];},
+  querySelectorAll:function(sel){return [];},
+  querySelector:function(sel){return null;},
+  addEventListener:function(){},
+  body:_mockEl('body'),
+};
+var window={addEventListener:function(){},scrollY:0,location:{href:'http://localhost/'}};
+var _warnings=[];
+var console_warn_original=console.warn;
+console.warn=function(){_warnings.push(Array.prototype.slice.call(arguments).join(' '));};
+var _mockStatus={
+  version:'1.0.0',build:'test',
+  concurrent_sessions:2,limit:4,hard_cap:8,
+  priority_low:false,priority_reason:null,
+  boxed_until:null,resets_at:null,
+  usage_age:1.5,stale:false,
+  effective_permits:1,band:'normal',phantom_estimate:0,
+  breaker:'half_open',breaker_half_open_age_seconds:12.5,
+  recent_429s:3,total_429s:8,gateway_429s:0,rate_limit_429s:0,
+  target:4,queue_depth:0,local_in_flight:1,cooling_down:0,
+  avg_wait_seconds:0.1,p95_wait_seconds:0.5,avg_hold_seconds:2.3,
+  queue_timeouts:0,retry_after_hint:5,
+  ready:true,gate_closed_reason:'open',
+  config:{target:4,min_floor:1,poll_interval:5,usage_fresh_ttl:30,
+    phantom_window:5,breaker_threshold:5,breaker_window_seconds:300,
+    breaker_cooldown_seconds:60,provider:'umans',controller:'concurrency_reconcile'},
+  overrides:{},
+  requests_in_window:100,requests_limit:500,requests_remaining:400,
+  requests_hard_cap:1000,requests_window_seconds:3600,
+  local_requests_in_window:95,request_window_delta:5,
+  total_requests_forwarded:1000,
+};
+var fetch=function(url,opts){
+  if(url.indexOf('/status.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve(_mockStatus);},
+      text:function(){return Promise.resolve(JSON.stringify(_mockStatus));},
+      headers:{get:function(k){return k==='content-type'?'application/json':'';}},
+    });
+  }
+  if(url.indexOf('/history.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({entries:[]});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(){return '';}},
+    });
+  }
+  return Promise.resolve({ok:false,status:404,json:function(){return Promise.resolve({});},text:function(){return Promise.resolve('');},headers:{get:function(){return '';}}});
+};
+"""
+
+_NODE_HALF_OPEN_SUFFIX = r"""
+setTimeout(function(){
+  try{
+    var bannerHtml=_elements['banner-breaker']?_elements['banner-breaker'].textContent:'';
+    var bannerDisplay=_elements['banner-breaker']?_elements['banner-breaker'].style.display:'';
+    var statsHtml=_elements['stats']?_elements['stats'].innerHTML:'';
+    console.log(JSON.stringify({
+      error:null,
+      bannerText:bannerHtml,
+      bannerDisplay:bannerDisplay,
+      stats:statsHtml,
+      warnings:_warnings,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack,bannerText:'',bannerDisplay:'',stats:''}));
+  }
+  process.exit(0);
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_renders_half_open_breaker() -> None:
+    """Execute the dashboard JS with breaker=half_open and verify the banner
+    and stats table render breaker_half_open_age_seconds (WI-021).
+
+    Verifies:
+    - The breaker banner is visible (display=block)
+    - The banner text contains 'HALF_OPEN' and the age value (12.5s)
+    - The stats table includes the breaker_half_open_age row with the value
+    """
+    js = _extract_dashboard_js()
+    script = _NODE_HALF_OPEN_PREFIX + "\n" + js + "\n" + _NODE_HALF_OPEN_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js HALF_OPEN test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+
+    banner_text = output["bannerText"]
+    assert "HALF_OPEN" in banner_text, (
+        f"Banner must contain 'HALF_OPEN' when breaker is half_open, got: {banner_text}"
+    )
+    assert "12.5" in banner_text, (
+        f"Banner must contain the age (12.5), got: {banner_text}"
+    )
+    assert "probing" in banner_text, (
+        f"Banner must contain 'probing', got: {banner_text}"
+    )
+
+    stats = output["stats"]
+    assert "breaker_half_open_age" in stats, (
+        "Stats table must render breaker_half_open_age row"
+    )
+    assert "12.5" in stats, (
+        "Stats table must contain the age value 12.5"
+    )

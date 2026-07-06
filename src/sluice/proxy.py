@@ -21,6 +21,7 @@ import os
 import time
 from collections.abc import AsyncIterator, Mapping
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import httpx
 
@@ -37,6 +38,7 @@ from sluice.admin import (
     handle_login_post,
     handle_logout,
     handle_readyz,
+    handle_reload,
     is_admin_auth_value,
     send_dashboard,
     send_history_json,
@@ -49,6 +51,7 @@ from sluice.admin import (
 )
 from sluice.gate import PermitGate
 from sluice.lifecycle import LifecycleManager
+from sluice.metrics import ClientMetrics
 from sluice.reconcile import ReconciliationLoop, RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle
 from sluice.session import SESSION_COOKIE as _SESSION_COOKIE
@@ -213,6 +216,8 @@ class ProxyApp:
         self._max_request_body_bytes = max_request_body_bytes
         self._upstream_idle_timeout = upstream_idle_timeout
         self._cors_allow_origin = cors_allow_origin
+        self._config_path: str | None = None  # set by CLI for SIGHUP reload
+        self._client_metrics = ClientMetrics()
         self._lifecycle = LifecycleManager(
             guard=guard,
             reconcile=reconcile,
@@ -222,6 +227,7 @@ class ProxyApp:
             gate=gate,
             drain_timeout=drain_timeout,
         )
+        self._lifecycle._app_ref = self
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
@@ -245,6 +251,7 @@ class ProxyApp:
         if scope["method"] == "OPTIONS" and self._cors_allow_origin and path in (
             "/", "/status.json", "/metrics", "/history.json",
             "/admin/config", "/admin/config/target",
+            "/admin/reload",
             "/login", "/logout",
         ):
             await send_text(
@@ -293,6 +300,12 @@ class ProxyApp:
                 self._cors_allow_origin,
             )
             return
+        if path == "/admin/reload" and scope["method"] == "POST":
+            await handle_reload(
+                send, self, self._admin_token, scope, self._guard,
+                self._cors_allow_origin,
+            )
+            return
 
         # Admin routes — token-gated when admin_token is set.
         # GET / without auth serves the login page (200, no challenge);
@@ -316,11 +329,13 @@ class ProxyApp:
                 await send_status_json(
                     send, self._reconcile, self._guard, self._build_sha,
                     self._cors_allow_origin,
+                    client_metrics=self._client_metrics.to_dict(),
                 )
                 return
             if path == "/metrics":
                 await send_prometheus(
                     send, self._reconcile, self._guard, self._cors_allow_origin,
+                    client_metrics=self._client_metrics.to_dict(),
                 )
                 return
             if path == "/history.json":
@@ -330,6 +345,114 @@ class ProxyApp:
                 return
 
         await self._proxy_request(scope, receive, send)
+
+    @property
+    def client_metrics(self) -> ClientMetrics:
+        """Per-client metrics for /status.json and /metrics (WI-023)."""
+        return self._client_metrics
+
+    def reload_config(self, **kwargs: Any) -> dict[str, str]:
+        """Apply runtime-safe config changes without restart.
+
+        Only fields that can be safely changed at runtime are applied.
+        Fields that require recreating resources (upstream URL, provider,
+        admin token, gate internals) are silently ignored — the operator
+        must restart for those.
+
+        Returns a dict of ``{field: "old -> new"}`` for each changed field,
+        suitable for logging.
+        """
+        changes: dict[str, str] = {}
+
+        def _apply(field: str, attr: str, value: Any) -> None:
+            old = getattr(self, attr)
+            if value != old:
+                changes[field] = f"{old} -> {value}"
+                setattr(self, attr, value)
+
+        if "queue_timeout" in kwargs:
+            v = kwargs["queue_timeout"]
+            if v is not None and v <= 0:
+                log.warning("reload: ignoring invalid queue_timeout=%r (must be > 0)", v)
+            else:
+                _apply("queue_timeout", "_queue_timeout", v)
+        if "trusted_proxies" in kwargs:
+            _apply("trusted_proxies", "_trusted_proxies", kwargs["trusted_proxies"])
+        if "max_request_body_bytes" in kwargs:
+            v = kwargs["max_request_body_bytes"]
+            if v is not None and v <= 0:
+                v = None
+            _apply("max_request_body_bytes", "_max_request_body_bytes", v)
+        if "upstream_idle_timeout" in kwargs:
+            _apply("upstream_idle_timeout", "_upstream_idle_timeout", kwargs["upstream_idle_timeout"])
+        if "cors_allow_origin" in kwargs:
+            _apply("cors_allow_origin", "_cors_allow_origin", kwargs["cors_allow_origin"])
+
+        # Reconcile-level fields
+        r = self._reconcile
+        if "poll_interval" in kwargs:
+            v = kwargs["poll_interval"]
+            if v is not None and v <= 0:
+                log.warning("reload: ignoring invalid poll_interval=%r (must be > 0)", v)
+            else:
+                old_pi = r._poll_interval
+                if v != old_pi:
+                    changes["poll_interval"] = f"{old_pi} -> {v}"
+                    r._poll_interval = v
+        if "poll_interval_idle" in kwargs:
+            v = kwargs["poll_interval_idle"]
+            if v is not None and v <= 0:
+                v = None
+            old_idle = r._poll_interval_idle_cfg
+            if v != old_idle:
+                changes["poll_interval_idle"] = f"{old_idle} -> {v}"
+                r._poll_interval_idle_cfg = v
+
+        return changes
+
+    def _reload_from_config(self) -> dict[str, str]:
+        """Re-read the config file and apply safe changes.
+
+        Called by the SIGHUP handler and the ``POST /admin/reload`` endpoint.
+        Returns a dict of ``{field: "old -> new"}`` for each changed field.
+        Raises if no config file was specified at startup.
+        """
+        if not self._config_path:
+            raise ValueError("no config file specified at startup")
+        import tomllib
+        from pathlib import Path
+
+        p = Path(self._config_path)
+        if not p.exists():
+            raise FileNotFoundError(f"config file not found: {self._config_path}")
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+        serve_section = data.get("serve", data)
+        if not isinstance(serve_section, dict):
+            serve_section = {}
+
+        # Build kwargs from the config file for safe-to-reload fields
+        kwargs: dict[str, Any] = {}
+        if "poll_interval" in serve_section:
+            kwargs["poll_interval"] = float(serve_section["poll_interval"])
+        if "poll_interval_idle" in serve_section:
+            v = serve_section["poll_interval_idle"]
+            kwargs["poll_interval_idle"] = float(v) if v else None
+        if "queue_timeout" in serve_section:
+            kwargs["queue_timeout"] = float(serve_section["queue_timeout"])
+        if "trusted_proxies" in serve_section:
+            from sluice.trust import parse_trusted_proxies
+            kwargs["trusted_proxies"] = parse_trusted_proxies(serve_section["trusted_proxies"])
+        if "max_request_body_bytes" in serve_section:
+            v = serve_section["max_request_body_bytes"]
+            kwargs["max_request_body_bytes"] = int(v) if v else None
+        if "upstream_idle_timeout" in serve_section:
+            v = serve_section["upstream_idle_timeout"]
+            kwargs["upstream_idle_timeout"] = float(v) if v else None
+        if "cors_allow_origin" in serve_section:
+            kwargs["cors_allow_origin"] = serve_section["cors_allow_origin"]
+
+        return self.reload_config(**kwargs)
 
     async def _proxy_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Draining fast-fail: during shutdown, refuse new requests so the
@@ -417,18 +540,24 @@ class ProxyApp:
         # interactive`` and consume the reserved slots.  A spoofed label from
         # a non-trusted peer is still stripped before forwarding (cache-
         # transparency) but does not grant reserve access.
+        #
+        # The label is always read for per-client metrics (WI-023 feature #4)
+        # regardless of trust — it's observability metadata, not access control.
+        client_label: str | None = None
+        for k, v in scope.get("headers", []):
+            if k == b"x-sluice-client-label":
+                client_label = v.decode("latin-1")
+                break
+
         reserved = False
-        if self._reserved_labels and peer_is_trusted(scope, self._trusted_proxies):
-            for k, v in scope.get("headers", []):
-                if k == b"x-sluice-client-label":
-                    label = v.decode("latin-1")
-                    if label in self._reserved_labels:
-                        reserved = True
-                    break
+        if self._reserved_labels and client_label and peer_is_trusted(scope, self._trusted_proxies):
+            if client_label in self._reserved_labels:
+                reserved = True
 
         acquired = await self._gate.acquire(timeout=self._queue_timeout, reserved=reserved)
         if not acquired:
             log.info("permit queue timeout — returning 503")
+            self._client_metrics.record_queue_timeout(client_label)
             retry_after = self._reconcile.saturation_retry_after()
             await send_json(
                 send,
@@ -453,11 +582,12 @@ class ProxyApp:
             return
 
         self._reconcile.record_request_forwarded()
+        self._client_metrics.record_forwarded(client_label)
 
         acquire_mono = time.monotonic()
         forward_failed = False
         try:
-            await self._forward(scope, receive, send)
+            await self._forward(scope, receive, send, client_label=client_label)
         except Exception:
             forward_failed = True
             log.exception("proxy forward failed")
@@ -471,7 +601,7 @@ class ProxyApp:
                 hold_seconds=None if forward_failed else hold_seconds,
             )
 
-    async def _forward(self, scope: Scope, receive: Receive, send: Send) -> None:
+    async def _forward(self, scope: Scope, receive: Receive, send: Send, *, client_label: str | None = None) -> None:
         url = self._build_url(scope)
         headers = self._filter_request_headers(scope["headers"])
         method = scope["method"]
@@ -655,13 +785,17 @@ class ProxyApp:
                     )
                     if classification == "concurrency":
                         self._reconcile.record_429()
+                        self._client_metrics.record_concurrency_429(client_label)
                     elif classification == "rate_limit":
                         self._reconcile.record_rate_limit_429()
+                        self._client_metrics.record_rate_limit_429(client_label)
                     elif classification == "gateway":
                         self._reconcile.record_gateway_429()
+                        self._client_metrics.record_gateway_429(client_label)
                     else:
                         log.warning("unknown 429 classification: %s — feeding breaker", classification)
                         self._reconcile.record_429()
+                        self._client_metrics.record_concurrency_429(client_label)
 
                 # WI-004: Feed response headers to the truth source.
                 # For polled truth (umans) this is a no-op; for header truth
@@ -736,6 +870,7 @@ class ProxyApp:
                     # success (the breaker should not see it as healthy).
                     if 200 <= response.status_code < 400 and not upstream_idle:
                         self._reconcile.record_success()
+                        self._client_metrics.record_success(client_label)
             finally:
                 # Close the stream context to cancel the upstream request
                 # (WI-014: phantom prevention).

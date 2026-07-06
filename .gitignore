@@ -34,3 +34,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Session artifacts
+.claude/
