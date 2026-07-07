@@ -138,15 +138,17 @@ only (the body is streamed through, never read). The relevant headers:
 
 | header | reject (concurrency) | deprioritization window | hard box |
 |---|---|---|---|
-| `Retry-After` | observed `1` (capture 2026-07-03) | n/a — provider serves 200 | n/a — gate closed by `/v1/usage` |
+| `Retry-After` | observed `1` (2026-07-03) and `2` (2026-07-07) | n/a — provider serves 200 | n/a — gate closed by `/v1/usage` |
 | `Server` | `uvicorn` (app-origin, no CDN) | n/a | n/a |
 | CDN headers (`cf-ray`, etc.) | absent | absent | absent |
 
-**Key finding (capture 2026-07-03):** genuine umans 429s carry `Retry-After: 1`
-— a positive value — and `Server: uvicorn` with no CDN headers. The
-`Retry-After` value is small (≈1 s) and does **not** represent a rate-limit
-window duration; it is a concurrency rejection signal that happens to carry a
-positive retry-after.
+**Key finding (capture 2026-07-03, confirmed 2026-07-07):** genuine umans
+429s carry a small positive `Retry-After` (1–2 s) and `Server: uvicorn`
+with no CDN headers. The `Retry-After` value does **not** represent a
+rate-limit window duration; it is a concurrency rejection signal that
+happens to carry a positive retry-after. These 429s are classified as
+`rate_limit` by the heuristic and do **not** feed the breaker (correction
+2026-07-07: feeding them caused 30 false-trip outages in 24 h).
 
 ## 429 classification: `_classify_429`
 
@@ -165,23 +167,36 @@ categories, in priority order:
    Fed to the breaker via `record_429()`.
 
 3. **`rate_limit`** — `Retry-After > 0` (a positive integer or a valid
-   HTTP-date). Fed to the breaker via `record_rate_limit_429()`, tracked in
-   a separate counter (`rate_limit_429s`).
+   HTTP-date). Tracked in a separate counter (`rate_limit_429s`), wakes the
+   poll, but does **NOT** feed the breaker. See correction below.
 
-### The retry-after heuristic and its limitation
+### The retry-after heuristic and its correction
 
 The retry-after heuristic is **unreliable** for distinguishing concurrency
 from rate-limit on the umans provider. Capture 2026-07-03 proved that umans
 sends `Retry-After: 1` on genuine concurrency 429s — these are classified
-as `rate_limit` by the heuristic. For this reason, **both `concurrency` and
-`rate_limit` classifications feed the breaker** (the distinction is for
-telemetry only). The breaker threshold (5 in 5 minutes, `BreakerConfig` in
-`control.py:263`) prevents a single rate-limit event from tripping, but
-sustained rate-limiting should trip it.
+as `rate_limit` by the heuristic. An earlier version of this code fed both
+`concurrency` and `rate_limit` 429s to the breaker based on that capture's
+*initial* (same-day-corrected) misdiagnosis that a 5-hour box had occurred.
+
+**Capture 2026-07-07** (samples/429-capture-2026-07-07.md, gitignored)
+proved the breaker-feeding change was a regression: 36 `rate_limit` 429s
+(`retry_after=2`, `server=uvicorn`) over 24 h, with `concurrent_sessions=0`
+and `boxed_until=null` throughout — the account never boxed — caused 30
+self-inflicted breaker open→503 outages. The 429s were transient
+concurrency rejections from a live client bursting past `hard_cap`; they
+are not box-precursors.
+
+The deprioritization rung these 429s accompany is already handled correctly
+by `is_deprioritized` → LOW band → serve at the account limit
+(`effective_permits`). The breaker is a backstop for sustained concurrency
+hammering *into a hard box*; rate-limit 429s don't cause one. Transient
+concurrency rejections that carry a positive retry-after are absorbed by
+the next `/v1/usage` poll (woken immediately) adjusting the gate.
 
 Per AGENTS.md rule 1 (fail safe): any `Retry-After` value that is neither a
 positive integer nor a valid HTTP-date is treated as `concurrency` (the
-fail-closed classification).
+fail-closed classification, which does feed the breaker).
 
 ### Recording path (proxy → reconcile)
 
@@ -196,15 +211,16 @@ if response.status_code == 429:
     if classification == "concurrency":
         self._reconcile.record_429()           # feeds breaker, total_429s++
     elif classification == "rate_limit":
-        self._reconcile.record_rate_limit_429() # feeds breaker, rate_limit_429s++
+        self._reconcile.record_rate_limit_429() # rate_limit_429s++, wakes poll, NO breaker
     elif classification == "gateway":
         self._reconcile.record_gateway_429()    # does NOT feed breaker
 ```
 
-`record_429()` and `record_rate_limit_429()` both append to `_recent_429s`
-and call `breaker_on_429()` (`src/sluice/reconcile.py:211, 230`).
-`record_gateway_429()` only increments `_total_gateway_429s`
-(`reconcile.py:224`).
+`record_429()` appends to `_recent_429s` and calls `breaker_on_429()`
+(`src/sluice/reconcile.py`). `record_rate_limit_429()` and
+`record_gateway_429()` only increment their respective counters
+(`record_rate_limit_429` also wakes the poll so fresh `/v1/usage` state is
+fetched immediately).
 
 ## What sluice does not observe
 
@@ -250,5 +266,5 @@ and call `breaker_on_429()` (`src/sluice/reconcile.py:211, 230`).
 - `src/sluice/control.py:200` — `effective_permits` (the decision function)
 - `src/sluice/usage.py:62` — `parse_usage` (the `/v1/usage` parser)
 - `src/sluice/reconcile.py:211` — `record_429` (concurrency 429 → breaker)
-- `src/sluice/reconcile.py:230` — `record_rate_limit_429` (rate-limit 429 → breaker)
+- `src/sluice/reconcile.py` — `record_rate_limit_429` (rate-limit 429, NO breaker, wakes poll)
 - `src/sluice/reconcile.py:224` — `record_gateway_429` (gateway 429, no breaker)

@@ -508,10 +508,9 @@ async def test_429_with_retry_after_not_recorded_as_concurrency():
     """A 429 with a non-zero retry-after is classified as rate_limit, not concurrency.
 
     Rate-limit 429s are tracked in a separate counter (``rate_limit_429s``)
-    but still feed the breaker — the retry-after heuristic is unreliable
-    (capture 2026-07-03: umans sends retry_after=1 on concurrency 429s).
-    A single rate-limit 429 must not trip the breaker (threshold=5), but
-    it counts toward ``recent_429s``.
+    and do NOT feed the breaker (capture 2026-07-07: feeding them caused 30
+    false-trip outages in 24 h with concurrent_sessions=0 and no box).  A
+    single rate-limit 429 must not enter ``recent_429s`` or trip the breaker.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -525,8 +524,8 @@ async def test_429_with_retry_after_not_recorded_as_concurrency():
     assert response.status_code == 429
     assert reconcile.total_429s == 0, "rate-limit 429 must not increment concurrency counter"
     assert reconcile.rate_limit_429s == 1, "rate-limit 429 must be tracked separately"
-    assert reconcile.recent_429_count == 1, "rate-limit 429 must feed the breaker window"
-    assert reconcile.breaker_state.value == "closed", "single rate-limit 429 must not trip breaker"
+    assert reconcile.recent_429_count == 0, "rate-limit 429 must not feed the breaker window"
+    assert reconcile.breaker_state.value == "closed", "rate-limit 429 must not trip breaker"
 
 
 async def test_429_with_zero_retry_after_recorded_as_concurrency():
@@ -712,12 +711,15 @@ async def test_concurrency_429_still_trips_breaker():
     assert reconcile.gateway_429s == 0
 
 
-async def test_rate_limit_429_trips_breaker_when_sustained():
-    """Sustained rate-limit 429s trip the breaker (capture 2026-07-03 fix).
+async def test_rate_limit_429_does_not_trip_breaker():
+    """Rate-limit 429s do NOT trip the breaker (capture 2026-07-07 fix).
 
-    The retry-after heuristic is unreliable — umans sends retry_after=1 on
-    concurrency 429s.  Rate-limit 429s must feed the breaker so sustained
-    enforcement trips it, even if a single event doesn't.
+    The earlier decision to feed rate_limit 429s to the breaker was based on
+    WI-024's initial misdiagnosis (same-day-corrected in finding #5).  Live
+    capture 2026-07-07 proved false-trips: 36 rate_limit 429s with
+    concurrent_sessions=0 and no box caused 30 self-inflicted outages in 24 h.
+    The deprioritization rung is handled by is_deprioritized -> LOW band; the
+    breaker is a backstop for hard-box-bound sustained concurrency hammering.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -727,13 +729,13 @@ async def test_rate_limit_429_trips_breaker_when_sustained():
     reconcile._brk_cfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
 
     async with _asgi_client(app) as client:
-        for _ in range(3):
+        for _ in range(5):
             await client.post("/v1/messages", json={"prompt": "hi"})
 
-    assert reconcile.rate_limit_429s == 3
+    assert reconcile.rate_limit_429s == 5
     assert reconcile.total_429s == 0, "rate-limit 429s must not increment concurrency counter"
-    assert reconcile.recent_429_count == 3
-    assert reconcile.breaker_state.value == "open", "sustained rate-limit 429s must trip the breaker"
+    assert reconcile.recent_429_count == 0, "rate-limit 429s must not enter the breaker window"
+    assert reconcile.breaker_state.value == "closed", "rate-limit 429s must not trip the breaker"
 
 
 async def test_rate_limit_429_in_status_json():
@@ -768,12 +770,11 @@ async def test_rate_limit_429_in_prometheus():
     assert "sluice_rate_limit_429s" in response.text
 
 
-async def test_mixed_concurrency_and_rate_limit_429s_trip_breaker():
-    """Both concurrency and rate_limit 429s share the breaker window.
+async def test_mixed_concurrency_and_rate_limit_429s_only_concurrency_feeds_breaker():
+    """Only concurrency 429s feed the breaker window; rate_limit 429s don't.
 
-    2 concurrency 429s + 3 rate_limit 429s = 5 entries in recent_429s,
-    which should trip the breaker (threshold=5).  The counters stay separate
-    but the breaker window is shared.
+    5 concurrency 429s trip the breaker (threshold=5).  Rate_limit 429s
+    are tracked in a separate counter and do not contribute to recent_429s.
     """
     call_count = 0
 
@@ -794,8 +795,8 @@ async def test_mixed_concurrency_and_rate_limit_429s_trip_breaker():
 
     assert reconcile.total_429s == 2, "concurrency counter"
     assert reconcile.rate_limit_429s == 3, "rate_limit counter"
-    assert reconcile.recent_429_count == 5, "shared breaker window"
-    assert reconcile.breaker_state.value == "open", "mixed 429s must trip the breaker"
+    assert reconcile.recent_429_count == 2, "only concurrency 429s in breaker window"
+    assert reconcile.breaker_state.value == "closed", "2 concurrency 429s < threshold 5, no trip"
 
 
 # ---------------------------------------------------------------------------
@@ -1942,7 +1943,7 @@ async def test_concurrency_429_without_retry_after_is_recorded():
 
 
 async def test_rate_limit_429_with_retry_after_is_not_recorded():
-    """A 429 with retry-after (rate-limit) is tracked separately but still feeds the breaker."""
+    """A 429 with retry-after (rate-limit) is tracked separately and does NOT feed the breaker."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         resp = _resp(429, json_data={"error": "rate_limit_exceeded"})
@@ -1956,7 +1957,7 @@ async def test_rate_limit_429_with_retry_after_is_not_recorded():
 
     assert reconcile.total_429s == 0, "rate-limit 429s must not increment concurrency counter"
     assert reconcile.rate_limit_429s == 1, "rate-limit 429s must be tracked separately"
-    assert reconcile.recent_429_count == 1, "rate-limit 429s must feed the breaker window"
+    assert reconcile.recent_429_count == 0, "rate-limit 429s must not feed the breaker window"
 
 
 @pytest.mark.parametrize("retry_after", ["0", "00", " 0 ", " 0", "0 "])

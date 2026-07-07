@@ -79,7 +79,7 @@ class HistoryEntry:
     total_429s: int
     queue_depth: int
     queue_timeouts: int
-    rate_limit_429s: int = 0  # 429s classified as rate-limit (fed to breaker, tracked separately)
+    rate_limit_429s: int = 0  # 429s classified as rate-limit (NOT fed to breaker; safety net tightens gate when stale)
     # Request-window budget (None when provider reports no request limit)
     requests_in_window: int | None = None
     requests_limit: int | None = None

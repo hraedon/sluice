@@ -158,6 +158,79 @@ async def test_stale_reading_tightens():
     assert gate.capacity == 2  # target - stale_penalty = 3 - 1
 
 
+async def test_stale_reading_with_rate_limit_429s_tightens_to_min_floor():
+    """Safety net: stale reading + recent rate_limit 429s → gate at min_floor.
+
+    Without this, sluice would forward at target - stale_penalty (2) into an
+    upstream that is actively 429ing — a fail-open window (AGENTS.md rule 1).
+    The breaker can't help because rate_limit 429s don't feed it; this shell-
+    level override is the backstop.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    # Fresh → target.
+    await loop.tick()
+    assert gate.capacity == 3
+
+    # Rate-limit 429s arrive (these do NOT feed the breaker).
+    loop.record_rate_limit_429()
+    loop.record_rate_limit_429()
+
+    # Poll fails → stale reading.
+    client.set_fail(True)
+    m[0] += 100  # stale
+    await loop.tick()
+    assert gate.capacity == 1  # min_floor, not target - stale_penalty (2)
+
+
+async def test_fresh_reading_with_rate_limit_429s_does_not_overtighten():
+    """Fresh reading + rate_limit 429s → normal gate (poll sees the truth).
+
+    The safety net only activates when the reading is stale.  When fresh,
+    the poll's concurrent_sessions is trusted — if it says 0, the gate
+    stays at target.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    await loop.tick()
+    assert gate.capacity == 3
+
+    loop.record_rate_limit_429()
+    loop.record_rate_limit_429()
+
+    # Fresh reading (poll succeeds).
+    await loop.tick()
+    assert gate.capacity == 3  # no overtightening when fresh
+
+
+async def test_rate_limit_429_does_not_retrip_half_open_breaker():
+    """HALF_OPEN breaker + rate_limit 429 → stays HALF_OPEN (not re-tripped).
+
+    rate_limit 429s don't call breaker_on_429, so a half-open breaker
+    stays half-open.  The probe timeout (30s) is the backstop that
+    eventually re-trips to OPEN if no success arrives.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+    bcfg = BreakerConfig(threshold=3, window_seconds=300.0, cooldown_seconds=60.0)
+    loop._brk_cfg = bcfg
+
+    # Trip with concurrency 429s → OPEN.
+    for _ in range(3):
+        loop.record_429()
+    await loop.tick()
+    assert gate.capacity == 0
+
+    # Advance past cooldown → HALF_OPEN.
+    m[0] += 100
+    await loop.tick()
+    assert gate.capacity == 1  # half-open probe
+
+    # rate_limit 429 arrives — breaker stays HALF_OPEN (not re-tripped).
+    loop.record_rate_limit_429()
+    from sluice.control import BreakerState
+    assert loop._breaker.state is BreakerState.HALF_OPEN
+
+
 # --- breaker integration ---------------------------------------------------
 
 
