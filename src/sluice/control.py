@@ -326,10 +326,15 @@ def breaker_on_429(
     now: float,
     config: BreakerConfig,
 ) -> BreakerSnapshot:
-    """Event: a 429 was received from the upstream (concurrency or rate-limit).
+    """Event: a concurrency 429 was received from the upstream.
 
     Trips immediately if the threshold is met (don't wait for the next tick).
     If half-open (probing), the probe failed → back to OPEN.
+
+    Note: only ``concurrency``-classified 429s (no/zero retry-after) reach
+    this function.  ``rate_limit``-classified 429s (positive retry-after) are
+    tracked separately and do NOT call this — see ``record_rate_limit_429``
+    in ``reconcile.py``.
     """
     if snap.state is BreakerState.HALF_OPEN:
         return BreakerSnapshot(

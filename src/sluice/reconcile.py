@@ -115,6 +115,7 @@ class ReconciliationLoop:
 
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
+        self._recent_rate_limit_429s: deque[float] = deque()
         self._total_429s = 0
         self._total_gateway_429s = 0
         self._total_rate_limit_429s = 0
@@ -239,27 +240,33 @@ class ReconciliationLoop:
     def record_rate_limit_429(self) -> None:
         """A rate-limit 429 was received from the upstream (positive retry-after).
 
-        Fed to the breaker because the retry-after heuristic is unreliable for
-        distinguishing concurrency from rate-limit (capture 2026-07-03: umans
-        sends ``retry_after=1`` on concurrency 429s, which the heuristic
-        misclassifies as rate-limit).  Sustained rate-limiting is a backoff
-        signal regardless — the breaker threshold (5 in 5 minutes) prevents
-        a single event from tripping, but sustained rate-limiting should
-        trip it.
+        Does NOT feed the breaker.  Capture 2026-07-07
+        (samples/429-capture-2026-07-07.md, gitignored) proved that umans
+        emits ``retry_after=2`` on transient concurrency rejections that
+        never lead to a box — ``concurrent_sessions`` stayed 0 and
+        ``boxed_until`` stayed null through 36 such 429s, while the breaker
+        false-tripped 30 times in 24 h.  The earlier decision to feed these
+        to the breaker was based on WI-024's initial (same-day-corrected)
+        misdiagnosis that a 5-hour box had occurred; finding #5 of the
+        capture doc proved it was a deprioritization window where the
+        provider keeps serving 200s.
 
-        Tracked in a separate counter for telemetry so ``total_429s`` remains
+        The deprioritization rung is already handled correctly by
+        ``is_deprioritized`` → LOW band → serve at the account limit
+        (``effective_permits``).  Transient concurrency rejections are
+        absorbed by the next ``/v1/usage`` poll adjusting the gate.  The
+        breaker's job is to stop sluice from hammering into a *hard box*;
+        rate-limit 429s don't cause one.
+
+        Wakes the poll so fresh ``/v1/usage`` state is fetched ASAP — a 429
+        means upstream state may have changed.  Tracked in a separate counter
+        and a windowed deque (``_recent_rate_limit_429s``) for the stale-reading
+        safety net in ``tick()`` (see below).  ``total_429s`` remains
         concurrency-only.
         """
         now = self._mono()
-        self._recent_429s.append(now)
         self._total_rate_limit_429s += 1
-        self._prune_429s(now)
-        self._breaker = breaker_on_429(
-            self._breaker,
-            self._recent_429s,
-            now=now,
-            config=self._brk_cfg,
-        )
+        self._recent_rate_limit_429s.append(now)
         self._wake_poll()
 
     def record_success(self) -> None:
@@ -308,6 +315,8 @@ class ReconciliationLoop:
         cutoff = now - self._brk_cfg.window_seconds
         while self._recent_429s and self._recent_429s[0] < cutoff:
             self._recent_429s.popleft()
+        while self._recent_rate_limit_429s and self._recent_rate_limit_429s[0] < cutoff:
+            self._recent_rate_limit_429s.popleft()
 
     def _wake_poll(self) -> None:
         """Signal the reconcile loop to wake from an idle sleep (WI-022).
@@ -388,6 +397,19 @@ class ReconciliationLoop:
             )
             permits = effective_permits(state, self._ctrl_cfg, now=now_wall)
             self._last_phantom_estimate = phantom_est
+
+            # Stale-reading safety net (adversarial review 2026-07-07):
+            # When the usage reading is stale AND there are recent rate_limit
+            # 429s, the poll-driven gate can't see the upstream's state and
+            # the breaker can't trip (rate_limit 429s don't feed it).  Without
+            # this, sluice would forward at target - stale_penalty (e.g. 3)
+            # into an upstream that is actively rejecting requests — a fail-open
+            # window (AGENTS.md rule 1).  Tighten to min_floor as a backstop.
+            # The breaker remains the backstop for concurrency-classified 429s;
+            # this covers the gap for rate_limit-classified 429s when the poll
+            # is the only available signal and it's unavailable.
+            if not cached.ok and len(self._recent_rate_limit_429s) > 0:
+                permits = min(permits, self._ctrl_cfg.min_floor)
 
         await self._gate.resize(permits)
 

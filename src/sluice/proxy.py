@@ -144,8 +144,14 @@ def _classify_429(
        concurrency from rate-limit.  Capture 2026-07-03
        (docs/wi-024-429-capture) proved umans sends ``retry_after=1`` on
        genuine concurrency 429s — they are classified as ``rate_limit``
-       here.  Both ``concurrency`` and ``rate_limit`` are fed to the
-       breaker in the proxy (the distinction is for telemetry only).
+       here.  Only ``concurrency`` 429s feed the breaker; ``rate_limit``
+       429s are tracked in a separate counter and wake the poll, but do
+       NOT trip the breaker (capture 2026-07-07 proved they false-trip:
+       36 rate_limit 429s with ``concurrent_sessions=0`` and no box caused
+       30 self-inflicted outages in 24 h).  The deprioritization rung they
+       signal is already handled by ``is_deprioritized`` → LOW band, and
+       a shell-level safety net in ``tick()`` tightens to ``min_floor``
+       when the reading is stale and rate_limit 429s are recent.
        Per AGENTS.md rule 1 (fail safe), any value that is neither a
        positive integer nor a valid HTTP-date is treated as concurrency.
     """
@@ -741,34 +747,42 @@ class ProxyApp:
                 # or not the client is still connected, and dropping it would
                 # prevent the breaker from tripping (WI-019 fail-open).
                 #
-                # All non-CDN 429s feed the breaker.  The retry-after heuristic
-                # (_classify_429) distinguishes 'concurrency' (no/zero retry-after)
-                # from 'rate_limit' (positive retry-after) for logging and separate
-                # telemetry counters, but BOTH classifications feed the breaker.
+                # All non-CDN 429s are classified, but only `concurrency`
+                # 429s feed the breaker.  `rate_limit` 429s (positive
+                # retry-after) are tracked separately and wake the poll, but
+                # do NOT trip the breaker — capture 2026-07-07 proved they
+                # false-trip (36 rate_limit 429s, concurrent_sessions=0,
+                # no box, 30 self-inflicted outages in 24 h).  The
+                # deprioritization rung they signal is handled by
+                # `is_deprioritized` → LOW band → serve at the account limit.
                 #
-                # This is fail-safe: capture 2026-07-03 (docs/wi-024-429-capture)
-                # proved umans sends retry_after=1 on genuine concurrency 429s.
-                # The old heuristic classified these as rate_limit and skipped
-                # the breaker — the breaker stayed CLOSED right into a 5-hour
-                # box.  Feeding all non-CDN 429s ensures the breaker trips on
-                # sustained enforcement regardless of the retry-after value.
-                # The breaker threshold (5 in 5 minutes) prevents a single
-                # rate-limit event from tripping; sustained rate-limiting should
-                # trip it.
+                # This is not fully fail-safe: genuine concurrency 429s
+                # that carry a small positive retry-after (capture
+                # 2026-07-03: retry_after=1) are misclassified as `rate_limit`
+                # here and thus don't feed the breaker.  The next `/v1/usage`
+                # poll (woken immediately) *should* observe elevated
+                # `concurrent_sessions` and the gate will tighten — but
+                # capture 2026-07-07 showed `concurrent_sessions=0` during
+                # transient bursts, so the poll may not see the pressure.
+                # A shell-level safety net in `tick()` tightens to `min_floor`
+                # when the reading is stale AND there are recent rate_limit
+                # 429s, covering the poll-failure gap.  The breaker remains
+                # the backstop for concurrency-classified 429s (no/zero
+                # retry-after).
                 #
                 # Edge case: retry-after: 0 (or "00", " 0 ", etc.) means
-                # "retry immediately" — a transient concurrency signal, not a
-                # rate-limit window.  The string "0" is truthy in Python, so a
-                # naive ``not header`` check would silently skip breaker
+                # "retry immediately" — a transient concurrency signal, not
+                # a rate-limit window.  The string "0" is truthy in Python,
+                # so a naive ``not header`` check would silently skip breaker
                 # recording (fail-open).  _classify_429 handles this and
                 # all other parse edge cases fail-safe.
                 #
                 # Monitoring hook (WI-024): classify every 429 as
-                # 'concurrency' (feed breaker), 'rate_limit' (also feed breaker,
-                # tracked separately), or 'gateway' (CDN/gateway rejection —
-                # tracked separately, NOT fed to the breaker).  Logs the
-                # classification and server header so CDN-originated 429s are
-                # visible.
+                # 'concurrency' (feed breaker), 'rate_limit' (tracked
+                # separately, wakes poll, does NOT feed breaker), or
+                # 'gateway' (CDN/gateway rejection — tracked separately,
+                # NOT fed to the breaker).  Logs the classification and
+                # server header so CDN-originated 429s are visible.
                 if response.status_code == 429:
                     retry_after_raw = response.headers.get("retry-after")
                     classification = _classify_429(retry_after_raw, response.headers)

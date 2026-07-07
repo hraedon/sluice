@@ -4,4 +4,4 @@ The deterministic decision logic lives in :mod:`sluice.control` and is stdlib-on
 The async proxy/usage/CLI shell imports the core, never the reverse.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
