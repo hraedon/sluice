@@ -4,6 +4,20 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-06
+
+### Features
+
+- **Plan 014 — Windows Service support.** sluice can now run as a native
+  Windows service. An install script (`scripts/install-windows.ps1`)
+  finds Python 3.12+ (borrowing cert-watch's Install Manager and shared-
+  Python logic), creates a venv, installs sluice with the `[windows]`
+  extra (pywin32), and registers a Windows service via `New-Service`.
+  The service spawns `sluice serve` as a subprocess; the dashboard is
+  available at `http://localhost:8800/`. An uninstall script
+  (`scripts/uninstall-windows.ps1`) removes the service. Config via a
+  TOML file at `C:\ProgramData\sluice\sluice.toml`.
+
 ## [1.1.0] — 2026-07-06
 
 sluice 1.1 is the first feature release since the 1.0 deployment. It adds

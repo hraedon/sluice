@@ -104,6 +104,21 @@ docker run --rm -p 8800:8800 -e SLUICE_USAGE_KEY=sk-... sluice:local \
   serve --upstream https://api.code.umans.ai --listen 0.0.0.0:8800
 ```
 
+**Windows** (PowerShell, as Administrator):
+
+```powershell
+# Clone or download the repo, then from the repo root:
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
+    -Upstream https://api.code.umans.ai -UsageKey sk-...
+```
+
+This finds Python 3.12+ (Python Install Manager, per-machine installs, or
+PATH), creates a venv with sluice + pywin32, registers a Windows service,
+and starts it. The dashboard is at `http://localhost:8800/`. Config lives
+at `C:\ProgramData\sluice\sluice.toml`. Manage the service with
+`Start-Service sluice` / `Stop-Service sluice` / `Restart-Service sluice`.
+Uninstall with `scripts\uninstall-windows.ps1`.
+
 Then point your clients (opencode, open-webui, …) at `http://127.0.0.1:8800` instead of the
 provider, and open `http://127.0.0.1:8800/` for the dashboard. See
 `docs/client-configuration.md` for per-client setup and `deploy/` for the Kubernetes / ArgoCD
@@ -270,7 +285,7 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **1.1 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
+Status: **1.2 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
 real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
 boxed). See `docs/concurrency-model.md` for the data model,
 `docs/client-configuration.md` to point clients at it, and `deploy/README.md` for the
