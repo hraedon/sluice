@@ -14,8 +14,11 @@ The Docker quickstart works but is heavyweight for a single-user box.
 
 sluice runs as a native Windows Service via `pywin32`. A small
 `src/sluice/win_service.py` module subclasses
-`win32serviceutil.ServiceFramework` and spawns `sluice serve` as a
-subprocess. On stop, the subprocess is terminated.
+`win32serviceutil.ServiceFramework` and runs the uvicorn ASGI server
+**in-process**: `SvcDoRun` builds the same app `sluice serve` would (via
+the shared `build_service_app()` helper) and drives a `uvicorn.Server`;
+`SvcStop` sets `should_exit` so uvicorn shuts down *gracefully* (stop
+accepting, drain in-flight, run the ASGI lifespan shutdown).
 
 **Why not NSSM?** The NSSM website (nssm.cc) was returning 503 during
 development. NSSM is also an external binary download, whereas pywin32
@@ -26,12 +29,18 @@ keeps everything in the Python ecosystem.
 sluice is a reverse proxy -- it needs to own its own listener, not be
 hosted inside IIS's pipeline.
 
-**Why subprocess instead of running uvicorn in-process?** The CLI's
-`_cmd_serve` function calls `uvicorn.run()` which blocks and handles
-signals. Running it in a subprocess is simpler and requires no CLI
-refactoring. For a single-user local instance, the non-graceful
-termination on stop is acceptable (in-flight requests are lost, but
-the service restarts cleanly).
+**Why in-process, not a `sluice serve` subprocess?** An earlier draft
+spawned `sluice serve` as a child and hard-terminated it on stop. That
+had two defects: the stop was non-graceful (in-flight streams dropped),
+and the SCM supervised only the wrapper — if the child died the service
+still read *Running*. In-process fixes both: the SCM supervises the real
+server, and `should_exit` gives a clean drain. The cost was a small
+refactor — `_cmd_serve` now splits config-resolution/app-building
+(`_build_serve_app`, shared) from the `uvicorn.run` call, so the service
+reuses the exact same app. Two Windows details this requires:
+`_StoppableServer` overrides `install_signal_handlers` (SvcDoRun is not
+the main thread), and the module redirects stdout/stderr to
+`logs\service.log` (a service has no console).
 
 ## Install script: `scripts/install-windows.ps1`
 

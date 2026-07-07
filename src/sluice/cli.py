@@ -189,7 +189,17 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _cmd_serve(args: argparse.Namespace) -> int:
+class _ConfigError(Exception):
+    """A serve-config resolution error; its message is the stderr body."""
+
+
+def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]:
+    """Resolve config and build the ASGI app plus bind params.
+
+    Shared by the CLI ``serve`` command and the Windows service so both run an
+    identical proxy. Raises :class:`_ConfigError` on invalid config; returns
+    ``(app, host, port, log_level)`` with ``log_level`` already lower-cased.
+    """
     config_data: dict[str, Any] = {}
     config_path = args.config or os.environ.get(_ENV_PREFIX + "CONFIG")
     if config_path:
@@ -200,13 +210,13 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         provider = get_provider(provider_name)
     except ValueError as exc:
-        print(f"sluice: error: {exc}", file=sys.stderr)
-        return 2
+        raise _ConfigError(str(exc)) from exc
 
     upstream = _resolve("upstream", args) or provider.default_base_url
     if not upstream:
-        print("sluice: error: --upstream is required (flag, SLUICE_UPSTREAM env, or [serve] in config file)", file=sys.stderr)
-        return 2
+        raise _ConfigError(
+            "--upstream is required (flag, SLUICE_UPSTREAM env, or [serve] in config file)"
+        )
 
     listen = _resolve("listen", args)
     target = _resolve("target", args)
@@ -245,30 +255,25 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         trusted_proxies = parse_trusted_proxies(trusted_proxies_raw)
     except ValueError as exc:
-        print(f"sluice: error: --trusted-proxies: {exc}", file=sys.stderr)
-        return 2
+        raise _ConfigError(f"--trusted-proxies: {exc}") from exc
 
     if history_store_path and history_ttl is not None and history_ttl <= 0:
-        print("sluice: error: --history-ttl must be positive", file=sys.stderr)
-        return 2
+        raise _ConfigError("--history-ttl must be positive")
 
     if drain_timeout is not None and drain_timeout < 0:
-        print("sluice: error: --drain-timeout must be >= 0", file=sys.stderr)
-        return 2
+        raise _ConfigError("--drain-timeout must be >= 0")
 
     reserve_count = 0
     reserved_labels: set[str] = set()
     if reserve_raw:
         # Format: "label=count" (e.g. "interactive=1")
         if "=" not in reserve_raw:
-            print(f"sluice: error: --reserve must be 'label=count', got '{reserve_raw}'", file=sys.stderr)
-            return 2
+            raise _ConfigError(f"--reserve must be 'label=count', got '{reserve_raw}'")
         label, _, count_str = reserve_raw.rpartition("=")
         try:
             reserve_count = int(count_str)
         except ValueError:
-            print(f"sluice: error: --reserve count must be an integer, got '{count_str}'", file=sys.stderr)
-            return 2
+            raise _ConfigError(f"--reserve count must be an integer, got '{count_str}'")
         reserved_labels = {label}
 
     log_format = _resolve("log_format", args)
@@ -296,8 +301,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         host, _, port_str = listen.rpartition(":")
         host = host.strip("[]")
     if not host or not port_str:
-        print(f"sluice: error: --listen must be host:port, got '{listen}'", file=sys.stderr)
-        return 2
+        raise _ConfigError(f"--listen must be host:port, got '{listen}'")
     port = int(port_str)
 
     guard: SingletonGuard
@@ -316,9 +320,10 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         log.info("  singleton_guard:   noop")
 
     if provider.needs_usage_key and not usage_key:
-        print(f"sluice: error: environment variable {usage_key_env} is not set", file=sys.stderr)
-        print("       set it to the API key used for /v1/usage polling", file=sys.stderr)
-        return 2
+        raise _ConfigError(
+            f"environment variable {usage_key_env} is not set\n"
+            "       set it to the API key used for /v1/usage polling"
+        )
 
     adaptive_config = AdaptiveConfig(target=target) if provider.controller == "adaptive" else None
 
@@ -426,16 +431,36 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         log.info("  cors_allow_origin: %s", cors_allow_origin)
     log.info("  log_format:        %s", log_format)
 
+    return app, host, port, log_level.lower()
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        app, host, port, log_level = _build_serve_app(args)
+    except _ConfigError as exc:
+        print(f"sluice: error: {exc}", file=sys.stderr)
+        return 2
+
     import uvicorn
 
     uvicorn.run(
         app,
         host=host,
         port=port,
-        log_level=log_level.lower(),
+        log_level=log_level,
         timeout_graceful_shutdown=30,
     )
     return 0
+
+
+def build_service_app() -> tuple[ProxyApp, str, int, str]:
+    """Build the ASGI app + bind params for the in-process Windows service.
+
+    Uses the same env/config resolution as ``sluice serve`` with no CLI flags:
+    config comes from the ``SLUICE_CONFIG`` file and ``SLUICE_*`` env vars.
+    """
+    args = build_parser().parse_args(["serve"])
+    return _build_serve_app(args)
 
 
 # ---------------------------------------------------------------------------

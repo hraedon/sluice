@@ -327,9 +327,12 @@ target = $Target
 
 # ===========================================================================
 # 5. Register the Windows service
-#    Uses New-Service with python.exe -m sluice.win_service as the binary.
+#    Uses New-Service with pythonw.exe -m sluice.win_service as the binary.
 #    This bypasses pythonservice.exe (which has DLL resolution issues in
-#    venvs) and runs the service module directly via python.exe.
+#    venvs) and runs the service module directly. pythonw.exe (no console)
+#    is preferred over python.exe since a service has no console; the module
+#    redirects stdout/stderr to logs\service.log. The module hosts uvicorn
+#    in-process and stops it gracefully on SvcStop.
 # ===========================================================================
 
 # Remove existing service (if present) for clean reconfiguration
@@ -344,7 +347,12 @@ if ($existingSvc) {
     Start-Sleep -Seconds 2
 }
 
-$pythonExe = Join-Path $venv "Scripts\python.exe"
+# Prefer pythonw.exe (no console window/allocation for a session-0 service);
+# fall back to python.exe if the venv somehow lacks it.
+$pythonExe = Join-Path $venv "Scripts\pythonw.exe"
+if (-not (Test-Path $pythonExe)) {
+    $pythonExe = Join-Path $venv "Scripts\python.exe"
+}
 $binPath = "`"$pythonExe`" -m sluice.win_service"
 
 Write-Host "Creating service `"$ServiceName`" (binPath: $binPath) ..."

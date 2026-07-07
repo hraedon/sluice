@@ -1,37 +1,78 @@
 """Windows Service wrapper for sluice.
 
-Requires pywin32 (``pip install sluice[windows]``).  On non-Windows platforms
-the module imports but the service class is inert (no pywin32 dependency).
+Requires pywin32 (``pip install sluice[windows]``). On non-Windows platforms
+the module imports but the service class is inert.
 
-The service spawns ``sluice serve`` as a subprocess and waits for it.  On
-stop, the subprocess is terminated.  This is the simplest reliable approach
-that requires no refactoring of the CLI or uvicorn integration.
+The service runs the uvicorn ASGI server **in-process** (not as a subprocess):
+``SvcDoRun`` builds the same app ``sluice serve`` would and drives a
+:class:`uvicorn.Server`; ``SvcStop`` sets ``should_exit`` so uvicorn performs a
+*graceful* shutdown (stop accepting, drain in-flight, run the ASGI lifespan
+shutdown) rather than a hard kill. This means the SCM supervises the real
+server — if it dies, the service dies — instead of a wrapper that can report
+Running while a child process is dead.
 
 Usage (from an elevated PowerShell, in the venv)::
 
     python -m sluice.win_service install
     python -m sluice.win_service start
 
-Or via the install-windows.ps1 script which handles everything.
+Or via install-windows.ps1, which registers the service to launch this module.
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 
-_log_prefix = "sluice-service"
+import uvicorn
+
+_LOG_PREFIX = "sluice-service"
+
+
+def _redirect_std_streams() -> None:
+    """Point stdout/stderr at a log file.
+
+    A Windows service has no console — ``sys.stdout``/``sys.stderr`` may be
+    ``None``, so uvicorn's and sluice's logging (and any traceback) would be
+    lost or raise. Rebinding both to a file, *before* the app and uvicorn build
+    their logging handlers, captures everything. Best-effort: never fatal.
+    """
+    logdir = os.path.join(
+        os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "sluice", "logs"
+    )
+    try:
+        os.makedirs(logdir, exist_ok=True)
+        stream = open(  # noqa: SIM115 - long-lived for the process lifetime
+            os.path.join(logdir, "service.log"),
+            "a",
+            buffering=1,
+            encoding="utf-8",
+            errors="replace",
+        )
+        sys.stdout = stream
+        sys.stderr = stream
+    except OSError:
+        pass
+
+
+class _StoppableServer(uvicorn.Server):
+    """A uvicorn server that survives running off the main thread.
+
+    ``SvcDoRun`` executes on a pywin32 worker thread, where Python cannot
+    install signal handlers (and the SCM delivers stop via ``SvcStop``, not
+    signals). Overriding the installer to a no-op avoids the ``ValueError``
+    uvicorn would otherwise raise at startup.
+    """
+
+    def install_signal_handlers(self) -> None:  # pragma: no cover - Windows only
+        return None
+
 
 if sys.platform == "win32":
+    import servicemanager  # type: ignore[import-not-found]
+    import win32event  # type: ignore[import-not-found]
     import win32service  # type: ignore[import-not-found]
     import win32serviceutil  # type: ignore[import-not-found]
-    import win32event  # type: ignore[import-not-found]
-    import servicemanager  # type: ignore[import-not-found]
-
-    _DEFAULT_CONFIG = os.path.join(
-        os.environ.get("PROGRAMDATA", r"C:\ProgramData"), "sluice", "sluice.toml"
-    )
 
     class SluiceService(win32serviceutil.ServiceFramework):  # type: ignore[misc]
         _svc_name_ = "sluice"
@@ -43,84 +84,53 @@ if sys.platform == "win32":
         def __init__(self, args: list[str]) -> None:
             super().__init__(args)
             self._stop_event = win32event.CreateEvent(None, 0, 0, None)
-            self._proc: subprocess.Popen[bytes] | None = None
-            self._config_path = os.environ.get("SLUICE_CONFIG", _DEFAULT_CONFIG)
+            self._server: _StoppableServer | None = None
 
         def SvcStop(self) -> None:
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-            servicemanager.LogInfoMsg(f"{_log_prefix}: stop requested")
-            self._terminate_proc()
+            server = self._server
+            if server is not None:
+                # uvicorn polls should_exit ~10x/s, then drains gracefully.
+                server.should_exit = True
             win32event.SetEvent(self._stop_event)
 
         def SvcDoRun(self) -> None:
-            servicemanager.LogMsg(
-                servicemanager.EVENTLOG_INFORMATION_TYPE,
-                servicemanager.PYS_SERVICE_STARTED,
-                (self._svc_name_, ""),
-            )
+            _redirect_std_streams()
+            servicemanager.LogInfoMsg(f"{_LOG_PREFIX}: starting")
             try:
-                self._run_sluice()
-            except Exception:
-                servicemanager.LogErrorMsg(
-                    f"{_log_prefix}: unhandled exception", exc_info=True
-                )
+                self._serve()
+            except Exception as exc:  # noqa: BLE001 - surface to SCM + event log
+                servicemanager.LogErrorMsg(f"{_LOG_PREFIX}: crashed: {exc!r}")
+                raise
+            servicemanager.LogInfoMsg(f"{_LOG_PREFIX}: stopped")
 
-        def _find_sluice_exe(self) -> tuple[str, list[str]]:
-            exe_dir = os.path.dirname(sys.executable)
-            sluice_exe = os.path.join(exe_dir, "sluice.exe")
-            if os.path.exists(sluice_exe):
-                return sluice_exe, ["serve", "--config", self._config_path]
-            return sys.executable, [
-                "-m", "sluice", "serve", "--config", self._config_path
-            ]
+        def _serve(self) -> None:
+            from sluice.cli import build_service_app
 
-        def _run_sluice(self) -> None:
-            exe, base_args = self._find_sluice_exe()
-            cmd = [exe] + base_args
-            servicemanager.LogInfoMsg(f"{_log_prefix}: starting {cmd}")
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+            app, host, port, log_level = build_service_app()
+            config = uvicorn.Config(
+                app,
+                host=host,
+                port=port,
+                log_level=log_level,
+                timeout_graceful_shutdown=30,
             )
-            while True:
-                result = win32event.WaitForSingleObject(self._stop_event, 2000)
-                if result == win32event.WAIT_OBJECT_0:
-                    break
-                if self._proc.poll() is not None:
-                    rc = self._proc.returncode
-                    servicemanager.LogWarningMsg(
-                        f"{_log_prefix}: sluice exited (code {rc}), service stopping"
-                    )
-                    break
-            self._terminate_proc()
-
-        def _terminate_proc(self) -> None:
-            if self._proc is None or self._proc.poll() is not None:
-                return
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                servicemanager.LogWarningMsg(
-                    f"{_log_prefix}: sluice did not exit in 10s, killing"
-                )
-                self._proc.kill()
-                self._proc.wait(timeout=5)
-            except Exception:
-                pass
+            self._server = _StoppableServer(config)
+            self._server.run()
 
     def _win_main() -> int:
         if len(sys.argv) == 1:
+            # Launched by the SCM: become the service control dispatcher.
             servicemanager.Initialize()
             servicemanager.PrepareToHostSingle(SluiceService)
             servicemanager.StartServiceCtrlDispatcher()
             return 0
+        # install / remove / start / stop / debug verbs.
         win32serviceutil.HandleCommandLine(SluiceService)
         return 0
 
 else:
+
     def _win_main() -> int:
         return 1
 

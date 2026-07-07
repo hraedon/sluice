@@ -18,6 +18,14 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`scripts/uninstall-windows.ps1`) removes the service. Config via a
   TOML file at `C:\ProgramData\sluice\sluice.toml`.
 
+  The service hosts uvicorn **in-process** (not a `sluice serve`
+  subprocess): the SCM supervises the real server, and `SvcStop` sets
+  uvicorn's `should_exit` for a graceful drain instead of a hard kill.
+  Runs via `pythonw.exe` and redirects stdout/stderr to
+  `logs\service.log`. `_cmd_serve` was split into a shared
+  `_build_serve_app()` (config → app) and the `uvicorn.run` call so the
+  service reuses the identical app.
+
   Validated end-to-end on Windows Server 2025 (Python 3.14): service
   reaches Running via the SCM dispatcher, `/v1/usage` reconciliation is
   live, and real client requests proxy through to umans (`/v1/models` and
