@@ -104,6 +104,11 @@ docker run --rm -p 8800:8800 -e SLUICE_USAGE_KEY=sk-... sluice:local \
   serve --upstream https://api.code.umans.ai --listen 0.0.0.0:8800
 ```
 
+sluice logs to stdout, so log retention is the runtime's job. Kubernetes
+(kubelet) and systemd (journald) rotate by default; Docker's default
+`json-file` driver does **not** — add `--log-opt max-size=10m --log-opt
+max-file=5` (or set it on the daemon) for a long-running container.
+
 **Windows** (PowerShell, as Administrator):
 
 ```powershell
@@ -117,6 +122,8 @@ PATH), creates a venv with sluice + pywin32, registers a Windows service,
 and starts it. The dashboard is at `http://localhost:8800/`. Config lives
 at `C:\ProgramData\sluice\sluice.toml`. Manage the service with
 `Start-Service sluice` / `Stop-Service sluice` / `Restart-Service sluice`.
+Logs go to `C:\ProgramData\sluice\logs\service.log` (rotated), and notable
+events (warnings, crashes) also appear in Event Viewer under source `sluice`.
 Uninstall with `scripts\uninstall-windows.ps1`.
 
 Then point your clients (opencode, open-webui, …) at `http://127.0.0.1:8800` instead of the

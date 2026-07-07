@@ -139,6 +139,7 @@ environment.
 
 - `scripts/install-windows.ps1` — install + service creation
 - `scripts/uninstall-windows.ps1` — service removal
-- `deploy/windows/README.md` — Windows deployment docs
-- `README.md` — add Windows quickstart section
+- `src/sluice/win_service.py` — the in-process service host
+- `README.md` — Windows quickstart section (no separate `deploy/windows/`
+  doc; the quickstart plus this plan cover it)
 - `CHANGELOG.md` — v1.2.0 entry

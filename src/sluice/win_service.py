@@ -128,7 +128,6 @@ class _StoppableServer(uvicorn.Server):
 
 if sys.platform == "win32":
     import servicemanager  # type: ignore[import-not-found]
-    import win32event  # type: ignore[import-not-found]
     import win32service  # type: ignore[import-not-found]
     import win32serviceutil  # type: ignore[import-not-found]
 
@@ -141,16 +140,16 @@ if sys.platform == "win32":
 
         def __init__(self, args: list[str]) -> None:
             super().__init__(args)
-            self._stop_event = win32event.CreateEvent(None, 0, 0, None)
             self._server: _StoppableServer | None = None
+            self._stopping = False
 
         def SvcStop(self) -> None:
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            self._stopping = True
             server = self._server
             if server is not None:
                 # uvicorn polls should_exit ~10x/s, then drains gracefully.
                 server.should_exit = True
-            win32event.SetEvent(self._stop_event)
 
         def SvcDoRun(self) -> None:
             _redirect_std_streams()
@@ -181,6 +180,10 @@ if sys.platform == "win32":
                 log_config=None,
             )
             self._server = _StoppableServer(config)
+            if self._stopping:
+                # Stop arrived during startup (before the server existed); the
+                # SvcStop signal would otherwise be lost — don't start serving.
+                return
             self._server.run()
 
     def _win_main() -> int:
