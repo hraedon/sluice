@@ -47,7 +47,6 @@ strict = true
 module = [
     "win32service",
     "win32serviceutil",
-    "win32event",
     "servicemanager",
 ]
 ignore_missing_imports = true
