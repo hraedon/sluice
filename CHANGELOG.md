@@ -21,8 +21,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   The service hosts uvicorn **in-process** (not a `sluice serve`
   subprocess): the SCM supervises the real server, and `SvcStop` sets
   uvicorn's `should_exit` for a graceful drain instead of a hard kill.
-  Runs via `pythonw.exe` and redirects stdout/stderr to
-  `logs\service.log`. `_cmd_serve` was split into a shared
+  Runs via `pythonw.exe`. Service logging goes to a size-rotated
+  `logs\service.log` (5 MB × 5), with notable events (`WARNING`+) also
+  mirrored to the Windows Event Log (source `sluice`) for Event Viewer / WEF.
+  File logging + rotation is Windows-service-only; elsewhere sluice logs to
+  stdout and the platform rotates. `_cmd_serve` was split into a shared
   `_build_serve_app()` (config → app) and the `uvicorn.run` call so the
   service reuses the identical app.
 

@@ -106,6 +106,20 @@ environment.
   as the Windows alternative.
 - No `os.fork`, `fcntl`, `grp`, `pwd`, or other Unix-only APIs are used.
 - uvicorn's asyncio event loop works on Windows (ProactorEventLoop on 3.12+).
+- **Logging (Windows-service only).** A service has no stdout collector, so
+  the service writes its own log — the one place sluice does. The full
+  `logging` stream (sluice + uvicorn, the latter run with `log_config=None`
+  so it propagates to root) goes to a size-rotated `logs\service.log`
+  (`RotatingFileHandler`, 5 MB × 5 = 25 MB ceiling). Notable events
+  (`WARNING`+ — crashes, breaker trips, box detection) are *also* mirrored to
+  the Windows Event Log (`NTEventLogHandler`, source `sluice`) so Event
+  Viewer / WEF / monitoring agents see them without tailing a file; the
+  high-frequency stream (per-request, 5 s usage polls) stays file-only to
+  avoid flooding the Application log. This file-logging + rotation lives
+  **only** in `win_service`, never in the core: on Linux/docker/k8s sluice
+  logs to stdout and the platform owns rotation (kubelet and journald rotate
+  by default; **docker's default `json-file` driver does not** — set
+  `--log-opt max-size`/`max-file`, noted in the Docker quickstart).
 - **pip stderr under `$ErrorActionPreference='Stop'`.** Windows PowerShell
   promotes a native command's stderr to a *terminating* error under `Stop`.
   pip routinely writes notices/warnings to stderr (e.g. "Cache entry
