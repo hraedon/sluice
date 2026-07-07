@@ -4,6 +4,24 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-07-07
+
+### Features
+
+- **Docker Compose deployment.** `deploy/compose.yaml` + `deploy/.env.example`
+  provide a self-contained single-host deployment with log rotation, health
+  checks, SQLite history persistence (named volume), and the same security
+  hardening as the k8s manifest (read-only root FS, all capabilities dropped,
+  non-root user). All config via `SLUICE_*` env vars; compose makes the admin
+  token mandatory (fail-safe). Builds from source by default, with a commented
+  `ghcr.io` line to switch to the pre-built image. Validated end-to-end:
+  build, proxy request to umans (200), SQLite persistence across restart,
+  security settings verified.
+
+  The Dockerfile now creates `/data` with `sluice:sluice` ownership so named
+  Docker volumes are writable by the non-root user (no effect on the k8s
+  deployment — the PVC overlays it).
+
 ## [1.2.0] — 2026-07-07
 
 ### Features
