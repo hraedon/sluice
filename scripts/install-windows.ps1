@@ -365,6 +365,12 @@ if ($UsageKey) {
 if ($Upstream) {
     $envLines += "SLUICE_UPSTREAM=$Upstream"
 }
+# Force the provider via env too, so re-installing over an existing config
+# actually applies -Provider. The config file (below) is only written on a
+# fresh install; without this env var a re-install silently keeps the old
+# provider while -Upstream (also env-forced) changes, yielding an incoherent
+# provider/upstream pair. Env precedence (flag → env → config) makes this win.
+$envLines += "SLUICE_PROVIDER=$Provider"
 if ($AdminToken) {
     $envLines += "SLUICE_ADMIN_TOKEN=$AdminToken"
 }

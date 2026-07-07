@@ -18,6 +18,14 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`scripts/uninstall-windows.ps1`) removes the service. Config via a
   TOML file at `C:\ProgramData\sluice\sluice.toml`.
 
+  Validated end-to-end on Windows Server 2025 (Python 3.14): service
+  reaches Running via the SCM dispatcher, `/v1/usage` reconciliation is
+  live, and real client requests proxy through to umans (`/v1/models` and
+  `/v1/chat/completions` both 200). The install script env-forces
+  `SLUICE_PROVIDER` (not just `SLUICE_UPSTREAM`) so a re-install over an
+  existing config actually applies `-Provider` instead of silently keeping
+  the old provider and yielding an incoherent provider/upstream pair.
+
 ## [1.1.0] — 2026-07-06
 
 sluice 1.1 is the first feature release since the 1.0 deployment. It adds
