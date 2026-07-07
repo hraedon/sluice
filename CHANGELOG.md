@@ -26,9 +26,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   `_build_serve_app()` (config → app) and the `uvicorn.run` call so the
   service reuses the identical app.
 
-  Validated end-to-end on Windows Server 2025 (Python 3.14): service
-  reaches Running via the SCM dispatcher, `/v1/usage` reconciliation is
-  live, and real client requests proxy through to umans (`/v1/models` and
+  The install script relaxes `$ErrorActionPreference` around its pip calls
+  and judges them by exit code — otherwise pip's stderr notices (e.g. a
+  fresh-cache warning) are promoted to a terminating error and abort the
+  install on a clean machine (masked whenever the pip cache is warm).
+
+  Validated end-to-end on Windows Server 2025 (Python 3.14): fresh install,
+  service reaches Running via the SCM dispatcher, in-process uvicorn logs to
+  `logs\service.log`, `SvcStop` performs a graceful drain (observed
+  "Application shutdown complete"), `/v1/usage` reconciliation is live, and
+  real client requests proxy through to umans (`/v1/models` and
   `/v1/chat/completions` both 200). The install script env-forces
   `SLUICE_PROVIDER` (not just `SLUICE_UPSTREAM`) so a re-install over an
   existing config actually applies `-Provider` instead of silently keeping

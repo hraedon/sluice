@@ -106,6 +106,20 @@ environment.
   as the Windows alternative.
 - No `os.fork`, `fcntl`, `grp`, `pwd`, or other Unix-only APIs are used.
 - uvicorn's asyncio event loop works on Windows (ProactorEventLoop on 3.12+).
+- **pip stderr under `$ErrorActionPreference='Stop'`.** Windows PowerShell
+  promotes a native command's stderr to a *terminating* error under `Stop`.
+  pip routinely writes notices/warnings to stderr (e.g. "Cache entry
+  deserialization failed" on a fresh cache), which aborted the installer
+  mid-run on a clean machine — invisible whenever the pip cache was warm.
+  The install script now relaxes the preference around the pip calls and
+  judges them by `$LASTEXITCODE`, merging stderr into the log.
+- **Two `pythonw.exe` processes are expected.** Launching the service as
+  `pythonw.exe -m sluice.win_service` produces a parent (spawned by
+  `services.exe`) that re-execs into a child which becomes the actual
+  service host; the SCM tracks the child. Only the child runs uvicorn (one
+  listener, one `/v1/usage` poll cadence) — it is *not* a second server, so
+  it does not double-count concurrency. Both exit on stop. Cosmetic; a
+  future cleanup could try to collapse it, but it does not affect behavior.
 
 ## Files
 

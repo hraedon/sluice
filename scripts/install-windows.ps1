@@ -244,20 +244,33 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "  venv verified: $venvProbe"
 
 Write-Host "Installing sluice (with [windows] extra for pywin32) ..."
-& $venvPy -m pip install --upgrade pip | Out-Null
 $installTarget = $repoRoot
 if (-not (Test-Path (Join-Path $repoRoot "pyproject.toml"))) {
     $installTarget = "git+https://github.com/hraedon/sluice.git@main"
 }
-# Install with [windows] extra so pywin32 is available for the service
-& $venvPy -m pip install --upgrade "$installTarget[windows]"
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  [warn] pip install with [windows] extra failed; trying without ..."
-    & $venvPy -m pip install --upgrade $installTarget
+# pip writes progress and notices (and, on a fresh cache, warnings like
+# "Cache entry deserialization failed") to stderr. Under
+# $ErrorActionPreference='Stop', Windows PowerShell promotes that stderr to a
+# terminating error and aborts the whole install. Native commands must be
+# judged by exit code ($LASTEXITCODE), not by whether they touched stderr, so
+# relax the preference for just this stretch and merge stderr into the log.
+$eap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $venvPy -m pip install --upgrade pip 2>&1 | Out-Null
+    # Install with [windows] extra so pywin32 is available for the service
+    & $venvPy -m pip install --upgrade "$installTarget[windows]" 2>&1 | ForEach-Object { Write-Host "  $_" }
     if ($LASTEXITCODE -ne 0) {
-        throw "pip install of sluice failed (exit $LASTEXITCODE)."
+        Write-Host "  [warn] pip install with [windows] extra failed; trying without ..."
+        & $venvPy -m pip install --upgrade $installTarget 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip install of sluice failed (exit $LASTEXITCODE)."
+        }
+        & $venvPy -m pip install "pywin32>=306" 2>&1 | ForEach-Object { Write-Host "  $_" }
     }
-    & $venvPy -m pip install "pywin32>=306"
+}
+finally {
+    $ErrorActionPreference = $eap
 }
 $installedVer = ((& $venvPy -m pip show sluice 2>$null | Select-String "^Version:") -replace "^Version:\s*", "").Trim()
 Write-Host "  Installed sluice version: $installedVer"
