@@ -1,8 +1,68 @@
 # Deploying sluice
 
-sluice runs as a **single-replica** (`Recreate`, never scale past 1 — the
-concurrency invariant requires exactly one instance) Deployment in its own
-namespace, fronted by an internal Traefik ingress.
+sluice runs as a **single instance** — the concurrency invariant requires
+exactly one sluice admitting traffic (never scale past 1). Two deployment
+options are provided:
+
+- **Docker Compose** — single-host, home-lab friendly. See [below](#docker-compose).
+- **Kubernetes (ArgoCD GitOps)** — production, internal Traefik ingress. See
+  [GitOps](#gitops-argocd).
+
+## Docker Compose
+
+`deploy/compose.yaml` is a self-contained single-service deployment with log
+rotation, health checks, history persistence, and the same security hardening
+as the k8s manifest (read-only root FS, all capabilities dropped, non-root
+user).
+
+### Quickstart
+
+```sh
+cd deploy/
+cp .env.example .env
+# edit .env:
+#   SLUICE_USAGE_KEY=sk-...                        # your umans API key
+#   SLUICE_ADMIN_TOKEN=$(openssl rand -hex 32)     # dashboard login token
+
+docker compose up -d        # start
+docker compose logs -f      # tail
+docker compose down         # stop
+```
+
+The dashboard is at `http://<host>:8800/`. Compose makes `SLUICE_ADMIN_TOKEN`
+mandatory (unlike standalone `docker run`), so visit `/` in a browser and paste
+the token at the login page to get a session cookie. Bearer (`Authorization:
+Bearer <token>`) and HTTP Basic auth also work for `curl` / Prometheus. See
+[Securing the dashboard](../README.md#securing-the-dashboard) for details.
+
+Point clients (opencode, open-webui, …) at `http://<host>:8800` instead of the
+upstream provider.
+
+### Configuration
+
+All tunables are environment variables set in `.env` (see `.env.example` for
+the full list with defaults). The compose file builds from source by default;
+to use the pre-built image from GitHub Container Registry instead, comment out
+`build:`/`image:` in `compose.yaml` and uncomment the `ghcr.io` line.
+
+The compose default for `SLUICE_TARGET` is **4** (the provider's full
+concurrency limit), matching the k8s deployment and unlike the CLI default of
+3 (one-slot safety buffer). Set `SLUICE_TARGET=3` in `.env` for the
+conservative buffer. See the main README's
+[Tuning](../README.md#tuning) section for the trade-off.
+
+History (sparkline data) persists across restarts in a named Docker volume
+mounted at `/data`.
+
+### Behind a reverse proxy
+
+If you run behind Traefik, nginx, or Caddy, set `SLUICE_TRUSTED_PROXIES` in
+`.env` to the proxy's CIDR so the `x-sluice-client-label` QoS header is
+trusted:
+
+```env
+SLUICE_TRUSTED_PROXIES=172.16.0.0/12
+```
 
 ## GitOps (ArgoCD)
 

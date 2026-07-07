@@ -31,7 +31,8 @@ RUN apt-get update \
     && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -r sluice && useradd -r -g sluice -d /tmp sluice
+RUN groupadd -r sluice && useradd -r -g sluice -d /tmp sluice \
+    && mkdir -p /data && chown sluice:sluice /data
 
 COPY --from=builder /opt/venv /opt/venv
 

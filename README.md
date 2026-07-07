@@ -104,6 +104,15 @@ docker run --rm -p 8800:8800 -e SLUICE_USAGE_KEY=sk-... sluice:local \
   serve --upstream https://api.code.umans.ai --listen 0.0.0.0:8800
 ```
 
+**Docker Compose** (single-host, with log rotation + history persistence):
+
+```sh
+cd deploy && cp .env.example .env   # set SLUICE_USAGE_KEY + SLUICE_ADMIN_TOKEN (openssl rand -hex 32)
+docker compose up -d
+```
+
+See `deploy/README.md` for the full compose options and `deploy/compose.yaml`.
+
 sluice logs to stdout, so log retention is the runtime's job. Kubernetes
 (kubelet) and systemd (journald) rotate by default; Docker's default
 `json-file` driver does **not** — add `--log-opt max-size=10m --log-opt
@@ -295,5 +304,5 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 Status: **1.2 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
 real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
 boxed). See `docs/concurrency-model.md` for the data model,
-`docs/client-configuration.md` to point clients at it, and `deploy/README.md` for the
-deployment and the external-exposure toggle.
+`docs/client-configuration.md` to point clients at it, and `deploy/README.md`
+for Docker Compose and Kubernetes / ArgoCD deployment.

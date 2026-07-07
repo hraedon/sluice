@@ -1,0 +1,81 @@
+# Docker Compose deployment for sluice.
+#
+# Single-instance deployment — the concurrency invariant requires exactly one
+# sluice (same constraint as the k8s Recreate strategy; never scale past 1).
+# Suitable for home-lab / single-host deployments where Kubernetes is overkill.
+#
+# Quickstart:
+#   cp .env.example .env        # fill in SLUICE_USAGE_KEY and SLUICE_ADMIN_TOKEN
+#   docker compose up -d        # start
+#   docker compose logs -f      # tail logs
+#   docker compose down         # stop
+#
+# Build from source (default). To use the pre-built registry image instead,
+# comment out build/image below and uncomment the ghcr image line.
+
+services:
+  sluice:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sluice:local
+    # image: ghcr.io/hraedon/sluice:latest
+
+    container_name: sluice
+    restart: unless-stopped
+
+    ports:
+      - "${SLUICE_PORT:-8800}:8800"
+
+    # All config via SLUICE_* environment variables (same precedence as the CLI).
+    # Secrets come from .env; tunables have built-in defaults matching the
+    # k8s deployment.
+    environment:
+      # --- Secrets (required — set in .env) ---
+      SLUICE_USAGE_KEY: ${SLUICE_USAGE_KEY:?set SLUICE_USAGE_KEY in .env}
+      SLUICE_ADMIN_TOKEN: ${SLUICE_ADMIN_TOKEN:?set SLUICE_ADMIN_TOKEN in .env}
+      # --- Config ---
+      SLUICE_UPSTREAM: ${SLUICE_UPSTREAM:-https://api.code.umans.ai}
+      SLUICE_LISTEN: "0.0.0.0:8800"
+      SLUICE_TARGET: ${SLUICE_TARGET:-4}
+      SLUICE_POLL_INTERVAL: ${SLUICE_POLL_INTERVAL:-5}
+      SLUICE_RELEASE_COOLDOWN: ${SLUICE_RELEASE_COOLDOWN:-2}
+      SLUICE_QUEUE_TIMEOUT: ${SLUICE_QUEUE_TIMEOUT:-30}
+      SLUICE_USAGE_KEY_ENV: SLUICE_USAGE_KEY
+      SLUICE_HISTORY_STORE: /data/history.sqlite
+      SLUICE_PROVIDER: ${SLUICE_PROVIDER:-umans}
+      # Optional: trusted proxy CIDR for x-sluice-client-label (default: loopback-only)
+      SLUICE_TRUSTED_PROXIES: ${SLUICE_TRUSTED_PROXIES:-}
+
+    command: ["serve"]
+
+    volumes:
+      - sluice-data:/data
+
+    tmpfs:
+      - /tmp
+
+    # Match the k8s security context: read-only root FS, no capabilities.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Docker's json-file driver does NOT rotate by default.
+    # 10 MB × 5 files ≈ 50 MB max disk per container.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8800/healthz').status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  sluice-data:
