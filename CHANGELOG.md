@@ -4,6 +4,46 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-07
+
+### Features
+
+- **Plan 014 — Windows Service support.** sluice can now run as a native
+  Windows service. An install script (`scripts/install-windows.ps1`)
+  finds Python 3.12+ (borrowing cert-watch's Install Manager and shared-
+  Python logic), creates a venv, installs sluice with the `[windows]`
+  extra (pywin32), and registers a Windows service via `New-Service`.
+  The service spawns `sluice serve` as a subprocess; the dashboard is
+  available at `http://localhost:8800/`. An uninstall script
+  (`scripts/uninstall-windows.ps1`) removes the service. Config via a
+  TOML file at `C:\ProgramData\sluice\sluice.toml`.
+
+  The service hosts uvicorn **in-process** (not a `sluice serve`
+  subprocess): the SCM supervises the real server, and `SvcStop` sets
+  uvicorn's `should_exit` for a graceful drain instead of a hard kill.
+  Runs via `pythonw.exe`. Service logging goes to a size-rotated
+  `logs\service.log` (5 MB × 5), with notable events (`WARNING`+) also
+  mirrored to the Windows Event Log (source `sluice`) for Event Viewer / WEF.
+  File logging + rotation is Windows-service-only; elsewhere sluice logs to
+  stdout and the platform rotates. `_cmd_serve` was split into a shared
+  `_build_serve_app()` (config → app) and the `uvicorn.run` call so the
+  service reuses the identical app.
+
+  The install script relaxes `$ErrorActionPreference` around its pip calls
+  and judges them by exit code — otherwise pip's stderr notices (e.g. a
+  fresh-cache warning) are promoted to a terminating error and abort the
+  install on a clean machine (masked whenever the pip cache is warm).
+
+  Validated end-to-end on Windows Server 2025 (Python 3.14): fresh install,
+  service reaches Running via the SCM dispatcher, in-process uvicorn logs to
+  `logs\service.log`, `SvcStop` performs a graceful drain (observed
+  "Application shutdown complete"), `/v1/usage` reconciliation is live, and
+  real client requests proxy through to umans (`/v1/models` and
+  `/v1/chat/completions` both 200). The install script env-forces
+  `SLUICE_PROVIDER` (not just `SLUICE_UPSTREAM`) so a re-install over an
+  existing config actually applies `-Provider` instead of silently keeping
+  the old provider and yielding an incoherent provider/upstream pair.
+
 ## [1.1.0] — 2026-07-06
 
 sluice 1.1 is the first feature release since the 1.0 deployment. It adds
