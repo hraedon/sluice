@@ -135,7 +135,8 @@ class ClientMetrics:
             for label, c in self._counters.items():
                 val = getattr(c, attr)
                 if val > 0:
-                    lines.append(f'{name}{{label="{label}"}} {val}')
+                    escaped = label.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                    lines.append(f'{name}{{label="{escaped}"}} {val}')
             ov = getattr(self._overflow, attr)
             if ov > 0:
                 lines.append(f'{name}{{label="__overflow__"}} {ov}')

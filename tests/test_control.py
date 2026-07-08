@@ -715,18 +715,31 @@ def test_effective_permits_clamped_by_hard_cap():
     assert effective_permits(s, cfg, now=NOW) == 6
 
 
-def test_effective_permits_not_clamped_by_hard_cap_when_stale():
-    """When the reading is stale, hard_cap is not trusted — no clamp."""
+def test_effective_permits_clamped_by_hard_cap_when_stale():
+    """When the reading is stale, the LKG hard_cap is still respected as a ceiling.
+
+    Fail-safe: ignoring the last-known hard_cap when stale would be fail-open
+    (a provider downgrade during a poll outage would forward above the real
+    limit).  The stale_penalty tightens ``base``; the clamp further restricts
+    the ceiling to the last-known safe bound.
+    """
     cfg = ControllerConfig(target=10, min_floor=1)
     r = reading(concurrent_sessions=0, limit=4, hard_cap=6, age_seconds=60.0)
     s = state(r, in_flight=0, phantom=0)
-    # Stale: base = min(10, 10-1) = 9, clamped to [1, 10] = 9 (not clamped to 6)
-    assert effective_permits(s, cfg, now=NOW) == 9
+    # Stale: base = min(10, 10-1) = 9, clamped to [1, min(10, 6)] = 6
+    assert effective_permits(s, cfg, now=NOW) == 6
 
 
-# ---------------------------------------------------------------------------
-# Plan 013 WI-002: saturation_retry_after — pure estimator
-# ---------------------------------------------------------------------------
+def test_controller_config_rejects_min_floor_zero():
+    """min_floor=0 voids the 'never fully closed on uncertainty' guarantee."""
+    with pytest.raises(ValueError, match="min_floor must be >= 1"):
+        ControllerConfig(min_floor=0)
+
+
+def test_adaptive_config_rejects_min_floor_zero():
+    """AdaptiveConfig must also reject min_floor < 1."""
+    with pytest.raises(ValueError, match="min_floor must be >= 1"):
+        AdaptiveConfig(min_floor=0)
 
 
 def test_saturation_retry_after_basic():

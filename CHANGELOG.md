@@ -4,6 +4,79 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] — 2026-07-08
+
+### Fixes
+
+- **Fail-safe: stale-reading path now respects LKG `hard_cap` as a ceiling.**
+  Previously, when the `/v1/usage` reading was stale, the `effective_permits`
+  computation dropped the `hard_cap` clamp entirely — clamping only to
+  `target`. If a provider downgrade occurred during a poll outage (e.g.
+  `hard_cap` dropped from 8 to 2), sluice would forward permits above the
+  real limit — a fail-open window (AGENTS.md rule 1). The stale path now
+  clamps to `min(target, hard_cap)`, using the last-known-good `hard_cap` as
+  the ceiling. The `stale_penalty` still tightens `base`; the clamp further
+  restricts the ceiling to the last-known safe bound.
+
+- **Adaptive controller gains the stale-reading + rate_limit 429 safety net.**
+  The shell-level safety net (`permits = min(permits, min_floor)` when the
+  reading is stale AND recent rate_limit 429s exist) was only applied to the
+  concurrency-reconcile controller (umans). The adaptive controller (Anthropic,
+  OpenAI, generic) had no equivalent — its AIMD stale-decrease is gated by
+  `min_decrease_interval` (30s), so permits could be held steady into a
+  rejecting upstream during that window. The safety net now applies to both
+  controllers.
+
+- **Idle detection now considers rate_limit 429s.** The `_idle` predicate
+  (which triggers slow poll backoff, WI-022) previously checked only
+  `_recent_429s` (concurrency 429s). A system actively receiving rate_limit
+  429s (which don't feed the breaker but do wake the poll) could declare
+  itself idle and oscillate the poll cadence. The predicate now also checks
+  `len(self._recent_rate_limit_429s) == 0`.
+
+- **`min_floor` validation.** `ControllerConfig` and `AdaptiveConfig` now
+  reject `min_floor < 1` at construction. A `min_floor=0` would void the
+  "never fully closed on uncertainty alone" guarantee (AGENTS.md). The
+  `__post_init__` raises `ValueError` so misconfiguration fails fast at
+  startup, not silently at runtime.
+
+- **`resize()` clamps negative capacity to 0.** `PermitGate.resize()` now
+  guards against negative values, clamping to 0 (fail-safe: closed gate)
+  instead of accepting them silently, which would inflate `_available()`.
+
+- **RFC 7230 §6.1: Connection header hop-by-hop parsing.** The proxy now
+  parses the `Connection` header to identify additional hop-by-hop headers
+  (headers named in `Connection` must not be forwarded). Previously, only a
+  fixed set was stripped — custom headers named in `Connection` would leak
+  to the upstream, breaking cache-transparency (AGENTS.md rule 7). Applied
+  to both request and response header filtering.
+
+- **Session fixation prevention.** Upstream `Set-Cookie` values that set
+  `sluice_session=` are now stripped from the response. The upstream should
+  never set this cookie, but if it does, it must not reach the client's
+  browser and overwrite the admin session cookie.
+
+- **IPv4-mapped IPv6 loopback in Secure cookie decision.** `_should_set_secure()`
+  now recognizes `::ffff:127.0.0.1` as a loopback address, so the `Secure`
+  attribute is correctly set on IPv4-mapped IPv6 localhost connections.
+
+- **Prometheus label escaping in `ClientMetrics.to_prometheus()`.** Label
+  values are now escaped (`\`, `"`, `\n`) to match the escaping already
+  present in `status.py`'s `to_prometheus()`. Previously, a client label
+  containing special characters would produce invalid Prometheus text.
+
+### Tests
+
+- Fixed `test_429_with_unparseable_retry_after_is_recorded`: moved `"-1"`
+  (a valid integer that parses as concurrency) to the zero-variants test,
+  replaced with `"1.5"` (a float that is genuinely unparseable).
+- Renamed `test_effective_permits_not_clamped_by_hard_cap_when_stale` →
+  `test_effective_permits_clamped_by_hard_cap_when_stale` with updated
+  assertion reflecting the fail-safe behavior.
+- Added tests for: `min_floor` validation, adaptive controller safety net,
+  idle detection with rate_limit 429s, rate_limit 429 aging out of safety
+  net, negative `resize()` clamping.
+
 ## [1.2.1] — 2026-07-07
 
 ### Features

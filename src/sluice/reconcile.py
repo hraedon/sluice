@@ -378,6 +378,15 @@ class ReconciliationLoop:
             permits, self._adaptive = adaptive_effective_permits(
                 state, self._adaptive, self._adaptive_cfg, now=now_mono
             )
+
+            # Stale-reading safety net (same rationale as the concurrency
+            # reconciler below): when the usage reading is stale AND there are
+            # recent rate_limit 429s, the AIMD controller's stale-decrease is
+            # gated by min_decrease_interval (30s default), so permits can be
+            # held steady into a rejecting upstream — a fail-open window.
+            # Tighten to min_floor as a backstop (AGENTS.md rule 1).
+            if not cached.ok and len(self._recent_rate_limit_429s) > 0:
+                permits = min(permits, self._adaptive_cfg.min_floor)
         else:
             # Concurrency reconciler — the umans path (regression gate).
             # Record the (observed, local) pairing for windowed phantom estimation.
@@ -458,6 +467,7 @@ class ReconciliationLoop:
             cached.ok
             and self._gate.held == 0
             and len(self._recent_429s) == 0
+            and len(self._recent_rate_limit_429s) == 0
             and self._last_band is Band.NORMAL
             and self._last_phantom_estimate == 0
             and self._breaker.state is BreakerState.CLOSED

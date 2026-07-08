@@ -1960,13 +1960,14 @@ async def test_rate_limit_429_with_retry_after_is_not_recorded():
     assert reconcile.recent_429_count == 0, "rate-limit 429s must not feed the breaker window"
 
 
-@pytest.mark.parametrize("retry_after", ["0", "00", " 0 ", " 0", "0 "])
+@pytest.mark.parametrize("retry_after", ["0", "00", " 0 ", " 0", "0 ", "-1"])
 async def test_429_with_retry_after_zero_variants_is_recorded(retry_after):
-    """A 429 with retry-after: 0 (any canonical form) is a concurrency signal.
+    """A 429 with retry-after: 0 or negative (any canonical form) is a concurrency signal.
 
     retry-after: 0 means "retry immediately," which is a concurrency rejection,
     not a rate-limit window.  The string "0" is truthy in Python, so a naive
     ``not header`` check would silently skip the breaker — fail-open.
+    Negative values mean the same (retry immediately).
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1982,12 +1983,14 @@ async def test_429_with_retry_after_zero_variants_is_recorded(retry_after):
     assert reconcile.total_429s == 1, f"retry-after: {retry_after!r} must trip the breaker"
 
 
-@pytest.mark.parametrize("retry_after", ["", "abc", "-1"])
+@pytest.mark.parametrize("retry_after", ["", "abc", "1.5"])
 async def test_429_with_unparseable_retry_after_is_recorded(retry_after):
     """A 429 with an unparseable retry-after is treated as concurrency (fail safe).
 
     Per AGENTS.md rule 1, any uncertainty must tighten the gate.  An unparseable
     retry-after cannot be classified as a rate-limit window, so it trips the breaker.
+    "1.5" is a float — not a valid delta-seconds integer — and not a valid HTTP-date,
+    so it falls through to the concurrency fail-safe.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:

@@ -201,7 +201,7 @@ def _should_set_secure(
     if forwarded_proto_https(scope, trusted_proxies):
         return True
     server = scope.get("server")
-    if server and server[0] in ("127.0.0.1", "localhost", "::1"):
+    if server and server[0] in ("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"):
         return True
     return False
 

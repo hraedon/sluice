@@ -398,3 +398,11 @@ async def test_hold_seconds_zero_when_empty():
     """avg_hold_seconds is 0.0 when no samples exist."""
     gate = PermitGate(initial_capacity=1)
     assert gate.avg_hold_seconds == 0.0
+
+
+async def test_resize_negative_clamps_to_zero():
+    """Negative capacity is clamped to 0 (fail-safe: close the gate)."""
+    gate = PermitGate(initial_capacity=3)
+    await gate.resize(-1)
+    assert gate.capacity == 0
+    assert gate.available == 0

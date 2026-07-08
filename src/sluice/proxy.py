@@ -74,6 +74,22 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
+
+def _parse_connection_headers(headers: list[tuple[bytes, bytes]]) -> set[str]:
+    """Extract header names listed in Connection headers (RFC 7230 §6.1).
+
+    These are hop-by-hop and must not be forwarded.  Returns a set of
+    lowercased header names (without the ``connection`` header itself).
+    """
+    extra: set[str] = set()
+    for k, v in headers:
+        if k.lower() == b"connection":
+            for name in v.decode("latin-1").split(","):
+                name = name.strip().lower()
+                if name:
+                    extra.add(name)
+    return extra
+
 # Sluice-internal control headers — consumed and stripped before forwarding.
 # These are QoS / routing metadata sluice uses; they must never reach the upstream
 # so the request hashes identically to a direct client (cache-transparency, AGENTS.md #7).
@@ -934,10 +950,14 @@ class ProxyApp:
         return None
 
     def _filter_request_headers(self, scope_headers: list[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
+        # Parse Connection header for additional hop-by-hop headers (RFC 7230 §6.1).
+        connection_hop_by_hop = _parse_connection_headers(scope_headers)
+        strip_set = _STRIP_REQUEST | connection_hop_by_hop
+
         result: list[tuple[str, str]] = []
         for k, v in scope_headers:
             name = k.decode("latin-1").lower()
-            if name in _STRIP_REQUEST:
+            if name in strip_set:
                 continue
             if name.startswith("x-sluice-"):
                 continue
@@ -961,8 +981,20 @@ class ProxyApp:
 
     @staticmethod
     def _encode_response_headers(response: httpx.Response) -> list[tuple[bytes, bytes]]:
+        # Parse upstream Connection header for additional hop-by-hop headers.
+        connection_hop_by_hop = _parse_connection_headers(
+            [(k.encode("latin-1"), v.encode("latin-1")) for k, v in response.headers.items()]
+        )
+        strip_set = _HOP_BY_HOP | connection_hop_by_hop
         return [
             (k.encode("latin-1"), v.encode("latin-1"))
             for k, v in response.headers.items()
-            if k.lower() not in _HOP_BY_HOP
+            if k.lower() not in strip_set
+            # Strip upstream Set-Cookie values that set the sluice session cookie
+            # to prevent session fixation (the upstream should never set this,
+            # but if it does, it must not reach the client's browser).
+            and not (
+                k.lower() == "set-cookie"
+                and v.strip().lower().startswith(f"{_SESSION_COOKIE}=")
+            )
         ]

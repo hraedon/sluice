@@ -153,7 +153,14 @@ class PermitGate:
             self._cond.notify_all()
 
     async def resize(self, new_capacity: int) -> None:
-        """Change the capacity.  Never revokes in-flight permits."""
+        """Change the capacity.  Never revokes in-flight permits.
+
+        Negative values are clamped to 0 (fail-safe: a misconfigured override
+        or a corrupted computation closes the gate rather than inflating it).
+        """
+        if new_capacity < 0:
+            log.warning("resize called with negative capacity %d — clamping to 0", new_capacity)
+            new_capacity = 0
         async with self._cond:
             self._capacity = new_capacity
             self._cond.notify_all()

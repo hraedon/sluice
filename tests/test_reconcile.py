@@ -203,6 +203,97 @@ async def test_fresh_reading_with_rate_limit_429s_does_not_overtighten():
     assert gate.capacity == 3  # no overtightening when fresh
 
 
+async def test_rate_limit_429s_aging_out_releases_safety_net():
+    """After rate_limit 429s age out of the breaker window, the safety net releases.
+
+    Without this, a single burst of rate_limit 429s would pin the gate at
+    min_floor forever (fail-closed stuck state).
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    # Fresh → target.
+    await loop.tick()
+    assert gate.capacity == 3
+
+    # Rate-limit 429s arrive.
+    loop.record_rate_limit_429()
+    loop.record_rate_limit_429()
+
+    # Poll fails → stale → safety net tightens to min_floor.
+    client.set_fail(True)
+    m[0] += 100  # stale
+    await loop.tick()
+    assert gate.capacity == 1  # min_floor
+
+    # Advance past the breaker window (300s) → 429s age out.
+    client.set_fail(False)
+    m[0] += 310
+    await loop.tick()
+    # Fresh reading, no recent rate_limit 429s → safety net releases.
+    assert gate.capacity == 3  # back to target
+
+
+async def test_stale_reading_with_rate_limit_429s_tightens_adaptive_to_min_floor():
+    """Adaptive controller safety net: stale + rate_limit 429s → min_floor.
+
+    Same rationale as the concurrency reconciler: the AIMD stale-decrease is
+    gated by min_decrease_interval (30s), so permits can be held steady into
+    a rejecting upstream — a fail-open window (AGENTS.md rule 1).
+    """
+    from sluice.control import AdaptiveConfig
+
+    initial = _reading(concurrent_sessions=0, provider="anthropic")
+    m = [1000.0]
+    w = [1_000_000.0]
+    client = FakeUsageClient(initial)
+    gate = PermitGate(initial_capacity=3, release_cooldown=0.0, clock=lambda: m[0])
+    loop = ReconciliationLoop(
+        truth_source=client,
+        gate=gate,
+        controller_config=CFG,
+        breaker_config=BCFG,
+        poll_interval=5.0,
+        monotonic_clock=lambda: m[0],
+        wall_clock=lambda: w[0],
+        controller="adaptive",
+        adaptive_config=AdaptiveConfig(target=3, min_floor=1),
+    )
+
+    # Fresh → AIMD additive increase (starts at 1, +1 per tick).
+    await loop.tick()
+    assert gate.capacity == 2  # 1 + additive_step
+    await loop.tick()
+    assert gate.capacity == 3  # 2 + additive_step, capped at target
+
+    # Rate-limit 429s arrive.
+    loop.record_rate_limit_429()
+
+    # Poll fails → stale → safety net tightens to min_floor.
+    client.set_fail(True)
+    m[0] += 100  # stale
+    await loop.tick()
+    assert gate.capacity == 1  # adaptive min_floor
+
+
+async def test_idle_not_set_when_rate_limit_429s_recent():
+    """Idle detection must consider rate_limit 429s, not just concurrency 429s.
+
+    Without this, the system declares itself idle and slows the poll cadence
+    while rate_limit 429s are actively arriving — the poll is woken by each 429,
+    but the cadence oscillates unnecessarily.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    await loop.tick()
+    assert loop.is_idle  # truly idle
+
+    loop.record_rate_limit_429()
+
+    # Fresh tick with rate_limit 429 → not idle.
+    await loop.tick()
+    assert not loop.is_idle
+
+
 async def test_rate_limit_429_does_not_retrip_half_open_breaker():
     """HALF_OPEN breaker + rate_limit 429 → stays HALF_OPEN (not re-tripped).
 

@@ -30,7 +30,12 @@ jobs:
         run: |
           short_sha=$(git rev-parse --short HEAD)
           echo "sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          git_tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+          # Only a tag pointing AT HEAD names this build. `git describe` here
+          # was a bug: it returns the nearest *ancestor* tag, so every ordinary
+          # main push re-pointed the previous release's ghcr version tag at
+          # unreleased code (v1.2.1 was silently moved to the 1.2.2-code image
+          # on 2026-07-07).
+          git_tag=$(git tag --points-at HEAD --list 'v*' | sort -V | tail -n1)
           echo "git_tag=${git_tag}" >> "$GITHUB_OUTPUT"
           {
             echo "image_tags<<EOF"

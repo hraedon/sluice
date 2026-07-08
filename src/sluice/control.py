@@ -95,6 +95,10 @@ class ControllerConfig:
     low_penalty: int = 1  # tighten by this when already in the 'low' band
     phantom_window: int = 3  # samples for sustained phantom detection (Plan 003)
 
+    def __post_init__(self) -> None:
+        if self.min_floor < 1:
+            raise ValueError(f"min_floor must be >= 1, got {self.min_floor}")
+
 
 @dataclass(frozen=True)
 class ControllerState:
@@ -245,13 +249,14 @@ def effective_permits(state: ControllerState, config: ControllerConfig, *, now: 
     if state.breaker is BreakerState.HALF_OPEN:
         return max(0, min(base, 1))
 
-    # Clamp target against the provider's hard_cap when the reading is fresh —
-    # a runtime override (or a plan downgrade) can leave target > hard_cap,
-    # and the provider will punish requests above hard_cap (AGENTS.md rule 1).
-    # When stale, we don't trust hard_cap; the stale_penalty already tightened.
-    if reading.age_seconds <= config.usage_fresh_ttl:
-        return _clamp(base, config.min_floor, min(config.target, reading.hard_cap))
-    return _clamp(base, config.min_floor, config.target)
+    # Clamp target against the provider's hard_cap — a runtime override (or a
+    # plan downgrade) can leave target > hard_cap, and the provider will punish
+    # requests above hard_cap (AGENTS.md rule 1).  The LKG hard_cap is the
+    # last-known upper bound and must be respected even when stale: ignoring it
+    # would be fail-open (a downgrade during a poll outage would forward above
+    # the real limit).  The stale_penalty already tightened ``base``; the clamp
+    # further restricts the ceiling to the last-known safe bound.
+    return _clamp(base, config.min_floor, min(config.target, reading.hard_cap))
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +383,10 @@ class AdaptiveConfig:
     fresh_ttl: float = 15.0  # headers older than this are "stale"
     low_remaining_fraction: float = 0.2  # below this → backoff
     min_decrease_interval: float = 30.0  # minimum seconds between multiplicative decreases
+
+    def __post_init__(self) -> None:
+        if self.min_floor < 1:
+            raise ValueError(f"min_floor must be >= 1, got {self.min_floor}")
 
 
 @dataclass(frozen=True)

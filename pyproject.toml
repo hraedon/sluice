@@ -1,6 +1,6 @@
 [project]
 name = "sluice"
-version = "1.2.2"
+version = "1.2.3"
 description = "Central concurrency-metering reverse proxy for LLM APIs, reconciled against the provider's usage endpoint."
 readme = "README.md"
 requires-python = ">=3.12"
