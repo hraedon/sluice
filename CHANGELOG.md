@@ -4,6 +4,27 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] — 2026-07-10
+
+### Fixes
+
+- **`__version__` drift between `pyproject.toml` and `__init__.py`.** The
+  v1.3.0 startup banner logged `sluice 1.2.3 starting` because
+  `__version__` was a hand-maintained second copy of the version string.
+  Now resolved from `importlib.metadata.version("sluice")` (the installed
+  package's metadata, written from `pyproject.toml` at build time) with a
+  non-drifting `"0.0.0+uninstalled"` fallback for run-from-source.
+- **`_cancel_task` in `proxy.py` swallowed control-flow exceptions.**
+  `contextlib.suppress(BaseException)` caught `KeyboardInterrupt` and
+  `SystemExit` — narrowed to `suppress(Exception, asyncio.CancelledError)`
+  so control-flow exceptions propagate correctly while still consuming
+  task results to prevent asyncio's "never retrieved" warnings.
+
+### Dependencies
+
+- Bump `actions/checkout` v6.0.3 → v7.0.0
+- Bump `actions/setup-python` v6.2.0 → v6.3.0
+
 ## [1.3.0] — 2026-07-10
 
 ### Fixes
