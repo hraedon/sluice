@@ -4,6 +4,33 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-07-10
+
+### Fixes
+
+- **Orphaned permits from ungracefully-disconnected clients ("local
+  phantoms").** When a client host was restarted or power-cycled mid-stream,
+  its TCP connection went silent without a FIN/RST. The proxy's streaming
+  loop only checked for a client disconnect *between* upstream chunks, so a
+  request whose upstream had gone idle blocked forever in `__anext__`, never
+  releasing its concurrency permit. The slot was held indefinitely —
+  `local_in_flight` stuck above the provider's `concurrent_sessions`, which
+  the reconciler's phantom absorption (`max(0, observed − local)`) cannot
+  reclaim because it only models the *opposite* skew. Observed live: three
+  permits pinned across 33h after two hosts were restarted, driving 297
+  saturation-503s. Two coordinated fixes:
+  - **Streaming loop races each upstream read against the disconnect event**
+    (`proxy.py`), so a detected disconnect frees the permit immediately even
+    when the upstream has gone silent — no longer waiting for a next chunk
+    that may never arrive.
+  - **TCP keepalive on client connections** (`cli.py`, on by default) so an
+    ungracefully-dropped peer is detected by the kernel (~120s with the
+    default 60s idle) and surfaced as `http.disconnect`, instead of the OS
+    default ~2h. New flags: `--tcp-keepalive` / `--no-tcp-keepalive` and
+    `--tcp-keepalive-idle` (env: `SLUICE_TCP_KEEPALIVE`,
+    `SLUICE_TCP_KEEPALIVE_IDLE`). Detection keys on genuine liveness, so
+    legitimately long streams to a live client are never truncated.
+
 ## [1.2.3] — 2026-07-08
 
 ### Fixes

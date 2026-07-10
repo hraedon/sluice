@@ -120,12 +120,14 @@ def test_serve_upstream_from_env(monkeypatch):
     monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
     monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
     monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+    # Disable keepalive so the runner doesn't bind a real socket in the test.
+    monkeypatch.setenv("SLUICE_TCP_KEEPALIVE", "false")
 
     # We can't actually run uvicorn, but we can verify the config resolution
     # doesn't error on upstream being missing from flags.
     from sluice.cli import main
 
-    with patch("uvicorn.run", side_effect=KeyboardInterrupt):
+    with patch("uvicorn.Server.run", side_effect=KeyboardInterrupt):
         try:
             main(["serve"])
         except (KeyboardInterrupt, SystemExit):
@@ -143,10 +145,11 @@ def test_invalid_log_level_env_falls_back(monkeypatch):
     monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
     monkeypatch.setenv("SLUICE_LOG_LEVEL", "BOGUS")
     monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+    monkeypatch.setenv("SLUICE_TCP_KEEPALIVE", "false")
 
     from sluice.cli import main
 
-    with patch("uvicorn.run", side_effect=KeyboardInterrupt):
+    with patch("uvicorn.Server.run", side_effect=KeyboardInterrupt):
         try:
             main(["serve"])
         except (KeyboardInterrupt, SystemExit):
@@ -206,53 +209,33 @@ def test_parse_listen_ipv4():
 
 
 def test_listen_ipv6_bracketed_parses_host_port(monkeypatch):
-    """Verify _cmd_serve extracts host=::1 port=8800 from [::1]:8800."""
+    """_build_serve_app extracts host=::1 port=8800 from [::1]:8800."""
     monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
     monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
     monkeypatch.delenv("SLUICE_CONFIG", raising=False)
 
-    captured = {}
+    from sluice.cli import _build_serve_app, build_parser
 
-    def fake_run(app, *, host, port, **kwargs):
-        captured["host"] = host
-        captured["port"] = port
-        raise KeyboardInterrupt
+    args = build_parser().parse_args(["serve", "--listen", "[::1]:8800"])
+    _app, host, port, _log = _build_serve_app(args)
 
-    from sluice.cli import main
-
-    with patch("uvicorn.run", side_effect=fake_run):
-        try:
-            main(["serve", "--listen", "[::1]:8800"])
-        except (KeyboardInterrupt, SystemExit):
-            pass
-
-    assert captured["host"] == "::1"
-    assert captured["port"] == 8800
+    assert host == "::1"
+    assert port == 8800
 
 
 def test_listen_ipv4_parses_host_port(monkeypatch):
-    """Verify _cmd_serve extracts host=0.0.0.0 port=8800 from 0.0.0.0:8800."""
+    """_build_serve_app extracts host=0.0.0.0 port=8800 from 0.0.0.0:8800."""
     monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
     monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
     monkeypatch.delenv("SLUICE_CONFIG", raising=False)
 
-    captured = {}
+    from sluice.cli import _build_serve_app, build_parser
 
-    def fake_run(app, *, host, port, **kwargs):
-        captured["host"] = host
-        captured["port"] = port
-        raise KeyboardInterrupt
+    args = build_parser().parse_args(["serve", "--listen", "0.0.0.0:8800"])
+    _app, host, port, _log = _build_serve_app(args)
 
-    from sluice.cli import main
-
-    with patch("uvicorn.run", side_effect=fake_run):
-        try:
-            main(["serve", "--listen", "0.0.0.0:8800"])
-        except (KeyboardInterrupt, SystemExit):
-            pass
-
-    assert captured["host"] == "0.0.0.0"
-    assert captured["port"] == 8800
+    assert host == "0.0.0.0"
+    assert port == 8800
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +335,60 @@ def test_cors_allow_origin_env_passthrough(monkeypatch):
     monkeypatch.setenv("SLUICE_CORS_ALLOW_ORIGIN", "https://grafana.example.com")
     args = _make_args()
     assert _resolve("cors_allow_origin", args) == "https://grafana.example.com"
+
+
+# ---------------------------------------------------------------------------
+# TCP keepalive (orphaned-permit fix): dead clients must be detectable
+# ---------------------------------------------------------------------------
+
+
+def test_tcp_keepalive_defaults_on():
+    """Keepalive is on by default so ungracefully-dropped clients are noticed."""
+    args = _make_args()
+    assert _resolve("tcp_keepalive", args) is True
+    assert _resolve("tcp_keepalive_idle", args) == 60
+
+
+def test_tcp_keepalive_env_disables(monkeypatch):
+    """SLUICE_TCP_KEEPALIVE=false turns keepalive off."""
+    monkeypatch.setenv("SLUICE_TCP_KEEPALIVE", "false")
+    args = _make_args()
+    assert _resolve("tcp_keepalive", args) is False
+
+
+def test_tcp_keepalive_idle_env_coerced_to_int(monkeypatch):
+    """SLUICE_TCP_KEEPALIVE_IDLE is coerced to int seconds."""
+    monkeypatch.setenv("SLUICE_TCP_KEEPALIVE_IDLE", "30")
+    args = _make_args()
+    val = _resolve("tcp_keepalive_idle", args)
+    assert val == 30
+    assert isinstance(val, int)
+
+
+def test_no_tcp_keepalive_flag_overrides_default():
+    """The --no-tcp-keepalive flag resolves to False (BooleanOptionalAction)."""
+    from sluice.cli import build_parser
+
+    args = build_parser().parse_args(["serve", "--no-tcp-keepalive"])
+    assert _resolve("tcp_keepalive", args) is False
+
+
+def test_bind_listen_socket_enables_keepalive():
+    """_bind_listen_socket returns a bound socket with SO_KEEPALIVE set.
+
+    Binds to an ephemeral port (0) to avoid collisions.  On Linux the
+    TCP_KEEPIDLE knob is also applied and readable back.
+    """
+    import socket as _socket
+
+    from sluice.cli import _bind_listen_socket
+
+    sock = _bind_listen_socket("127.0.0.1", 0, keepalive_idle=42)
+    try:
+        assert sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE) == 1
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            assert sock.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE) == 42
+        # It is bound (has a concrete port) but listen() is left to asyncio.
+        assert sock.getsockname()[1] != 0
+    finally:
+        sock.close()
