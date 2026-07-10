@@ -12,4 +12,4 @@ try:
     # the banner/status version is always whatever was built and installed.
     __version__ = _pkg_version("sluice")
 except PackageNotFoundError:  # pragma: no cover - only when running uninstalled
-    __version__ = "1.3.0"
+    __version__ = "0.0.0+uninstalled"
