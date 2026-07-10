@@ -71,7 +71,7 @@ async def _cancel_task(task: "asyncio.Future[Any]") -> None:
     not log it as never-retrieved.
     """
     if task.done():
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             task.result()
         return
     task.cancel()
