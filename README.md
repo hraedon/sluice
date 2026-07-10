@@ -54,6 +54,8 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   (`effective = target − max(0, observed − local_in_flight)`).
 - **Prevents phantoms** rather than only absorbing them: when a downstream client
   disconnects, sluice issues a clean cancel upstream instead of leaving a dangling stream.
+  This holds even when the client dies *ungracefully* (a rebooted host) — see
+  [local phantoms](#local-phantoms).
 - **Respects the box — and knows it from deprioritization.** On a hard box
   (`boxed_until` without `priority.reason = "rate_limited"`) it closes the gate and
   returns `503 Retry-After`, instead of hammering a locked account toward a longer
@@ -149,6 +151,8 @@ manifests.
 | `--queue-timeout SECS` | `30.0` | Max seconds a request waits for a permit before receiving a `503`. |
 | `--poll-interval SECS` | `5.0` | Seconds between `/v1/usage` polls — the reconciliation loop's cadence. |
 | `--reserve LABEL=N` | _(none)_ | Reserves N permit slots for a QoS class (e.g. `interactive=1`). See [QoS reserve](#qos-reserve) below. |
+| `--tcp-keepalive` / `--no-tcp-keepalive` | on | TCP keepalive on client connections so a client that dies ungracefully (a rebooted or power-cycled host that never sends FIN/RST) is detected and its permit released, instead of orphaning the concurrency slot. Off, the OS default (~2h) can pin a slot indefinitely — see [local phantoms](#local-phantoms) below. |
+| `--tcp-keepalive-idle SECS` | `60` | Seconds a client connection may sit idle before the first keepalive probe. Dead-peer detection takes roughly `idle + 60s` (4 probes × 15s). Lower it for faster reclaim on flaky networks. |
 
 The release cooldown is what makes the dashboard sometimes show queued requests alongside
 "free" slots — the slots are freed (`local_in_flight` decremented) but still resting
@@ -245,6 +249,32 @@ In a Kubernetes deployment, `--singleton-guard kube-lease` uses a coordination.k
 so that only one pod is leader at a time. Non-leader pods fast-fail with 503 and retry lease
 acquisition. The pod needs `POD_NAME` and `POD_NAMESPACE` env vars (set by the Kubernetes
 downward API). See `deploy/` for the manifest.
+
+## Local phantoms
+
+The reconciler's phantom absorption (`max(0, observed − local_in_flight)`) handles the
+skew where the **provider** counts more sessions than sluice does. The inverse can also
+happen: sluice counts more than the provider, because a permit is held by a request whose
+client is already gone. A client that dies *ungracefully* — a rebooted or power-cycled
+host that never sends a TCP FIN/RST — leaves its connection silently dead. Without help,
+the OS won't notice for ~2 hours, and the proxy's streaming read blocks the whole time,
+pinning the concurrency slot. `local_in_flight` sits stuck above the provider's
+`concurrent_sessions`, and because absorption only models the opposite skew, nothing
+reclaims it — until sluice restarts.
+
+Two mechanisms close this off, both keyed on genuine liveness so a legitimately long
+stream to a *live* client is never truncated:
+
+1. **TCP keepalive on client connections** (`--tcp-keepalive`, on by default) makes the
+   kernel probe an idle-looking connection and reset it when the peer is gone (~`idle + 60s`
+   with the default 60s idle), surfacing the dead client as an ASGI `http.disconnect`.
+2. **The streaming loop races each upstream read against that disconnect signal**, so the
+   permit is freed the instant the disconnect is detected — even when the upstream itself
+   has gone silent and no next chunk is coming.
+
+If you see `local_in_flight` pinned above `concurrent_sessions` with no active traffic,
+that's the fingerprint of a leaked permit; the two mechanisms above prevent it, and a
+restart clears any already-stuck slots.
 
 ## Why not LiteLLM (or nginx, or a Redis semaphore)?
 

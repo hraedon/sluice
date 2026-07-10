@@ -14,6 +14,7 @@ key of its own beyond the usage poller's.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import math
@@ -59,6 +60,25 @@ from sluice.singleton import SingletonGuard
 from sluice.trust import peer_is_trusted
 
 log = logging.getLogger("sluice.proxy")
+
+
+async def _cancel_task(task: "asyncio.Future[Any]") -> None:
+    """Cancel a racing task and await it, swallowing the fallout.
+
+    Used to tear down the read/disconnect tasks in the streaming loop
+    without leaking pending tasks or surfacing ``CancelledError``.  A task
+    that is already done has its result/exception retrieved so asyncio does
+    not log it as never-retrieved.
+    """
+    if task.done():
+        with contextlib.suppress(BaseException):
+            task.result()
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 # RFC 7230 hop-by-hop headers — never forwarded in either direction.
 _HOP_BY_HOP = frozenset(
@@ -856,35 +876,68 @@ class ProxyApp:
                 idle = self._upstream_idle_timeout
                 chunk_iter = response.aiter_raw()
                 upstream_idle = False
-                while True:
-                    if disconnect.is_set():
-                        break
-                    try:
-                        if idle is not None:
-                            chunk = await asyncio.wait_for(
-                                chunk_iter.__anext__(), timeout=idle
+                # Race each upstream read against the client-disconnect event.
+                #
+                # A bare ``disconnect.is_set()`` check only fires *between*
+                # chunks, so a client that vanishes mid-stream while the
+                # upstream has gone silent leaves this loop blocked forever in
+                # ``__anext__`` — the permit is never released and becomes a
+                # "local phantom" (``local_in_flight`` stuck above the
+                # provider's ``concurrent_sessions`` with nothing to reconcile
+                # it away).  An ungraceful client death (a rebooted host that
+                # never sends FIN/RST) is surfaced as ``http.disconnect`` only
+                # once TCP keepalive resets the socket (see cli._bind_listen_socket);
+                # racing the read against ``disconnect`` lets the loop act on
+                # that signal the instant it arrives instead of waiting for the
+                # next upstream chunk that may never come.
+                disc_wait = asyncio.ensure_future(disconnect.wait())
+                try:
+                    while True:
+                        if disconnect.is_set():
+                            break
+                        read_task = asyncio.ensure_future(chunk_iter.__anext__())
+                        done, _pending = await asyncio.wait(
+                            {read_task, disc_wait},
+                            timeout=idle,  # None → block until read or disconnect
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            # Idle timeout: no chunk *and* no disconnect within
+                            # `idle` seconds — the upstream went silent.
+                            await _cancel_task(read_task)
+                            log.warning(
+                                "upstream idle timeout (%.1fs) — aborting stream", idle,
                             )
-                        else:
-                            chunk = await chunk_iter.__anext__()
-                    except StopAsyncIteration:
-                        break
-                    except asyncio.TimeoutError:
-                        log.warning(
-                            "upstream idle timeout (%.1fs) — aborting stream", idle,
-                        )
-                        upstream_idle = True
-                        break
-                    try:
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                "more_body": True,
-                            }
-                        )
-                    except Exception:
-                        disconnect.set()
-                        break
+                            upstream_idle = True
+                            break
+                        if read_task not in done:
+                            # Client disconnected while awaiting the next chunk.
+                            # Cancel the pending read; the stream context is
+                            # closed in the finally below, terminating the
+                            # upstream request (phantom prevention).
+                            await _cancel_task(read_task)
+                            break
+                        try:
+                            chunk = read_task.result()
+                        except StopAsyncIteration:
+                            break
+                        if disconnect.is_set():
+                            # Disconnect landed alongside the final chunk —
+                            # don't bother sending to a client that is gone.
+                            break
+                        try:
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": chunk,
+                                    "more_body": True,
+                                }
+                            )
+                        except Exception:
+                            disconnect.set()
+                            break
+                finally:
+                    await _cancel_task(disc_wait)
 
                 # Close the response body.  When the upstream went idle (not a
                 # client disconnect) the client is still connected and needs a

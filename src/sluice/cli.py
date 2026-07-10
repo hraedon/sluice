@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,66 @@ from sluice.trust import parse_trusted_proxies
 log = logging.getLogger("sluice.cli")
 
 _ENV_PREFIX = "SLUICE_"
+
+# TCP keepalive probe cadence for client connections.  With the default
+# idle of 60s, a silently-dead peer (e.g. an ungracefully rebooted host that
+# never sent FIN/RST) is detected after roughly idle + intvl*cnt ≈ 120s, at
+# which point the kernel resets the connection, uvicorn delivers
+# ``http.disconnect``, and the proxy releases the orphaned permit.  Without
+# keepalive the OS default is ~2h — long enough to pin the concurrency slot
+# indefinitely for a single-operator proxy.
+_TCP_KEEPALIVE_INTVL = 15  # seconds between probes once idle threshold is crossed
+_TCP_KEEPALIVE_CNT = 4     # unacked probes before the connection is dropped
+
+
+def _apply_keepalive(sock: socket.socket, *, idle: int) -> None:
+    """Enable TCP keepalive on ``sock`` with an aggressive-ish cadence.
+
+    Best-effort and portable: ``SO_KEEPALIVE`` is standard, but the timing
+    knobs (``TCP_KEEPIDLE``/``TCP_KEEPINTVL``/``TCP_KEEPCNT``) are Linux
+    names.  Platforms that lack a given option are skipped rather than
+    failing the bind (macOS uses ``TCP_KEEPALIVE`` for the idle time;
+    Windows tunes keepalive via a different ioctl not reached here).
+    Options set on the listening socket are inherited by accepted
+    connections on Linux, which is the deployment target.
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (
+        ("TCP_KEEPIDLE", idle),
+        ("TCP_KEEPINTVL", _TCP_KEEPALIVE_INTVL),
+        ("TCP_KEEPCNT", _TCP_KEEPALIVE_CNT),
+    ):
+        opt = getattr(socket, name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as exc:  # pragma: no cover - platform-dependent
+            log.warning("keepalive: could not set %s=%s: %s", name, value, exc)
+    # macOS fallback: no TCP_KEEPIDLE, but TCP_KEEPALIVE carries the idle time.
+    if not hasattr(socket, "TCP_KEEPIDLE") and hasattr(socket, "TCP_KEEPALIVE"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle)
+        except OSError as exc:  # pragma: no cover - platform-dependent
+            log.warning("keepalive: could not set TCP_KEEPALIVE=%s: %s", idle, exc)
+
+
+def _bind_listen_socket(host: str, port: int, *, keepalive_idle: int) -> socket.socket:
+    """Create and bind a listening socket with TCP keepalive enabled.
+
+    Mirrors uvicorn's own ``Config.bind_socket`` (bind + ``SO_REUSEADDR`` +
+    ``set_inheritable``; asyncio calls ``listen()`` when it serves the
+    socket) and adds keepalive so the proxy notices dead clients.  The
+    returned socket is handed to ``uvicorn.Server.run(sockets=[...])``.
+    """
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    family, socktype, proto, _canon, sockaddr = infos[0]
+    sock = socket.socket(family, socktype, proto)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _apply_keepalive(sock, idle=keepalive_idle)
+    sock.bind(sockaddr)
+    sock.set_inheritable(True)
+    return sock
 
 
 class _JSONFormatter(logging.Formatter):
@@ -94,6 +155,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_request_body_bytes": None,
     "upstream_idle_timeout": None,
     "cors_allow_origin": None,
+    "tcp_keepalive": True,
+    "tcp_keepalive_idle": 60,
 }
 
 
@@ -112,10 +175,12 @@ def _resolve(key: str, args: argparse.Namespace) -> Any:
 
 
 def _coerce(env_val: str, key: str) -> Any:
-    if key in ("target", "history_size", "max_request_body_bytes"):
+    if key in ("target", "history_size", "max_request_body_bytes", "tcp_keepalive_idle"):
         return int(env_val)
     if key in ("poll_interval", "release_cooldown", "queue_timeout", "retry_interval", "history_ttl", "drain_timeout", "upstream_idle_timeout", "poll_interval_idle"):
         return float(env_val)
+    if key == "tcp_keepalive":
+        return env_val.strip().lower() in ("1", "true", "yes", "on")
     return env_val
 
 
@@ -175,6 +240,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--max-request-body-bytes", type=int, default=None, help="reject proxied requests whose body exceeds this many bytes (default: no limit — streaming). -1 disables the cap.")
     serve.add_argument("--upstream-idle-timeout", type=float, default=None, help="abort a streaming upstream response if no chunk arrives within this many seconds (default: no idle timeout — matches _UPSTREAM_TIMEOUT read=None). Resets on each chunk, so slow-but-steady streams are unaffected; only a silent upstream trips it.")
     serve.add_argument("--cors-allow-origin", default=None, help="emit Access-Control-Allow-Origin on admin routes with this value (e.g. '*' or 'https://grafana.example.com'). Default: none (same-origin only). (WI-028 finding 10)")
+    serve.add_argument("--tcp-keepalive", action=argparse.BooleanOptionalAction, default=None, help="enable TCP keepalive on client connections so a client that dies ungracefully (e.g. a rebooted host) is detected and its permit released, instead of orphaning the concurrency slot (default: on)")
+    serve.add_argument("--tcp-keepalive-idle", type=int, default=None, help="seconds a client connection may be idle before the first keepalive probe (default: 60; dead-peer detection ≈ idle + 60s)")
 
     # -- status --------------------------------------------------------------
     status = sub.add_parser("status", help="print current reading, computed permits, and band")
@@ -443,13 +510,34 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     import uvicorn
 
-    uvicorn.run(
+    # TCP keepalive on client connections: a client that dies ungracefully
+    # (a rebooted host that never sends FIN/RST) is otherwise invisible, so
+    # its in-flight streaming request pins the concurrency permit forever
+    # (orphaned "local phantom").  Binding the listening socket ourselves lets
+    # us set keepalive; uvicorn serves it via Server.run(sockets=...).
+    keepalive = _resolve("tcp_keepalive", args)
+    keepalive_idle = _resolve("tcp_keepalive_idle", args)
+    sock: socket.socket | None = None
+    if keepalive:
+        try:
+            sock = _bind_listen_socket(host, port, keepalive_idle=keepalive_idle)
+            log.info("  tcp_keepalive:     on (idle=%ds, intvl=%ds, cnt=%d)",
+                     keepalive_idle, _TCP_KEEPALIVE_INTVL, _TCP_KEEPALIVE_CNT)
+        except OSError as exc:
+            log.warning("keepalive socket bind failed (%s) — falling back to uvicorn's default bind", exc)
+            sock = None
+    else:
+        log.info("  tcp_keepalive:     off")
+
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
         log_level=log_level,
         timeout_graceful_shutdown=30,
     )
+    server = uvicorn.Server(config)
+    server.run(sockets=[sock] if sock is not None else None)
     return 0
 
 

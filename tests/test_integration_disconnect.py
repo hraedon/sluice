@@ -202,6 +202,84 @@ async def test_disconnect_cancels_upstream_with_real_connections():
         )
 
 
+async def test_disconnect_while_upstream_idle_releases_permit():
+    """Client disconnect during an *idle* upstream stream releases the permit.
+
+    Regression for the orphaned-permit bug: the streaming loop used to only
+    check ``disconnect.is_set()`` *between* chunks, so a client that vanished
+    while the upstream had gone silent left the loop blocked in ``__anext__``
+    forever — the permit was never released (``local_in_flight`` stuck above
+    the provider's ``concurrent_sessions``).  The loop now races each read
+    against the disconnect event, so the permit is freed promptly.
+
+    The upstream here sends one chunk and then goes silent (a long sleep,
+    never sending another chunk).  The client reads that chunk and
+    disconnects.  The permit must be released well before the upstream's
+    idle sleep ends.
+    """
+    upstream_port = _free_port()
+    proxy_port = _free_port()
+
+    async def upstream_app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                event = await receive()
+                if event["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif event["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        await send({"type": "http.response.start", "status": 200,
+                     "headers": [(b"content-type", b"text/event-stream")]})
+        await send({"type": "http.response.body",
+                     "body": b"data: chunk0\n\n", "more_body": True})
+        # Go silent: hold the stream open without sending anything else.
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+    upstream_config = uvicorn.Config(upstream_app, host="127.0.0.1",
+                                      port=upstream_port, log_level="error")
+    upstream_server = uvicorn.Server(upstream_config)
+    upstream_task = asyncio.create_task(upstream_server.serve())
+    await asyncio.sleep(0.2)
+
+    try:
+        server, server_task, gate = await _start_proxy(
+            f"http://127.0.0.1:{upstream_port}", proxy_port
+        )
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                f"http://127.0.0.1:{proxy_port}/v1/messages",
+                json={"prompt": "hi"},
+                timeout=30.0,
+            ) as response:
+                assert response.status_code == 200
+                async for chunk in response.aiter_bytes():
+                    assert b"chunk0" in chunk
+                    break  # got the chunk; now disconnect while upstream is idle
+            # Context exit sends FIN → proxy sees http.disconnect.
+
+        # The permit must be released promptly — long before the upstream's
+        # 30s idle sleep would have ended.  Without the disconnect race this
+        # times out (held stays 1).
+        released = await _wait_for(lambda: gate.held == 0, timeout=8.0)
+        assert released, (
+            f"permit not released after disconnect during idle upstream "
+            f"(held={gate.held})"
+        )
+
+    finally:
+        await _shutdown_servers(
+            (upstream_server, upstream_task),
+            (server, server_task),
+        )
+
+
 async def test_normal_request_completes_with_real_connections():
     """A normal request through the real proxy completes and releases the permit."""
     upstream_port = _free_port()
