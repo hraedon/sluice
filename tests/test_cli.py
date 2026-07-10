@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 from sluice.cli import _resolve, _DEFAULTS
@@ -392,3 +393,24 @@ def test_bind_listen_socket_enables_keepalive():
         assert sock.getsockname()[1] != 0
     finally:
         sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Version consistency: __version__ must match pyproject.toml when installed
+# ---------------------------------------------------------------------------
+
+
+def test_version_matches_pyproject():
+    """__version__ resolved from package metadata matches pyproject.toml.
+
+    Guards against the drift that motivated PR #19 (the hardcoded string
+    in __init__.py lagged behind pyproject.toml by a full minor version).
+    """
+    import tomllib
+
+    from sluice import __version__
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with open(pyproject, "rb") as f:
+        data = tomllib.load(f)
+    assert __version__ == data["project"]["version"]
