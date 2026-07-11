@@ -60,7 +60,7 @@ _SESSION_COOKIE = SESSION_COOKIE
 _SESSION_TTL = 2_592_000  # 30 days
 
 
-def _cors_extra_headers(
+def cors_extra_headers(
     cors_allow_origin: str | None,
     existing: list[tuple[bytes, bytes]] | None,
 ) -> list[tuple[bytes, bytes]]:
@@ -87,6 +87,9 @@ def _cors_extra_headers(
         headers.append((b"vary", b"Origin"))
         headers.append((b"access-control-allow-credentials", b"true"))
     return headers
+
+
+_cors_extra_headers = cors_extra_headers
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +209,7 @@ def _should_set_secure(
     return False
 
 
-def _build_set_cookie(
+def build_set_cookie(
     value: str,
     max_age: int,
     scope: Scope,
@@ -223,6 +226,9 @@ def _build_set_cookie(
     if _should_set_secure(scope, trusted_proxies):
         parts.append("Secure")
     return "; ".join(parts).encode("latin-1")
+
+
+_build_set_cookie = build_set_cookie
 
 
 def check_admin_auth(scope: Scope, admin_token: str | None, *, now: float | None = None) -> bool:
@@ -279,7 +285,7 @@ async def send_status_json(
     payload["build"] = build_sha
     await send_json(
         send, 200, payload,
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -293,7 +299,7 @@ async def send_prometheus(
     await send_text(
         send, 200, text,
         content_type="text/plain; version=0.0.4; charset=utf-8",
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -319,7 +325,7 @@ async def send_history_json(
     body = {"entries": entries, "count": len(entries), "enabled": history is not None}
     await send_json(
         send, 200, body,
-        extra_headers=_cors_extra_headers(cors_allow_origin, [(b"cache-control", b"no-store")]),
+        extra_headers=cors_extra_headers(cors_allow_origin, [(b"cache-control", b"no-store")]),
     )
 
 
@@ -329,7 +335,7 @@ async def send_dashboard(
     await send_text(
         send, 200, _DASHBOARD_HTML,
         content_type="text/html; charset=utf-8",
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -339,7 +345,7 @@ async def send_login_page(
     await send_text(
         send, 200, _LOGIN_HTML,
         content_type="text/html; charset=utf-8",
-        extra_headers=_cors_extra_headers(cors_allow_origin, None),
+        extra_headers=cors_extra_headers(cors_allow_origin, None),
     )
 
 
@@ -380,7 +386,7 @@ async def handle_login_post(
         return
 
     try:
-        body = await _read_body(receive)
+        body = await read_body(receive)
     except ValueError:
         await send_text(send, 413, "request body too large")
         return
@@ -407,7 +413,7 @@ async def handle_login_post(
 
     throttle.record_success(now)
     cookie_value = mint_session(admin_token, now, _SESSION_TTL)
-    set_cookie = _build_set_cookie(cookie_value, _SESSION_TTL, scope, trusted_proxies)
+    set_cookie = build_set_cookie(cookie_value, _SESSION_TTL, scope, trusted_proxies)
     if not _should_set_secure(scope, trusted_proxies):
         log.warning(
             "session cookie set without Secure — plain-HTTP origin (remote=%s)",
@@ -434,7 +440,7 @@ async def handle_logout(
     if not check_csrf(scope, admin_token):
         await send_text(send, 403, "cross-site request blocked")
         return
-    set_cookie = _build_set_cookie("", 0, scope, trusted_proxies)
+    set_cookie = build_set_cookie("", 0, scope, trusted_proxies)
     await send_text(
         send,
         303,
@@ -493,7 +499,7 @@ async def serve_static(path: str, send: Send) -> None:
 _MAX_CONFIG_BODY = 8192
 
 
-async def _read_body(receive: Receive) -> bytes:
+async def read_body(receive: Receive) -> bytes:
     """Read the request body from ASGI receive(), capped at _MAX_CONFIG_BODY."""
     body: bytes = b""
     while True:
@@ -506,6 +512,9 @@ async def _read_body(receive: Receive) -> bytes:
                 return body
         elif event["type"] == "http.disconnect":
             raise ConnectionError("client disconnected during body upload")
+
+
+_read_body = read_body
 
 
 def _extract_audit_user(scope: Scope) -> str:
@@ -547,7 +556,7 @@ async def handle_config_post(
     Requires a valid admin token; disabled (405) when no token is configured.
     Leader-only (Plan 011 §5): non-leaders return 503.
     """
-    cors = _cors_extra_headers(cors_allow_origin, None)
+    cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
         await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
         return
@@ -577,7 +586,7 @@ async def handle_config_post(
         return
 
     try:
-        body = await _read_body(receive)
+        body = await read_body(receive)
     except ValueError:
         await send_json(send, 413, {"error": "request body too large"}, extra_headers=cors)
         return
@@ -641,7 +650,7 @@ async def handle_config_delete(
     cors_allow_origin: str | None = None,
 ) -> None:
     """DELETE /admin/config/target — revert a runtime override."""
-    cors = _cors_extra_headers(cors_allow_origin, None)
+    cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
         await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
         return
@@ -679,7 +688,7 @@ async def handle_reload(
     Requires admin auth.  Returns a summary of what changed.
     Returns 400 if no config file was specified at startup.
     """
-    cors = _cors_extra_headers(cors_allow_origin, None)
+    cors = cors_extra_headers(cors_allow_origin, None)
     if not admin_token:
         await send_json(send, 405, {"error": "mutations disabled — set SLUICE_ADMIN_TOKEN to enable"}, extra_headers=cors)
         return

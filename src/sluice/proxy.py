@@ -30,7 +30,7 @@ from sluice.admin import (
     Receive,
     Send,
     Scope,
-    _cors_extra_headers,
+    cors_extra_headers,
     check_admin_auth,
     handle_config_delete,
     handle_config_post,
@@ -298,7 +298,7 @@ class ProxyApp:
         ):
             await send_text(
                 send, 204, "",
-                extra_headers=_cors_extra_headers(self._cors_allow_origin, None),
+                extra_headers=cors_extra_headers(self._cors_allow_origin, None),
             )
             return
 
@@ -358,7 +358,7 @@ class ProxyApp:
             if not authed and path != "/":
                 await send_json(
                     send, 401, {"error": "unauthorized"},
-                    extra_headers=_cors_extra_headers(self._cors_allow_origin, None),
+                    extra_headers=cors_extra_headers(self._cors_allow_origin, None),
                 )
                 return
             if path == "/":
