@@ -98,6 +98,23 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
         reason_raw = priority.get("reason")
         priority_reason = reason_raw if isinstance(reason_raw, str) else None
 
+        # Service mode (umans usage.service_mode) — distinct from priority/boxed.
+        # {current: str, resets_at: ISO}. Absent → not-low-interactivity (fail
+        # safe; the overload breaker + priority/boxed remain the backstops).
+        service_mode_block = usage.get("service_mode")
+        if not isinstance(service_mode_block, dict):
+            service_mode_block = {}
+        sm_current_raw = service_mode_block.get("current")
+        service_mode = sm_current_raw if isinstance(sm_current_raw, str) else None
+        service_mode_resets_at_epoch = _parse_iso_to_epoch(
+            service_mode_block.get("resets_at")
+        )
+
+        # Token counters (usage.tokens_in/out) — informational, for the
+        # low-interactivity threshold estimator (switchboard Plan 010 Feature C).
+        tokens_in = _safe_int_or_none(usage.get("tokens_in"))
+        tokens_out = _safe_int_or_none(usage.get("tokens_out"))
+
         # Request-window fields (umans Code Pro: limits.requests + usage.requests_in_window).
         # These are optional — Code Max reports "unlimited" with no requests block.
         requests_block = limits.get("requests")
@@ -117,6 +134,10 @@ def parse_usage(data: dict[str, object]) -> UsageReading:
             boxed_until_epoch=boxed_until_epoch,
             resets_at_epoch=resets_at_epoch,
             priority_reason=priority_reason,
+            service_mode=service_mode,
+            service_mode_resets_at_epoch=service_mode_resets_at_epoch,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
             requests_limit=requests_limit,
             requests_remaining=remaining_requests,
             requests_in_window=requests_in_window,

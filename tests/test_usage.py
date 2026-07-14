@@ -350,3 +350,51 @@ async def test_client_x_api_key_auth():
         assert "Authorization" not in received_headers
     finally:
         await client.close()
+
+
+# --- service_mode / low-interactivity (Plan 010 Feature 0) -----------------
+# Field shape confirmed live 2026-07-14 (samples/service-mode-capture-2026-07-14.md).
+
+
+def test_parse_service_mode_low_interactivity():
+    payload = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 1,
+            "tokens_in": 39321689,
+            "tokens_out": 221557,
+            "priority": {"low": False, "boxed_until": None, "reason": None},
+            "service_mode": {
+                "current": "low_interactivity",
+                "resets_at": "2026-07-14T23:02:32.660799+00:00",
+            },
+        },
+    }
+    r = parse_usage(payload)
+    assert r.service_mode == "low_interactivity"
+    assert r.service_mode_resets_at_epoch is not None
+    assert r.service_mode_resets_at_epoch > 0
+    assert r.tokens_in == 39321689
+    assert r.tokens_out == 221557
+
+
+def test_parse_service_mode_absent_is_none():
+    r = parse_usage(SAMPLE_PAYLOAD)
+    assert r.service_mode is None
+    assert r.service_mode_resets_at_epoch is None
+    assert r.tokens_in is None
+    assert r.tokens_out is None
+
+
+def test_parse_service_mode_non_dict_is_ignored():
+    payload = {
+        "limits": {"concurrency": {"limit": 4, "hard_cap": 8}},
+        "usage": {
+            "concurrent_sessions": 1,
+            "priority": {"low": False},
+            "service_mode": "low_interactivity",  # malformed: not a dict
+        },
+    }
+    r = parse_usage(payload)
+    assert r.service_mode is None
+    assert r.service_mode_resets_at_epoch is None

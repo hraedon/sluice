@@ -43,6 +43,7 @@ from sluice.control import (
     breaker_on_tick,
     effective_permits,
     is_hard_boxed,
+    is_low_interactivity,
     phantom_estimate,
     saturation_retry_after,
     validate_target_override,
@@ -857,6 +858,22 @@ class ReconciliationLoop:
         the provider reports no request window or the reading is stale.
         """
         return self._last_request_window_delta
+
+    def is_low_interactivity(self) -> bool:
+        """True while the account is in umans' low-interactivity service mode.
+
+        Surfaced for observability and for switchboard's routing decision (Plan
+        010 Feature 0).  Deliberately does NOT feed :meth:`gate_closed_reason`:
+        low-interactivity still serves (degraded), so a *direct* sluice user
+        keeps getting service rather than a blanket 503 for the whole penalty
+        window.  switchboard — which has an alternate provider — is where this
+        becomes a route-away decision.
+        """
+        if self._last_reading_cached is None:
+            return False
+        return is_low_interactivity(
+            self._last_reading_cached.reading, now=self._wall()
+        )
 
     def gate_closed_reason(self) -> str:
         """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.

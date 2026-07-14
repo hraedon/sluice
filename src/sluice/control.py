@@ -64,6 +64,18 @@ class LimitState:
     resets_at_epoch: float | None = None  # when the box lifts (epoch seconds), or None
     priority_reason: str | None = None  # umans priority.reason ("rate_limited" = deprioritized rung)
 
+    # Service mode (umans usage.service_mode) — DISTINCT from priority/boxed.
+    # "low_interactivity" is a fixed-duration penalty (interactive requests get
+    # 503-overloaded) with its own reset clock. See
+    # samples/service-mode-capture-2026-07-14.md.
+    service_mode: str | None = None  # usage.service_mode.current, or None if absent
+    service_mode_resets_at_epoch: float | None = None  # interactive-again deadline (epoch)
+
+    # Token counters (umans usage.tokens_in/out) — informational; consumed by
+    # switchboard's low-interactivity threshold estimator (Plan 010 Feature C).
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+
     # Token-bucket fields (Anthropic/OpenAI: in-band response headers;
     # umans: polled from /v1/usage limits.requests + usage.requests_in_window)
     requests_limit: int | None = None
@@ -149,6 +161,28 @@ def is_hard_boxed(reading: UsageReading, *, now: float) -> bool:
     the reason field was parsed.
     """
     return in_penalty_window(reading, now=now) and reading.priority_reason != "rate_limited"
+
+
+LOW_INTERACTIVITY = "low_interactivity"
+
+
+def is_low_interactivity(reading: UsageReading, *, now: float) -> bool:
+    """True while the account is in umans' low-interactivity service mode.
+
+    Keyed off ``usage.service_mode`` (confirmed live 2026-07-14,
+    samples/service-mode-capture-2026-07-14.md): a fixed-duration penalty,
+    distinct from the priority/boxed ladder, during which interactive requests
+    are 503-overloaded.  Unexpired-only — a stale past ``resets_at`` must never
+    latch us as low-interactivity forever (same lesson as ``boxed_until``,
+    fetch_umans.py).  Any other or absent ``service_mode`` is fail-safe treated
+    as not-low-interactivity; the overload breaker and priority/boxed states are
+    the backstops.
+    """
+    return (
+        reading.service_mode == LOW_INTERACTIVITY
+        and reading.service_mode_resets_at_epoch is not None
+        and now < reading.service_mode_resets_at_epoch
+    )
 
 
 def classify_band(reading: UsageReading, *, now: float) -> Band:

@@ -17,6 +17,7 @@ from sluice.control import (
     AdaptiveSnapshot,
     classify_band,
     effective_permits,
+    is_low_interactivity,
     phantom_estimate,
     phantom_estimate_instant,
     breaker_on_429,
@@ -860,3 +861,39 @@ def test_saturation_retry_after_custom_floor_and_cap():
         queue_depth=100, capacity=1, avg_hold_seconds=100.0, floor=3, cap=30
     )
     assert result == 30
+
+
+# --- is_low_interactivity (Plan 010 Feature 0) -----------------------------
+
+_LI_NOW = 1_000_000.0
+
+
+def _reading(**kw: object) -> LimitState:
+    return LimitState(concurrent_sessions=1, **kw)  # type: ignore[arg-type]
+
+
+def test_low_interactivity_active_unexpired():
+    r = _reading(service_mode="low_interactivity", service_mode_resets_at_epoch=_LI_NOW + 300)
+    assert is_low_interactivity(r, now=_LI_NOW) is True
+
+
+def test_low_interactivity_expired_does_not_latch():
+    # A stale past resets_at must never latch us as low-interactivity forever
+    # (same lesson as boxed_until).
+    r = _reading(service_mode="low_interactivity", service_mode_resets_at_epoch=_LI_NOW - 1)
+    assert is_low_interactivity(r, now=_LI_NOW) is False
+
+
+def test_low_interactivity_absent_service_mode_is_false():
+    assert is_low_interactivity(_reading(), now=_LI_NOW) is False
+
+
+def test_low_interactivity_other_mode_is_false():
+    r = _reading(service_mode="interactive", service_mode_resets_at_epoch=_LI_NOW + 300)
+    assert is_low_interactivity(r, now=_LI_NOW) is False
+
+
+def test_low_interactivity_no_resets_at_is_false():
+    # Fail safe: mode set but no deadline → cannot confirm it is active.
+    r = _reading(service_mode="low_interactivity", service_mode_resets_at_epoch=None)
+    assert is_low_interactivity(r, now=_LI_NOW) is False

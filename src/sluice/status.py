@@ -26,6 +26,11 @@ class StatusSnapshot:
     priority_reason: str | None
     boxed_until: float | None
     resets_at: float | None
+    service_mode: str | None
+    service_mode_resets_at: float | None
+    low_interactivity: bool
+    tokens_in: int | None
+    tokens_out: int | None
     usage_age: float
     stale: bool
 
@@ -80,6 +85,11 @@ class StatusSnapshot:
             "priority_reason": self.priority_reason,
             "boxed_until": self.boxed_until,
             "resets_at": self.resets_at,
+            "service_mode": self.service_mode,
+            "service_mode_resets_at": self.service_mode_resets_at,
+            "low_interactivity": self.low_interactivity,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
             "usage_age": round(self.usage_age, 1),
             "stale": self.stale,
             "effective_permits": self.effective_permits,
@@ -146,6 +156,13 @@ def snapshot(
         priority_reason=reading.priority_reason if reading else None,
         boxed_until=reading.boxed_until_epoch if reading else None,
         resets_at=reading.resets_at_epoch if reading else None,
+        service_mode=reading.service_mode if reading else None,
+        service_mode_resets_at=(
+            reading.service_mode_resets_at_epoch if reading else None
+        ),
+        low_interactivity=reconcile.is_low_interactivity(),
+        tokens_in=reading.tokens_in if reading else None,
+        tokens_out=reading.tokens_out if reading else None,
         usage_age=reconcile.last_age_seconds,
         stale=not (reconcile.last_fetch_ok),
         effective_permits=reconcile.effective_permits_count,
