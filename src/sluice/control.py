@@ -27,6 +27,7 @@ class Band(str, Enum):
     LOW = "low"  # limit < observed <= hard_cap (priority.low territory)
     REJECT = "reject"  # observed > hard_cap (429s)
     BOXED = "boxed"  # account paused (boxed_until set and not yet elapsed)
+    LOW_INTERACTIVITY = "low_interactivity"  # service_mode penalty (distinct from concurrency)
 
 
 class BreakerState(str, Enum):
@@ -194,6 +195,8 @@ def classify_band(reading: UsageReading, *, now: float) -> Band:
         return Band.REJECT
     if obs > reading.limit or reading.priority_low or is_deprioritized(reading, now=now):
         return Band.LOW
+    if is_low_interactivity(reading, now=now):
+        return Band.LOW_INTERACTIVITY
     return Band.NORMAL
 
 

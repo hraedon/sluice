@@ -76,6 +76,49 @@ def test_classify_band_boundary_at_hard_cap():
     assert classify_band(reading(concurrent_sessions=3), now=NOW) is Band.NORMAL
 
 
+def test_classify_band_low_interactivity():
+    r = reading(
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=NOW + 300,
+    )
+    assert classify_band(r, now=NOW) is Band.LOW_INTERACTIVITY
+
+
+def test_classify_band_low_interactivity_expired_is_normal():
+    r = reading(
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=NOW - 1,
+    )
+    assert classify_band(r, now=NOW) is Band.NORMAL
+
+
+def test_classify_band_concurrency_takes_precedence_over_low_interactivity():
+    r = reading(
+        concurrent_sessions=5,
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=NOW + 300,
+    )
+    assert classify_band(r, now=NOW) is Band.LOW
+
+
+def test_classify_band_boxed_takes_precedence_over_low_interactivity():
+    r = reading(
+        boxed_until_epoch=NOW + 100,
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=NOW + 300,
+    )
+    assert classify_band(r, now=NOW) is Band.BOXED
+
+
+def test_effective_permits_unchanged_by_low_interactivity():
+    r = reading(
+        service_mode="low_interactivity",
+        service_mode_resets_at_epoch=NOW + 300,
+    )
+    s = state(r, in_flight=0)
+    assert effective_permits(s, CFG, now=NOW) == CFG.target
+
+
 # --- phantom estimate (instant) -------------------------------------------
 
 

@@ -28,7 +28,7 @@ Compact field names in ``to_dict()`` (used by /history.json):
     ep   effective_permits
     lim  limit (provider concurrency limit)
     hc   hard_cap (provider reject threshold)
-    band band (normal/low/reject/boxed)
+    band band (normal/low/reject/boxed/low_interactivity)
     brk  breaker state (closed/open/half_open)
     pl   priority_low
     age  usage_age (seconds since reading)
@@ -36,6 +36,8 @@ Compact field names in ``to_dict()`` (used by /history.json):
     r429 recent_429s
     t429 total_429s
     rl429 rate_limit_429s
+    t503 total_503s
+    li   low_interactivity (service_mode penalty active)
     qd   queue_depth
     qt   queue_timeouts
     err  tick_failed (true if this entry was recorded during a tick exception)
@@ -80,6 +82,8 @@ class HistoryEntry:
     queue_depth: int
     queue_timeouts: int
     rate_limit_429s: int = 0  # 429s classified as rate-limit (NOT fed to breaker; safety net tightens gate when stale)
+    total_503s: int = 0  # upstream 503s (overload during low-interactivity, not fed to breaker)
+    low_interactivity: bool = False  # service_mode penalty active at this tick
     # Request-window budget (None when provider reports no request limit)
     requests_in_window: int | None = None
     requests_limit: int | None = None
@@ -106,6 +110,8 @@ class HistoryEntry:
             "r429": self.recent_429s,
             "t429": self.total_429s,
             "rl429": self.rate_limit_429s,
+            "t503": self.total_503s,
+            "li": self.low_interactivity,
             "qd": self.queue_depth,
             "qt": self.queue_timeouts,
             "err": self.tick_failed,

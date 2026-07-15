@@ -60,6 +60,7 @@ log = logging.getLogger("sluice.reconcile")
 _RETRY_AFTER_STALE_CAP = 300
 _RETRY_AFTER_SATURATION_FLOOR = 5
 _RETRY_AFTER_SATURATION_CAP = 60
+_RETRY_AFTER_LOW_INTERACTIVITY_FLOOR = 5
 RETRY_AFTER_SHORT = 5  # unknowable-timing default (draining, not_leader)
 _PRUNE_INTERVAL_TICKS = 60
 _DEFAULT_HISTORY_TTL = 604800.0
@@ -117,9 +118,11 @@ class ReconciliationLoop:
         self._breaker = BreakerSnapshot()
         self._recent_429s: deque[float] = deque()
         self._recent_rate_limit_429s: deque[float] = deque()
+        self._recent_503s: deque[float] = deque()
         self._total_429s = 0
         self._total_gateway_429s = 0
         self._total_rate_limit_429s = 0
+        self._total_503s = 0
 
         self._phantom_samples: deque[tuple[int, int]] = deque(
             maxlen=controller_config.phantom_window
@@ -270,6 +273,24 @@ class ReconciliationLoop:
         self._recent_rate_limit_429s.append(now)
         self._wake_poll()
 
+    def record_503(self) -> None:
+        """An upstream 503 was received (e.g. during low-interactivity mode).
+
+        Does NOT feed the breaker — a 503 during low-interactivity is an
+        overload symptom, not a concurrency rejection.  The provider is
+        still serving at lower priority; closing the gate would turn a soft
+        penalty into a full outage (per umans' documentation: functionality
+        is the same, just at lower priority).
+
+        Tracked in a separate counter and windowed deque for observability
+        and for the idle-detection check (503s mean the system is not
+        quiescent).  Wakes the poll so fresh ``/v1/usage`` state is fetched.
+        """
+        now = self._mono()
+        self._total_503s += 1
+        self._recent_503s.append(now)
+        self._wake_poll()
+
     def record_success(self) -> None:
         """An upstream request completed normally."""
         prev = self._breaker.state
@@ -318,6 +339,8 @@ class ReconciliationLoop:
             self._recent_429s.popleft()
         while self._recent_rate_limit_429s and self._recent_rate_limit_429s[0] < cutoff:
             self._recent_rate_limit_429s.popleft()
+        while self._recent_503s and self._recent_503s[0] < cutoff:
+            self._recent_503s.popleft()
 
     def _wake_poll(self) -> None:
         """Signal the reconcile loop to wake from an idle sleep (WI-022).
@@ -469,9 +492,11 @@ class ReconciliationLoop:
             and self._gate.held == 0
             and len(self._recent_429s) == 0
             and len(self._recent_rate_limit_429s) == 0
+            and len(self._recent_503s) == 0
             and self._last_band is Band.NORMAL
             and self._last_phantom_estimate == 0
             and self._breaker.state is BreakerState.CLOSED
+            and not is_low_interactivity(reading, now=now_wall)
         )
 
         # Record this tick's state for trend analysis.  The entry is frozen at
@@ -495,6 +520,8 @@ class ReconciliationLoop:
                 recent_429s=len(self._recent_429s),
                 total_429s=self._total_429s,
                 rate_limit_429s=self._total_rate_limit_429s,
+                total_503s=self._total_503s,
+                low_interactivity=is_low_interactivity(reading, now=now_wall),
                 queue_depth=self._gate.queue_depth,
                 queue_timeouts=self._gate.queue_timeouts,
                 requests_in_window=reading.requests_in_window if cached.ok else None,
@@ -583,6 +610,11 @@ class ReconciliationLoop:
             recent_429s=len(self._recent_429s),
             total_429s=self._total_429s,
             rate_limit_429s=self._total_rate_limit_429s,
+            total_503s=self._total_503s,
+            low_interactivity=(
+                is_low_interactivity(reading, now=self._wall())
+                if reading else False
+            ),
             queue_depth=self._gate.queue_depth,
             queue_timeouts=self._gate.queue_timeouts,
             requests_in_window=reading.requests_in_window if reading else None,
@@ -657,6 +689,14 @@ class ReconciliationLoop:
     @property
     def rate_limit_429s(self) -> int:
         return self._total_rate_limit_429s
+
+    @property
+    def total_503s(self) -> int:
+        return self._total_503s
+
+    @property
+    def recent_503_count(self) -> int:
+        return len(self._recent_503s)
 
     @property
     def recent_429_count(self) -> int:
@@ -874,6 +914,24 @@ class ReconciliationLoop:
         return is_low_interactivity(
             self._last_reading_cached.reading, now=self._wall()
         )
+
+    def low_interactivity_retry_after(self) -> int | None:
+        """Honest Retry-After for a 503 during low-interactivity mode.
+
+        Returns ``ceil(resets_at - now)`` clamped to ``[5, 60]`` for SDK
+        compatibility (see concurrency-model.md §10 — both Anthropic and OpenAI
+        Python SDKs discard values above 60 s).  Returns ``None`` when not in
+        low-interactivity mode or when ``resets_at`` is unavailable.
+        """
+        if self._last_reading_cached is None:
+            return None
+        reading = self._last_reading_cached.reading
+        if not is_low_interactivity(reading, now=self._wall()):
+            return None
+        if reading.service_mode_resets_at_epoch is None:
+            return _RETRY_AFTER_LOW_INTERACTIVITY_FLOOR
+        remaining = math.ceil(reading.service_mode_resets_at_epoch - self._wall())
+        return max(_RETRY_AFTER_LOW_INTERACTIVITY_FLOOR, min(_RETRY_AFTER_SATURATION_CAP, remaining))
 
     def gate_closed_reason(self) -> str:
         """Why the gate is shut: 'open', 'boxed', 'breaker', or 'saturated'.

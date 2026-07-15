@@ -71,6 +71,7 @@ def test_all_counter_types():
     m.record_rate_limit_429("client")
     m.record_gateway_429("client")
     m.record_queue_timeout("client")
+    m.record_503("client")
     d = m.to_dict()
     c = d["client"]
     assert c["forwarded"] == 1
@@ -79,6 +80,15 @@ def test_all_counter_types():
     assert c["rate_limit_429"] == 1
     assert c["gateway_429"] == 1
     assert c["queue_timeouts"] == 1
+    assert c["overloaded_503"] == 1
+
+
+def test_to_prometheus_renders_503():
+    m = ClientMetrics()
+    m.record_503("opencode")
+    text = m.to_prometheus()
+    assert "sluice_client_overloaded_503" in text
+    assert 'label="opencode"' in text
 
 
 def test_to_prometheus_renders_metrics():

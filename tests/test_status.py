@@ -68,6 +68,7 @@ async def test_snapshot_fields():
     assert d["avg_hold_seconds"] == 0.0
     assert d["retry_after_hint"] == 5  # floor (no hold samples)
     assert d["queue_timeouts"] == 0
+    assert d["total_503s"] == 0
     assert "config" in d
     assert d["config"]["target"] == 3
     assert d["config"]["breaker_threshold"] == 5
@@ -226,6 +227,7 @@ async def test_prometheus_format():
     assert "sluice_in_flight 0" in text
     assert 'sluice_band{state="normal"} 1' in text
     assert 'sluice_band{state="boxed"} 0' in text
+    assert 'sluice_band{state="low_interactivity"} 0' in text
     assert 'sluice_breaker{state="closed"} 1' in text
 
     assert "# HELP sluice_usage_stale" in text
@@ -235,6 +237,9 @@ async def test_prometheus_format():
     assert "# HELP sluice_usage_age_seconds" in text
     assert "# TYPE sluice_usage_age_seconds gauge" in text
     assert "sluice_usage_age_seconds " in text
+
+    assert "# HELP sluice_total_503s" in text
+    assert "sluice_total_503s 0" in text
 
 
 async def test_prometheus_stale_usage():

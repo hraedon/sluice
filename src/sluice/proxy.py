@@ -847,6 +847,21 @@ class ProxyApp:
                         self._reconcile.record_429()
                         self._client_metrics.record_concurrency_429(client_label)
 
+                # Track upstream 503s (e.g. during low-interactivity mode).
+                # Does NOT feed the breaker — a 503 is an overload symptom,
+                # not a concurrency rejection.  The provider keeps serving at
+                # lower priority; the gate stays open.  Recorded for
+                # observability and to prevent idle-detection from
+                # slow-polling through a penalty window.
+                if response.status_code == 503:
+                    log.info(
+                        "upstream 503: server=%s low_interactivity=%s",
+                        response.headers.get("server"),
+                        self._reconcile.is_low_interactivity(),
+                    )
+                    self._reconcile.record_503()
+                    self._client_metrics.record_503(client_label)
+
                 # WI-004: Feed response headers to the truth source.
                 # For polled truth (umans) this is a no-op; for header truth
                 # (Anthropic/OpenAI) it parses the allowlisted ratelimit headers.
@@ -860,12 +875,28 @@ class ProxyApp:
                 if disconnect.is_set():
                     return
 
+                # Encode response headers (strips hop-by-hop).  For upstream
+                # 503s during low-interactivity mode, add a Retry-After header
+                # if the upstream didn't provide one — the low-interactivity
+                # deadline is a honest signal that helps clients back off
+                # instead of retrying immediately into more 503s.  This only
+                # adds a header; the response body is never modified (inert
+                # in-path, AGENTS.md rule 3).
+                resp_headers = self._encode_response_headers(response)
+                if (
+                    response.status_code == 503
+                    and not any(k.lower() == b"retry-after" for k, _ in resp_headers)
+                ):
+                    li_ra = self._reconcile.low_interactivity_retry_after()
+                    if li_ra is not None:
+                        resp_headers.append((b"retry-after", str(li_ra).encode("latin-1")))
+
                 try:
                     await send(
                         {
                             "type": "http.response.start",
                             "status": response.status_code,
-                            "headers": self._encode_response_headers(response),
+                            "headers": resp_headers,
                         }
                     )
                     response_started = True

@@ -799,6 +799,116 @@ async def test_mixed_concurrency_and_rate_limit_429s_only_concurrency_feeds_brea
     assert reconcile.breaker_state.value == "closed", "2 concurrency 429s < threshold 5, no trip"
 
 
+async def test_503_reported_to_reconcile():
+    """An upstream 503 is tracked but does NOT feed the breaker."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(503, json_data={"error": "overloaded"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert reconcile.total_503s == 1
+    assert reconcile.recent_429_count == 0, "503 must not feed the breaker"
+    assert reconcile.breaker_state.value == "closed"
+
+
+async def test_503_in_status_json():
+    """503 count is visible in /status.json."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(503, json_data={"error": "overloaded"})
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        await client.post("/v1/messages", json={"prompt": "hi"})
+        response = await client.get("/status.json")
+
+    data = response.json()
+    assert data["total_503s"] == 1
+
+
+async def test_503_retry_after_added_during_low_interactivity():
+    """Upstream 503 during low-interactivity gets a Retry-After header added."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(503, json_data={"error": "overloaded"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    import time
+    now = time.time()
+    reconcile._first_poll_ok = True
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(
+            concurrent_sessions=0,
+            limit=4,
+            hard_cap=8,
+            service_mode="low_interactivity",
+            service_mode_resets_at_epoch=now + 120,
+        ),
+        fetched_at_monotonic=time.monotonic(),
+        ok=True,
+    )
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert "retry-after" in response.headers
+    ra = int(response.headers["retry-after"])
+    assert 5 <= ra <= 60
+
+
+async def test_503_no_retry_after_when_not_low_interactivity():
+    """Upstream 503 without low-interactivity does NOT get a Retry-After added."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(503, json_data={"error": "overloaded"})
+
+    app, _, _ = _make_app(upstream_handler=handler)
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert "retry-after" not in response.headers
+
+
+async def test_503_upstream_retry_after_not_overridden():
+    """If upstream provides its own Retry-After, sluice does not override it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _resp(503, json_data={"error": "overloaded"}, headers={"retry-after": "42"})
+
+    app, _, reconcile = _make_app(upstream_handler=handler)
+
+    import time
+    now = time.time()
+    reconcile._first_poll_ok = True
+    reconcile._last_reading_cached = CachedReading(
+        reading=UsageReading(
+            concurrent_sessions=0,
+            limit=4,
+            hard_cap=8,
+            service_mode="low_interactivity",
+            service_mode_resets_at_epoch=now + 120,
+        ),
+        fetched_at_monotonic=time.monotonic(),
+        ok=True,
+    )
+
+    async with _asgi_client(app) as client:
+        response = await client.post("/v1/messages", json={"prompt": "hi"})
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "42"
+
+
 # ---------------------------------------------------------------------------
 # Healthz / metrics
 # ---------------------------------------------------------------------------

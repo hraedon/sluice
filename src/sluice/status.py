@@ -44,6 +44,7 @@ class StatusSnapshot:
     total_429s: int
     gateway_429s: int
     rate_limit_429s: int
+    total_503s: int
 
     # Operational
     target: int
@@ -105,6 +106,7 @@ class StatusSnapshot:
             "total_429s": self.total_429s,
             "gateway_429s": self.gateway_429s,
             "rate_limit_429s": self.rate_limit_429s,
+            "total_503s": self.total_503s,
             "target": self.target,
             "queue_depth": self.queue_depth,
             "local_in_flight": self.local_in_flight,
@@ -174,6 +176,7 @@ def snapshot(
         total_429s=reconcile.total_429s,
         gateway_429s=reconcile.gateway_429s,
         rate_limit_429s=reconcile.rate_limit_429s,
+        total_503s=reconcile.total_503s,
         target=reconcile.target,
         queue_depth=reconcile.queue_depth,
         local_in_flight=reconcile.in_flight,
@@ -239,6 +242,7 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_total_429s", "Total concurrency 429s since startup (excludes rate-limit and gateway)", snap.total_429s)
     gauge("sluice_gateway_429s", "Upstream 429s from CDN/gateway (not fed to breaker)", snap.gateway_429s)
     gauge("sluice_rate_limit_429s", "Upstream 429s classified as rate-limit (NOT fed to breaker; safety net tightens gate when stale)", snap.rate_limit_429s)
+    gauge("sluice_total_503s", "Total upstream 503s since startup (overload during low-interactivity, not fed to breaker)", snap.total_503s)
     gauge(
         "sluice_breaker_half_open_age_seconds",
         "Seconds since breaker entered HALF_OPEN (None if not half-open)",
@@ -255,7 +259,7 @@ def to_prometheus(snap: StatusSnapshot) -> str:
         "sluice_band",
         "Current enforcement band",
         snap.band,
-        "normal", "low", "reject", "boxed",
+        "normal", "low", "reject", "boxed", "low_interactivity",
     )
     enum_gauge(
         "sluice_breaker",

@@ -45,6 +45,7 @@ class LabelCounters:
     rate_limit_429: int = 0
     gateway_429: int = 0
     queue_timeouts: int = 0
+    overloaded_503: int = 0
 
 
 @dataclass
@@ -89,6 +90,9 @@ class ClientMetrics:
     def record_queue_timeout(self, label: str | None) -> None:
         self._get(label or _DEFAULT_LABEL).queue_timeouts += 1
 
+    def record_503(self, label: str | None) -> None:
+        self._get(label or _DEFAULT_LABEL).overloaded_503 += 1
+
     def to_dict(self) -> dict[str, dict[str, int]]:
         """Serialise to ``{label: {forwarded, succeeded, ...}}`` for JSON."""
         result: dict[str, dict[str, int]] = {}
@@ -100,10 +104,12 @@ class ClientMetrics:
                 "rate_limit_429": c.rate_limit_429,
                 "gateway_429": c.gateway_429,
                 "queue_timeouts": c.queue_timeouts,
+                "overloaded_503": c.overloaded_503,
             }
         if any(getattr(self._overflow, attr) > 0 for attr in (
             "forwarded", "succeeded", "concurrency_429",
             "rate_limit_429", "gateway_429", "queue_timeouts",
+            "overloaded_503",
         )):
             result["__overflow__"] = {
                 "forwarded": self._overflow.forwarded,
@@ -112,6 +118,7 @@ class ClientMetrics:
                 "rate_limit_429": self._overflow.rate_limit_429,
                 "gateway_429": self._overflow.gateway_429,
                 "queue_timeouts": self._overflow.queue_timeouts,
+                "overloaded_503": self._overflow.overloaded_503,
             }
         return result
 
@@ -125,6 +132,7 @@ class ClientMetrics:
             ("sluice_client_rate_limit_429", "Total rate-limit 429s per client label", "rate_limit_429"),
             ("sluice_client_gateway_429", "Total gateway 429s per client label", "gateway_429"),
             ("sluice_client_queue_timeouts", "Total queue timeouts per client label", "queue_timeouts"),
+            ("sluice_client_overloaded_503", "Total upstream 503s per client label", "overloaded_503"),
         )
         for name, help_text, attr in metrics:
             has_data = any(getattr(c, attr) > 0 for c in self._counters.values()) or getattr(self._overflow, attr) > 0

@@ -294,6 +294,78 @@ async def test_idle_not_set_when_rate_limit_429s_recent():
     assert not loop.is_idle
 
 
+async def test_idle_not_set_when_503s_recent():
+    """Idle detection must consider upstream 503s.
+
+    503s during low-interactivity are not fed to the breaker, but the system
+    is not quiescent — stay on the fast poll cadence.
+    """
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    await loop.tick()
+    assert loop.is_idle  # truly idle
+
+    loop.record_503()
+
+    # Fresh tick with 503 → not idle.
+    await loop.tick()
+    assert not loop.is_idle
+    assert loop.total_503s == 1
+
+
+async def test_idle_not_set_during_low_interactivity():
+    """Idle detection must consider low-interactivity mode.
+
+    The account is penalized but still serving; stay on fast cadence so
+    recovery is detected promptly.
+    """
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            concurrent_sessions=0,
+            service_mode="low_interactivity",
+            service_mode_resets_at_epoch=1_000_300.0,
+        )
+    )
+
+    await loop.tick()
+    assert not loop.is_idle
+
+
+async def test_record_503_increments_and_wakes_poll():
+    """record_503 increments the counter and wakes the poll loop."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    await loop.tick()
+    assert loop.total_503s == 0
+
+    loop.record_503()
+    loop.record_503()
+    assert loop.total_503s == 2
+
+
+async def test_low_interactivity_retry_after():
+    """low_interactivity_retry_after returns clamped remaining time."""
+    loop, client, gate, m, w = _make_loop(
+        _reading(
+            service_mode="low_interactivity",
+            service_mode_resets_at_epoch=1_000_060.0,  # 60s from now
+        )
+    )
+
+    await loop.tick()
+    ra = loop.low_interactivity_retry_after()
+    assert ra is not None
+    assert 5 <= ra <= 60
+
+
+async def test_low_interactivity_retry_after_none_when_not_active():
+    """low_interactivity_retry_after returns None when not in low-interactivity."""
+    loop, client, gate, m, w = _make_loop(_reading(concurrent_sessions=0))
+
+    await loop.tick()
+    assert loop.low_interactivity_retry_after() is None
+
+
 async def test_rate_limit_429_does_not_retrip_half_open_breaker():
     """HALF_OPEN breaker + rate_limit 429 → stays HALF_OPEN (not re-tripped).
 

@@ -95,6 +95,8 @@ CREATE TABLE IF NOT EXISTS history (
     r429 INTEGER NOT NULL,
     t429 INTEGER NOT NULL,
     rl429 INTEGER NOT NULL DEFAULT 0,
+    t503 INTEGER NOT NULL DEFAULT 0,
+    li   INTEGER NOT NULL DEFAULT 0,
     qd   INTEGER NOT NULL,
     qt   INTEGER NOT NULL,
     err  INTEGER NOT NULL,
@@ -118,15 +120,17 @@ _MIGRATIONS = [
     "ALTER TABLE history ADD COLUMN rdelta INTEGER",
     "ALTER TABLE history ADD COLUMN rl429 INTEGER DEFAULT 0",
     "ALTER TABLE history ADD COLUMN tp INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE history ADD COLUMN t503 INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE history ADD COLUMN li INTEGER NOT NULL DEFAULT 0",
 ]
 
 _INSERT = """\
-INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SELECT = """\
-SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp
+SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp
 FROM history ORDER BY ts DESC, rowid DESC LIMIT ?
 """
 
@@ -216,6 +220,8 @@ class SQLiteHistoryStore:
                     entry.recent_429s,
                     entry.total_429s,
                     entry.rate_limit_429s,
+                    entry.total_503s,
+                    entry.low_interactivity,
                     entry.queue_depth,
                     entry.queue_timeouts,
                     entry.tick_failed,
@@ -258,15 +264,17 @@ class SQLiteHistoryStore:
                 recent_429s=row[12],
                 total_429s=row[13],
                 rate_limit_429s=row[14] if len(row) > 14 and row[14] is not None else 0,
-                queue_depth=row[15],
-                queue_timeouts=row[16],
-                tick_failed=bool(row[17]),
-                requests_in_window=row[18] if len(row) > 18 else None,
-                requests_limit=row[19] if len(row) > 19 else None,
-                requests_remaining=row[20] if len(row) > 20 else None,
-                local_requests_in_window=row[21] if len(row) > 21 else None,
-                request_window_delta=row[22] if len(row) > 22 else None,
-                throughput=row[23] if len(row) > 23 and row[23] is not None else 0,
+                total_503s=row[15] if len(row) > 15 and row[15] is not None else 0,
+                low_interactivity=bool(row[16]) if len(row) > 16 and row[16] is not None else False,
+                queue_depth=row[17],
+                queue_timeouts=row[18],
+                tick_failed=bool(row[19]),
+                requests_in_window=row[20] if len(row) > 20 else None,
+                requests_limit=row[21] if len(row) > 21 else None,
+                requests_remaining=row[22] if len(row) > 22 else None,
+                local_requests_in_window=row[23] if len(row) > 23 else None,
+                request_window_delta=row[24] if len(row) > 24 else None,
+                throughput=row[25] if len(row) > 25 and row[25] is not None else 0,
             )
             for row in rows
         ]

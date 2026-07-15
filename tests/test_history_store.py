@@ -912,3 +912,66 @@ def test_migration_idempotent_when_tp_already_exists():
         assert len(entries) == 1
         assert entries[0].throughput == 3
         store2.close()
+
+
+def test_migration_adds_t503_and_li_columns_to_old_db():
+    """Opening a database created before 503/low-interactivity tracking
+    must migrate it and backfill defaults for existing rows."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "pre_503.db")
+        conn = sqlite3.connect(path)
+        conn.execute("""\
+CREATE TABLE history (
+    ts  REAL    NOT NULL,
+    obs INTEGER,
+    loc INTEGER NOT NULL,
+    ph  INTEGER NOT NULL,
+    ep  INTEGER NOT NULL,
+    lim INTEGER,
+    hc  INTEGER,
+    band TEXT    NOT NULL,
+    brk  TEXT    NOT NULL,
+    pl   INTEGER NOT NULL,
+    age  REAL    NOT NULL,
+    stl  INTEGER NOT NULL,
+    r429 INTEGER NOT NULL,
+    t429 INTEGER NOT NULL,
+    rl429 INTEGER NOT NULL DEFAULT 0,
+    tp   INTEGER NOT NULL DEFAULT 0,
+    qd   INTEGER NOT NULL,
+    qt   INTEGER NOT NULL,
+    err  INTEGER NOT NULL,
+    rwin INTEGER,
+    rlim INTEGER,
+    rrem INTEGER,
+    rlw  INTEGER,
+    rdelta INTEGER
+)
+""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)")
+        conn.execute(
+            "INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, tp, qd, qt, err, rwin, rlim, rrem, rlw, rdelta) "
+            "VALUES (1000.0, 3, 2, 0, 3, 4, 8, 'normal', 'closed', 0, 1.0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 200, 190, 8, 2)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = SQLiteHistoryStore(path)
+        assert store.is_available
+
+        entries = store.load_recent(10)
+        assert len(entries) == 1
+        assert entries[0].total_503s == 0, "old rows should have total_503s=0"
+        assert entries[0].low_interactivity is False, "old rows should have low_interactivity=False"
+
+        store.append(_entry(timestamp=1001.0, total_503s=3, low_interactivity=True))
+        entries = store.load_recent(10)
+        assert len(entries) == 2
+        assert entries[0].total_503s == 0
+        assert entries[0].low_interactivity is False
+        assert entries[1].total_503s == 3
+        assert entries[1].low_interactivity is True
+
+        store.close()
