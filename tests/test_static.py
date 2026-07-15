@@ -549,3 +549,239 @@ def test_dashboard_js_renders_half_open_breaker() -> None:
     assert "12.5" in stats, (
         "Stats table must contain the age value 12.5"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tokens over the last 24H metric (reuses penalty section's usage-history fetch)
+# ---------------------------------------------------------------------------
+
+def test_dashboard_has_tokens_24h_metric() -> None:
+    """The dashboard HTML must contain the 'Tokens over the last 24H' metric.
+
+    Reuses the penalty section's ``fetchUsageBuckets`` / ``sumBuckets`` to
+    sum a rolling 24h window of token usage from the provider usage-history
+    endpoint, surfaced as a non-prominent row in the Reading card.  Bold
+    after 100M, bold+warn at 250M, bold+crit at 350M.
+    """
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    # CSS class for the bold threshold tier
+    assert "tr.row-bold" in html, "CSS class tr.row-bold must be defined in <style>"
+
+    # vol24 state + fetch helpers reuse the penalty section's usage-history fetch
+    assert re.search(r"var\s+vol24\s*=", html), "vol24 state must be defined"
+    assert "function fetchVolume24h" in html, "fetchVolume24h must be defined"
+    assert "function maybeFetchVolume24h" in html, (
+        "maybeFetchVolume24h must be defined"
+    )
+    # Must fetch a 24h rolling window (now - 86400 seconds)
+    assert "now-86400" in html, "must fetch a 24h rolling window"
+
+    # The tokens_24h row in the stats table
+    assert "tokens_24h" in html, "stats table must include tokens_24h row"
+
+    # Threshold classification logic references the three tiers
+    assert "100e6" in html, "must bold after 100M tokens"
+    assert "250e6" in html, "must apply warn at 250M tokens"
+    assert "350e6" in html, "must apply crit at 350M tokens"
+
+    # Slow cadence (5 min) — the 24h total shifts slowly
+    assert "VOL_REFRESH_MS=300000" in html, (
+        "vol24 refresh must be 5 min (300000 ms) to avoid over-polling"
+    )
+    # Skip the fetch while a penalty is active (penalty card already polls)
+    assert "penalty_started_at" in html, (
+        "maybeFetchVolume24h must check penalty_started_at"
+    )
+
+
+_NODE_TOKENS24H_PREFIX = r"""
+function _escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function _mockEl(id){
+  var _tc='',_ih='',_cn='';
+  return {
+    id:id,
+    style:{display:''},
+    classList:{add:function(){},remove:function(){},toggle:function(){},contains:function(){return false;}},
+    get textContent(){return _tc;},
+    set textContent(v){_tc=String(v);_ih=_escapeHtml(_tc);},
+    get innerHTML(){return _ih;},
+    set innerHTML(v){_ih=String(v);},
+    get className(){return _cn;},
+    set className(v){_cn=String(v);},
+    setAttribute:function(){},
+    getAttribute:function(){return null;},
+    getBoundingClientRect:function(){return{left:0,top:0,width:200,height:120};},
+    addEventListener:function(){},
+    removeEventListener:function(){},
+    offsetWidth:100,
+    offsetHeight:20,
+    appendChild:function(){},
+    removeChild:function(){},
+    querySelectorAll:function(){return [];},
+    querySelector:function(){return null;},
+  };
+}
+var _elements={};
+var document={
+  createElement:function(tag){return _mockEl('');},
+  getElementById:function(id){if(!_elements[id])_elements[id]=_mockEl(id);return _elements[id];},
+  querySelectorAll:function(sel){return [];},
+  querySelector:function(sel){return null;},
+  addEventListener:function(){},
+  body:_mockEl('body'),
+};
+var window={addEventListener:function(){},scrollY:0,location:{href:'http://localhost/'}};
+var _warnings=[];
+var console_warn_original=console.warn;
+console.warn=function(){_warnings.push(Array.prototype.slice.call(arguments).join(' '));};
+var _mockStatus={
+  version:'1.0.0',build:'test',
+  concurrent_sessions:2,limit:4,hard_cap:8,
+  priority_low:false,priority_reason:null,
+  boxed_until:null,resets_at:null,
+  service_mode:null,service_mode_resets_at:null,low_interactivity:false,
+  tokens_in:null,tokens_out:null,
+  usage_age:1.5,stale:false,
+  effective_permits:4,band:'normal',phantom_estimate:0,
+  breaker:'closed',breaker_half_open_age_seconds:null,
+  recent_429s:0,total_429s:0,gateway_429s:0,rate_limit_429s:0,total_503s:0,
+  target:4,queue_depth:0,local_in_flight:1,cooling_down:0,
+  avg_wait_seconds:0.1,p95_wait_seconds:0.5,avg_hold_seconds:2.3,
+  retry_after_hint:5,queue_timeouts:0,
+  ready:true,gate_closed_reason:'open',
+  config:{target:4,min_floor:1,poll_interval:5,poll_interval_idle:30,usage_fresh_ttl:30,
+    phantom_window:5,breaker_threshold:3,breaker_window_seconds:300,
+    breaker_cooldown_seconds:60,provider:'umans',controller:'concurrency_reconcile'},
+  overrides:{},
+  requests_in_window:100,requests_limit:500,requests_remaining:400,
+  requests_hard_cap:1000,requests_window_seconds:3600,
+  local_requests_in_window:95,request_window_delta:5,
+  total_requests_forwarded:1000,throughput:0,idle:true,poll_interval_idle:30,
+  client_metrics:null,penalty_started_at:null,
+};
+var fetch=function(url,opts){
+  if(url.indexOf('/status.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve(_mockStatus);},
+      text:function(){return Promise.resolve(JSON.stringify(_mockStatus));},
+      headers:{get:function(k){return k==='content-type'?'application/json':'';}},
+    });
+  }
+  if(url.indexOf('/history.json')!==-1){
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({entries:[]});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(){return '';}},
+    });
+  }
+  if(url.indexOf('/admin/usage-history')!==-1){
+    /* Two hourly buckets summing to 400M tokens (in+out) — >= 350M so the
+       row must carry row-bold + row-crit. */
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({buckets:[
+        {bucket:'2026-07-15T00:00:00Z',tokens_in:120000000,tokens_out:80000000,requests:10},
+        {bucket:'2026-07-15T01:00:00Z',tokens_in:110000000,tokens_out:90000000,requests:12},
+      ]});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(k){return k==='content-type'?'application/json':'';}},
+    });
+  }
+  return Promise.resolve({ok:false,status:404,json:function(){return Promise.resolve({});},text:function(){return Promise.resolve('');},headers:{get:function(){return '';}}});
+};
+"""
+
+_NODE_TOKENS24H_SUFFIX = r"""
+setTimeout(function(){
+  try{
+    var statsHtml=_elements['stats']?_elements['stats'].innerHTML:'';
+    console.log(JSON.stringify({
+      error:null,
+      stats:statsHtml,
+      warnings:_warnings,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack,stats:''}));
+  }
+  process.exit(0);
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_renders_tokens_24h_with_thresholds() -> None:
+    """Execute the dashboard JS with a mocked usage-history endpoint that
+    returns 400M tokens over 24h, and verify the tokens_24h row renders with
+    the correct threshold styling (bold + crit at >= 350M).
+    """
+    js = _extract_dashboard_js()
+    script = _NODE_TOKENS24H_PREFIX + "\n" + js + "\n" + _NODE_TOKENS24H_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js tokens_24h test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert not output.get("warnings"), (
+        f"Dashboard JS emitted unexpected console.warn: {output['warnings']}"
+    )
+
+    stats = output["stats"]
+    assert "tokens_24h" in stats, "stats table must render tokens_24h row"
+    assert "400.0M" in stats, "stats table must show the 400M token total"
+    assert "row-bold" in stats, "tokens_24h must be bold at 400M (>100M)"
+    assert "row-crit" in stats, "tokens_24h must be crit at 400M (>=350M)"
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_skips_tokens_24h_fetch_during_penalty() -> None:
+    """When a penalty event is active, vol24 must NOT fetch — the penalty card
+    already polls the same usage-history endpoint for overlapping ranges.
+
+    Activates a penalty (penalty_started_at = 1h ago) in the mock status and
+    verifies the tokens_24h row stays absent (vol24.total never populated).
+    """
+    js = _extract_dashboard_js()
+    # Activate a penalty event (started 1h ago) in the mock status
+    prefix = _NODE_TOKENS24H_PREFIX.replace(
+        "penalty_started_at:null",
+        "penalty_started_at:Date.now()/1000-3600",
+    )
+    script = prefix + "\n" + js + "\n" + _NODE_TOKENS24H_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js penalty-skip test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+
+    stats = output["stats"]
+    assert "tokens_24h" not in stats, (
+        "tokens_24h row must not render during a penalty (fetch skipped, "
+        "penalty card already polls the endpoint)"
+    )

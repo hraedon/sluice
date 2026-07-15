@@ -4,6 +4,21 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.9] — 2026-07-15
+
+### Added
+
+- **Dashboard: "Tokens over the last 24H" metric.** A rolling 24h token
+  total (in + out), surfaced as a non-prominent row in the Reading card. It
+  reuses the penalty section's usage-history fetch (`/admin/usage-history` →
+  Umans `/v1/usage/history`), summing hourly buckets over the trailing
+  `now − 86400` window. Styling escalates with volume: **bold** after 100M,
+  **bold + warning** at 250M, **bold + alert** at 350M — so heavy spend
+  draws attention without a dedicated banner. Refreshed every 5 min (the
+  total shifts slowly) and skipped entirely while a penalty event is active,
+  since the penalty card already polls the same endpoint for overlapping
+  ranges.
+
 ## [1.3.8] — 2026-07-15
 
 ### Fixes

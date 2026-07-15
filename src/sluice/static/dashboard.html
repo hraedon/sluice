@@ -46,6 +46,7 @@ tr.row-primary td,tr.row-primary th{font-weight:500}
 tr.row-detail td{color:var(--text-3)}
 tr.row-warn td{color:var(--warn)}
 tr.row-crit td{color:var(--crit)}
+tr.row-bold td{font-weight:600}
 .banner{padding:var(--space-3) var(--space-4);border-radius:var(--radius-sm);margin-bottom:var(--space-4);font-size:var(--fs-sm);display:none}
 .banner.boxed{display:block;background:var(--crit-soft);color:var(--crit);border:1px solid var(--crit)}
 .banner.breaker{display:block;background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn)}
@@ -486,6 +487,7 @@ function render(d){
     ['gate_closed',d.gate_closed_reason,'Why the gate refuses new work: open means it is not closed; otherwise boxed, breaker, or saturated'],
     ['ready',d.ready,'True once the first usage poll succeeded and this instance holds the singleton lock'],
     ['usage_age',d.usage_age+'s'+(d.stale?' (stale)':''),'Age of the newest usage reading; stale means the last poll failed'],
+    ['tokens_24h',vol24.total!=null?fmtTokens(vol24.total):null,'Total tokens (in+out) forwarded over the last 24 hours, via the provider usage-history endpoint'],
   ];
   var qtRecent=recentInc('qt','queue_timeouts'),t429Recent=d.recent_429s>0;
   function kvRow(r,cls){
@@ -500,6 +502,12 @@ function render(d){
       if(r[0]==='queue_timeouts'&&qtRecent) cls+=' row-warn';
       if(r[0]==='total_429s'&&t429Recent) cls+=' row-crit';
       if(r[0]==='recent_429s'&&t429Recent) cls+=' row-crit';
+      if(r[0]==='tokens_24h'){
+        var tv=vol24.total||0;
+        if(tv>100e6) cls+=' row-bold';
+        if(tv>=350e6) cls+=' row-crit';
+        else if(tv>=250e6) cls+=' row-warn';
+      }
       return kvRow(r,cls);
     }).join('');
   // Config table
@@ -573,6 +581,7 @@ function render(d){
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal'&&d.band!=='low_interactivity')||(d.breaker!=='closed')||(d.low_interactivity&&d.total_503s>0);
   renderBudget(d);
   renderPenaltySection(d);
+  maybeFetchVolume24h();
 }
 
 function renderBudget(d){
@@ -825,6 +834,41 @@ function renderPenaltySection(d){
     pState={start:null,before:null,beforeFailed:false,sinceCompleted:null,
             currentHour:null,lastRefresh:0,fetching:false};
   }
+}
+
+// -- Tokens over the last 24h (reuses the penalty section's usage-history fetch) -
+// Rolling 24h token total (in+out), summed from hourly usage-history buckets.
+// Bold >100M, bold+warn >=250M, bold+crit >=350M.
+// Refreshed every 5 min — a 24h total shifts slowly, and the penalty card
+// already polls the same endpoint at 60s while a penalty is active.
+var VOL_REFRESH_MS=300000;
+var vol24={total:null,lastRefresh:0,fetching:false};
+
+async function fetchVolume24h(){
+  if(vol24.fetching) return;
+  vol24.fetching=true;
+  try{
+    var now=Date.now()/1000;
+    var buckets=await fetchUsageBuckets(now-86400,now);
+    var s=sumBuckets(buckets);
+    vol24.total=s.total;
+    vol24.lastRefresh=Date.now();
+    if(lastD) render(lastD);
+  }catch(e){
+    // leave last-known value; row stays hidden until first success
+  }finally{
+    vol24.fetching=false;
+  }
+}
+
+function maybeFetchVolume24h(){
+  if(vol24.fetching) return;
+  // usage-history is umans-specific; skip for other providers
+  if(lastD&&lastD.config&&lastD.config.provider!=='umans') return;
+  // Skip while a penalty event is active — the penalty card already fetches
+  // overlapping ranges from this endpoint and surfaces token totals.
+  if(lastD&&lastD.penalty_started_at!=null) return;
+  if(Date.now()-vol24.lastRefresh>=VOL_REFRESH_MS) fetchVolume24h();
 }
 
 const SEV={normal:0,low:1,reject:2,boxed:3,low_interactivity:1};
