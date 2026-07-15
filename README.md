@@ -90,14 +90,9 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   since-penalty count accumulates hourly buckets and only refreshes the
   current hour every 60s.
 
-![sluice live dashboard under real team load: local in-flight repeatedly touching the effective-permits line of 4, queue depth rising to 3 behind it, zero 429s](docs/dashboard.png)
+![sluice live dashboard under real team load: local in-flight](docs/dashboard.png)
 
-*The dashboard under real team load: local in-flight (yellow) repeatedly touches the
-effective-permits line of 4 and never crosses it, the excess demand shows up as queue
-wait (depth up to 3, `9.71s avg / 20.11s p95`) instead of provider 429s —
-`total_429s: 0`, `queue_timeouts: 0` — and the gap between the provider's observed
-count (blue) and local truth is exactly the kind of divergence the reconciliation loop
-exists to watch.*
+*The dashboard under real load
 
 ## Quickstart
 
