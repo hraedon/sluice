@@ -27,12 +27,13 @@ enforcement ladder is:
 | `limit`..`hard_cap` (4–8) | `priority.low` — deprioritised routing |
 | > `hard_cap` (~8) | HTTP 429 concurrency errors |
 | daily concurrency-429 allowance exceeded | **boxed** — 5-hour pause (`boxed_until`), limited self-reactivations |
+| `service_mode: low_interactivity` | separate fixed-duration penalty — still serving, but at lower priority; interactive requests may get **503** (`resets_at`) |
 
 Ladder and numbers per the [official usage docs](https://app.umans.ai/offers/code/docs#usage).
 The exact thresholds drift (the docs say the box trips past 10 concurrency-429s a day;
 the dashboard currently shows a 20-hit daily allowance) — sluice doesn't hard-code any of
 them. It reacts to what `/v1/usage` itself reports (`priority.low`, `boxed_until`,
-`priority.reason`), so the ladder can move without a code change.
+`priority.reason`, `service_mode`), so the ladder can move without a code change.
 
 Two facts make a naive limiter insufficient:
 
@@ -62,6 +63,12 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   pause. On the `rate_limited` rung — where the provider keeps serving at low
   priority — it serves at the account limit (or one below when `--target` already
   sits at the limit) rather than turning a soft penalty into a self-inflicted outage.
+  The same logic applies to `service_mode: low_interactivity`: the provider is still
+  serving (degraded), so sluice keeps the gate open. The 503s that penalty produces
+  are tracked separately from concurrency 429s and do **not** feed the circuit
+  breaker — but sluice injects an honest `Retry-After` (clamped to ≤ 60 s for SDK
+  compatibility) when the upstream omits one, so clients back off instead of
+  retrying into more 503s.
 - **Both API surfaces.** Transparent streaming passthrough for the Anthropic
   (`/v1/messages`) and OpenAI (`/v1/chat/completions`) routes.
 - **Remembers the trend.** Every tick lands in a bounded in-memory history
@@ -70,8 +77,9 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   Depth and retention are tunable (`--history-size`, default 2880 ticks ≈ 4h at the
   5s cadence; `--history-ttl` for the SQLite store, default 7 days).
   The dashboard renders it at 5m/1h/4h ranges: a full-width concurrency chart,
-  queue depth, a band ribbon, and tick marks where queue timeouts or 429s
-  actually happened, with the Reading and Config tables side by side below.
+  queue depth, a band ribbon, and tick marks where queue timeouts, 429s, or
+  (during low-interactivity) 503s actually happened, with the Reading and Config
+  tables side by side below.
   Legend entries and every Reading/Config row carry hover explanations
   (native tooltips) of what the value means.
 
@@ -331,7 +339,7 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **1.2.3 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
+Status: **1.3.5 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
 real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
 boxed). See `docs/concurrency-model.md` for the data model,
 `docs/client-configuration.md` to point clients at it, and `deploy/README.md`

@@ -4,6 +4,49 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.5] — 2026-07-15
+
+### Added
+
+- **Low-interactivity `service_mode` support (Plan 010).** umans exposes a
+  separate penalty dimension from the concurrency ladder: `usage.service_mode`
+  flips to `low_interactivity` for a fixed window (`resets_at`) where the
+  account keeps serving but at lower priority — interactive requests may
+  receive **503** instead of being queued. sluice now parses
+  `service_mode` / `service_mode_resets_at_epoch` (and `tokens_in` /
+  `tokens_out`) from `/v1/usage`, and classifies it as a distinct
+  `LOW_INTERACTIVITY` band.
+  - **503s are tracked, not breaker-fed.** A 503 during low-interactivity is an
+    overload symptom, not a concurrency rejection — closing the gate would turn
+    a soft penalty into a self-inflicted full outage. 503s land in their own
+    counters (reconcile / metrics / status / history) and idle-detection stays
+    on the fast poll cadence for the duration of the window.
+  - **Honest `Retry-After` on those 503s.** When the upstream sends a 503
+    during low-interactivity without a `Retry-After`, sluice adds
+    `ceil(resets_at − now)` clamped to `[5, 60]` s for SDK compatibility
+    (concurrency-model.md §10 — both Anthropic and OpenAI Python SDKs discard
+    values above 60 s). An upstream-supplied `Retry-After` is never overridden,
+    and the response body is never modified (inert in-path, Rule 3).
+  - **Dashboard:** a low-interactivity banner with a live countdown, 503
+    sparkline ticks, and stat/tooltip fields. The 503 legend entry is hidden
+    until the first 503 appears, so it doesn't clutter an idle chart.
+  - The band does **not** change `effective_permits` — the provider is still
+    serving, so a direct sluice user keeps getting service instead of a blanket
+    503 for the whole window. (switchboard, which has an alternate provider, is
+    where this becomes a route-away decision.)
+
+### Changed
+
+- **Promoted private admin functions to public API (Plan 007, WI-5).** The
+  admin route handlers are now importable as a stable surface so switchboard
+  (and future consumers) can reuse them without referencing private API.
+
+### Dependencies
+
+- Bump `anyio` 4.14.1 → 4.14.2
+- Bump `ruff` 0.15.20 → 0.15.21
+- Bump `astral-sh/setup-uv` 8.3.0 → 8.3.2
+
 ## [1.3.1] — 2026-07-10
 
 ### Fixes

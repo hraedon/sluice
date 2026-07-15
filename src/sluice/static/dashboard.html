@@ -163,7 +163,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <span title="queue_depth on the lower spark, on its own scale"><span class="dot" style="background:var(--info,var(--accent))"></span> queue</span>
       <span title="tick where queue_timeouts incremented between samples"><span class="dot" style="background:var(--warn)"></span> timeout</span>
       <span title="tick where total_429s incremented between samples"><span class="dot" style="background:var(--crit)"></span> 429</span>
-      <span title="tick where total_503s incremented between samples (upstream overload during low-interactivity)"><span class="dot" style="background:var(--warn);opacity:.6"></span> 503</span>
+      <span id="leg-503" style="display:none" title="tick where total_503s incremented between samples (upstream overload during low-interactivity)"><span class="dot" style="background:var(--warn);opacity:.6"></span> 503</span>
       <span title="throughput - requests forwarded per tick interval; bars at the bottom of the spark show traffic, distinguishing idle from healthy (WI-023)"><span class="dot" style="background:var(--ok);opacity:.4"></span> throughput</span>
     </div>
     <div id="req-section" class="req-section">
@@ -753,6 +753,10 @@ function renderSparks(){
     else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
   }
   document.getElementById('qspark').innerHTML=qs;
+  var has503=false;
+  for(var e5=0;e5<valid.length;e5++){if(valid[e5].t503Inc){has503=true;break;}}
+  var leg503=document.getElementById('leg-503');
+  if(leg503) leg503.style.display=has503?'':'none';
   info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ+(maxTp>0?' · throughput max '+maxTp:'');
   // -- reconciliation spark: provider requests_in_window vs sluice local count
   var rspark=document.getElementById('rspark');
