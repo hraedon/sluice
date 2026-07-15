@@ -40,6 +40,7 @@ from sluice.admin import (
     handle_logout,
     handle_readyz,
     handle_reload,
+    handle_usage_history,
     is_admin_auth_value,
     send_dashboard,
     send_history_json,
@@ -241,6 +242,8 @@ class ProxyApp:
         max_request_body_bytes: int | None = None,
         upstream_idle_timeout: float | None = None,
         cors_allow_origin: str | None = None,
+        usage_api_key: str = "",
+        usage_auth_header: str = "authorization",
     ) -> None:
         self._upstream = upstream_base_url.rstrip("/")
         self._gate = gate
@@ -258,6 +261,8 @@ class ProxyApp:
         self._max_request_body_bytes = max_request_body_bytes
         self._upstream_idle_timeout = upstream_idle_timeout
         self._cors_allow_origin = cors_allow_origin
+        self._usage_api_key = usage_api_key
+        self._usage_auth_header = usage_auth_header
         self._config_path: str | None = None  # set by CLI for SIGHUP reload
         self._client_metrics = ClientMetrics()
         self._lifecycle = LifecycleManager(
@@ -293,7 +298,7 @@ class ProxyApp:
         if scope["method"] == "OPTIONS" and self._cors_allow_origin and path in (
             "/", "/status.json", "/metrics", "/history.json",
             "/admin/config", "/admin/config/target",
-            "/admin/reload",
+            "/admin/reload", "/admin/usage-history",
             "/login", "/logout",
         ):
             await send_text(
@@ -345,6 +350,14 @@ class ProxyApp:
         if path == "/admin/reload" and scope["method"] == "POST":
             await handle_reload(
                 send, self, self._admin_token, scope, self._guard,
+                self._cors_allow_origin,
+            )
+            return
+
+        if path == "/admin/usage-history" and scope["method"] == "GET":
+            await handle_usage_history(
+                send, scope, self._admin_token,
+                self._upstream, self._usage_api_key, self._usage_auth_header,
                 self._cors_allow_origin,
             )
             return

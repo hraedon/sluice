@@ -148,6 +148,13 @@ class ReconciliationLoop:
         self._last_reading_cached: CachedReading | None = None
         self._last_age: float = 0.0
 
+        # Penalty event tracking: records the wall-clock timestamp when the
+        # account first entered a penalty band (LOW, BOXED, LOW_INTERACTIVITY).
+        # Reset to None when the account returns to NORMAL.  Used by the
+        # dashboard to show token usage before/since the penalty event.
+        self._penalty_started_at: float | None = None
+        self._prev_in_penalty: bool = False
+
         self._task: asyncio.Task[None] | None = None
         self._first_poll_ok = False
         self._stopped = False
@@ -451,6 +458,18 @@ class ReconciliationLoop:
         self._last_band = classify_band(reading, now=now_wall)
         self._last_reading_cached = cached
         self._last_age = age
+
+        # Penalty event tracking: record when the account first enters a
+        # penalty band (LOW, BOXED, LOW_INTERACTIVITY).  Cleared when the
+        # account returns to NORMAL or REJECT (REJECT is transient — above
+        # hard_cap but not yet boxed — so it doesn't count as a penalty event).
+        _PENALTY_BANDS = frozenset({Band.LOW, Band.BOXED, Band.LOW_INTERACTIVITY})
+        in_penalty = self._last_band in _PENALTY_BANDS
+        if in_penalty and not self._prev_in_penalty:
+            self._penalty_started_at = now_wall
+        elif not in_penalty:
+            self._penalty_started_at = None
+        self._prev_in_penalty = in_penalty
 
         # Throughput: requests forwarded since the previous tick (WI-023).
         # Computed as the delta of the cumulative counter, so it reflects
@@ -858,6 +877,17 @@ class ReconciliationLoop:
     def is_idle(self) -> bool:
         """True when the system was idle at the last tick (WI-022)."""
         return self._idle
+
+    @property
+    def penalty_started_at(self) -> float | None:
+        """Wall-clock epoch when the current penalty event started, or None.
+
+        Set when the band transitions from non-penalty to a penalty band
+        (LOW, BOXED, LOW_INTERACTIVITY).  Cleared when the band returns to
+        a non-penalty state.  Used by the dashboard to compute token totals
+        before and since the penalty event.
+        """
+        return self._penalty_started_at
 
     def _effective_poll_interval(self) -> float:
         """The sleep interval for the next poll cycle (WI-022).

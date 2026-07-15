@@ -451,6 +451,8 @@ def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]
         max_request_body_bytes=max_request_body_bytes,
         upstream_idle_timeout=upstream_idle_timeout,
         cors_allow_origin=cors_allow_origin,
+        usage_api_key=usage_key,
+        usage_auth_header=usage_auth_header or "authorization",
     )
     app._config_path = config_path
 

@@ -117,6 +117,16 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 .rgap{fill:var(--warn);opacity:.12}
 .rleg{display:flex;gap:var(--space-4);font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);flex-wrap:wrap}
 .rleg .rdelta{color:var(--warn)}
+.penalty-section{margin-top:var(--space-4);display:none}
+.penalty-card{background:var(--panel);border:1px solid var(--warn);border-radius:var(--radius);padding:var(--space-4)}
+.penalty-card h2{font-size:var(--fs-xs);font-weight:400;color:var(--warn);margin:0 0 var(--space-3);text-transform:uppercase;letter-spacing:.05em}
+.penalty-grid{display:flex;gap:var(--space-4);flex-wrap:wrap}
+.penalty-col{flex:1;min-width:200px}
+.penalty-col h3{font-size:var(--fs-xs);font-weight:400;color:var(--text-3);margin:0 0 var(--space-2);text-transform:uppercase;letter-spacing:.05em}
+.penalty-tokens{font-size:var(--fs-md);font-weight:500;color:var(--text);font-variant-numeric:tabular-nums}
+.penalty-detail{font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);font-variant-numeric:tabular-nums}
+.penalty-loading{color:var(--text-3);font-size:var(--fs-xs)}
+.penalty-error{color:var(--crit);font-size:var(--fs-xs)}
 </style>
 </head>
 <body>
@@ -133,9 +143,9 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
   </div>
 </div>
 <div id="banner-error" class="banner error" onclick="this.style.display='none'" title="click to dismiss"></div>
-<div id="banner-boxed" class="banner boxed">ACCOUNT BOXED — retry after <span id="countdown">?</span>s</div>
-<div id="banner-deprio" class="banner deprio">DEPRIORITIZED (rate_limited) — serving at reduced permits, window ends in <span id="deprio-countdown">?</span>s</div>
-<div id="banner-lowia" class="banner lowia">LOW-INTERACTIVITY MODE — provider serving at lower priority, interactive-again in <span id="lowia-countdown">?</span>s</div>
+<div id="banner-boxed" class="banner boxed">ACCOUNT BOXED — retry after <span id="countdown">?</span></div>
+<div id="banner-deprio" class="banner deprio">DEPRIORITIZED (rate_limited) — serving at reduced permits, window ends in <span id="deprio-countdown">?</span></div>
+<div id="banner-lowia" class="banner lowia">LOW-INTERACTIVITY MODE — provider serving at lower priority, interactive-again in <span id="lowia-countdown">?</span></div>
 <div id="banner-breaker" class="banner breaker">CIRCUIT BREAKER OPEN — backing off</div>
 <div class="row">
   <div class="card">
@@ -190,6 +200,24 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
         <tr><th>brk</th><td id="tip-brk" colspan="5">-</td></tr>
       </table>
     </div>
+  </div>
+</div>
+<div id="penalty-section" class="penalty-section">
+  <div class="penalty-card">
+    <h2>Penalty Event — Token Usage</h2>
+    <div class="penalty-grid">
+      <div class="penalty-col">
+        <h3>24h Before Penalty</h3>
+        <div class="penalty-tokens" id="penalty-before-tokens">-</div>
+        <div class="penalty-detail" id="penalty-before-detail"></div>
+      </div>
+      <div class="penalty-col">
+        <h3>Since Penalty Started <span id="penalty-since-time" style="color:var(--text-3)"></span></h3>
+        <div class="penalty-tokens" id="penalty-since-tokens">-</div>
+        <div class="penalty-detail" id="penalty-since-detail"></div>
+      </div>
+    </div>
+    <div class="penalty-loading" id="penalty-status"></div>
   </div>
 </div>
 <div class="row">
@@ -517,20 +545,20 @@ function render(d){
   var penaltyEnd=d.resets_at||d.boxed_until; // resets_at preferred; boxed_until fallback (observed null resets_at live)
   if(d.band==='boxed'){
     bb.style.display='block';
-    var ra=penaltyEnd?Math.max(0,Math.round(penaltyEnd-Date.now()/1000)):'?';
+    var ra=penaltyEnd?fmtDuration(Math.max(0,Math.round(penaltyEnd-Date.now()/1000))):'?';
     document.getElementById('countdown').textContent=ra;
   }else bb.style.display='none';
   var bd=document.getElementById('banner-deprio');
   if(d.priority_reason==='rate_limited'&&d.boxed_until&&d.boxed_until>Date.now()/1000){
     bd.style.display='block';
     document.getElementById('deprio-countdown').textContent=
-      Math.max(0,Math.round(d.boxed_until-Date.now()/1000));
+      fmtDuration(Math.max(0,Math.round(d.boxed_until-Date.now()/1000)));
   }else bd.style.display='none';
   var bli=document.getElementById('banner-lowia');
   if(d.low_interactivity&&d.service_mode_resets_at){
     bli.style.display='block';
     document.getElementById('lowia-countdown').textContent=
-      Math.max(0,Math.round(d.service_mode_resets_at-Date.now()/1000));
+      fmtDuration(Math.max(0,Math.round(d.service_mode_resets_at-Date.now()/1000)));
   }else bli.style.display='none';
   document.getElementById('banner-breaker').style.display=
     (d.breaker==='open'||d.breaker==='half_open')?'block':'none';
@@ -544,6 +572,7 @@ function render(d){
   // Active = anything moving
   isActive=(loc>0)||(d.queue_depth>0)||(d.band!=='normal'&&d.band!=='low_interactivity')||(d.breaker!=='closed')||(d.low_interactivity&&d.total_503s>0);
   renderBudget(d);
+  renderPenaltySection(d);
 }
 
 function renderBudget(d){
@@ -581,6 +610,205 @@ function renderBudget(d){
     wEl.textContent='('+h+'h window)';
   }else{
     wEl.textContent='';
+  }
+}
+
+// -- Penalty event token tracking -------------------------------------------
+// Strategy: the 24h-before total is immutable — fetch once and cache.
+// The since-penalty total grows by complete hours — accumulate them and
+// only re-fetch the current (incomplete) hour on each refresh.
+var PENALTY_REFRESH_MS=60000;
+var pState={
+  start:null,
+  before:null,
+  sinceCompleted:null,
+  currentHour:null,
+  lastRefresh:0,
+  fetching:false,
+};
+
+function fmtTokens(n){
+  if(n>=1e9) return (n/1e9).toFixed(1)+'B';
+  if(n>=1e6) return (n/1e6).toFixed(1)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(1)+'k';
+  return String(n);
+}
+
+function fmtDuration(sec){
+  var h=Math.floor(sec/3600),m=Math.floor((sec%3600)/60),s=Math.floor(sec%60);
+  if(h>0) return h+'h '+m+'m';
+  if(m>0) return m+'m '+s+'s';
+  return s+'s';
+}
+
+function isoFromEpoch(ep){
+  return new Date(ep*1000).toISOString().replace(/\.\d+Z$/,'Z');
+}
+
+function sumBuckets(buckets){
+  var tin=0,tout=0,reqs=0;
+  for(var i=0;i<buckets.length;i++){
+    var b=buckets[i];
+    tin+=(b.tokens_in||0);
+    tout+=(b.tokens_out||0);
+    reqs+=(b.requests||0);
+  }
+  return {tin:tin,tout:tout,reqs:reqs,total:tin+tout};
+}
+
+function hourEpoch(ts){
+  return Math.floor(ts/3600)*3600;
+}
+
+async function fetchUsageBuckets(from,to){
+  var url='/admin/usage-history?from='+isoFromEpoch(from)+'&to='+isoFromEpoch(to)+'&granularity=hour';
+  var r=await fetch(url,{credentials:'include'});
+  if(!r.ok){
+    if(r.status===401){window.location.href='/';throw new Error('unauthorized');}
+    throw new Error('usage history fetch failed ('+r.status+')');
+  }
+  var data=await r.json();
+  return (data&&data.buckets)||[];
+}
+
+function renderPenaltyDisplay(){
+  var el=document.getElementById('penalty-before-tokens');
+  var elD=document.getElementById('penalty-before-detail');
+  if(pState.before){
+    el.textContent=fmtTokens(pState.before.total);
+    elD.textContent=pState.before.reqs+' requests \u00b7 in '+fmtTokens(pState.before.tin)+' \u00b7 out '+fmtTokens(pState.before.tout);
+  }else{
+    el.textContent='-';
+    elD.textContent='';
+  }
+
+  var sinceIn=0,sinceOut=0,sinceReqs=0;
+  if(pState.sinceCompleted){
+    sinceIn+=pState.sinceCompleted.tin;
+    sinceOut+=pState.sinceCompleted.tout;
+    sinceReqs+=pState.sinceCompleted.reqs;
+  }
+  if(pState.currentHour){
+    sinceIn+=pState.currentHour.tin;
+    sinceOut+=pState.currentHour.tout;
+    sinceReqs+=pState.currentHour.reqs;
+  }
+  document.getElementById('penalty-since-tokens').textContent=fmtTokens(sinceIn+sinceOut);
+  document.getElementById('penalty-since-detail').textContent=
+    sinceReqs+' requests \u00b7 in '+fmtTokens(sinceIn)+' \u00b7 out '+fmtTokens(sinceOut);
+
+  var now=Date.now()/1000;
+  if(pState.start){
+    var elapsed=now-pState.start;
+    if(elapsed>0)
+      document.getElementById('penalty-since-time').textContent='('+fmtDuration(elapsed)+' ago)';
+  }
+}
+
+async function initPenaltyTracking(penaltyStart){
+  var statusEl=document.getElementById('penalty-status');
+  if(statusEl) statusEl.textContent='loading usage history...';
+
+  // 1) Fetch the 24h before penalty — immutable, fetched once.
+  try{
+    var beforeBuckets=await fetchUsageBuckets(penaltyStart-86400,penaltyStart);
+    pState.before=sumBuckets(beforeBuckets);
+  }catch(e){
+    if(statusEl) statusEl.textContent='before: '+e.message;
+    return;
+  }
+
+  // 2) Fetch since penalty start to now — split into completed hours + current.
+  try{
+    var now=Date.now()/1000;
+    var sinceBuckets=await fetchUsageBuckets(penaltyStart,now);
+    var curHour=hourEpoch(now);
+    var completed=[],current=[];
+    for(var i=0;i<sinceBuckets.length;i++){
+      var bkt=new Date(sinceBuckets[i].bucket).getTime()/1000;
+      if(bkt<curHour) completed.push(sinceBuckets[i]);
+      else current.push(sinceBuckets[i]);
+    }
+    pState.sinceCompleted=sumBuckets(completed);
+    pState.currentHour=current.length?sumBuckets(current):{tin:0,tout:0,reqs:0,total:0};
+    pState.currentHour.hour=curHour;
+  }catch(e){
+    if(statusEl) statusEl.textContent='since: '+e.message;
+    return;
+  }
+
+  pState.lastRefresh=Date.now();
+  if(statusEl) statusEl.textContent='';
+  renderPenaltyDisplay();
+}
+
+async function refreshPenaltyCurrentHour(){
+  if(pState.fetching) return;
+  var now=Date.now()/1000;
+  var curHour=hourEpoch(now);
+
+  // If the tracked current hour has completed, fold it into the accumulated
+  // total and start tracking the new hour.
+  if(pState.currentHour && pState.currentHour.hour<curHour){
+    if(pState.sinceCompleted){
+      pState.sinceCompleted.tin+=pState.currentHour.tin;
+      pState.sinceCompleted.tout+=pState.currentHour.tout;
+      pState.sinceCompleted.reqs+=pState.currentHour.reqs;
+      pState.sinceCompleted.total+=pState.currentHour.total;
+    }else{
+      pState.sinceCompleted={tin:pState.currentHour.tin,tout:pState.currentHour.tout,
+        reqs:pState.currentHour.reqs,total:pState.currentHour.total};
+    }
+    pState.currentHour={hour:curHour,tin:0,tout:0,reqs:0,total:0};
+  }
+
+  // Re-fetch only the current hour's bucket(s).
+  pState.fetching=true;
+  try{
+    var buckets=await fetchUsageBuckets(curHour,now);
+    var b={tin:0,tout:0,reqs:0,total:0};
+    for(var i=0;i<buckets.length;i++){
+      b.tin+=(buckets[i].tokens_in||0);
+      b.tout+=(buckets[i].tokens_out||0);
+      b.reqs+=(buckets[i].requests||0);
+    }
+    b.total=b.tin+b.tout;
+    b.hour=curHour;
+    pState.currentHour=b;
+    pState.lastRefresh=Date.now();
+    var statusEl=document.getElementById('penalty-status');
+    if(statusEl) statusEl.textContent='';
+    renderPenaltyDisplay();
+  }catch(e){
+    var statusEl2=document.getElementById('penalty-status');
+    if(statusEl2) statusEl2.textContent='error: '+e.message;
+  }finally{
+    pState.fetching=false;
+  }
+}
+
+function renderPenaltySection(d){
+  var sec=document.getElementById('penalty-section');
+  var psa=d.penalty_started_at;
+  if(psa!=null){
+    sec.style.display='block';
+    if(pState.start!==psa){
+      // New penalty event — reset and initialise.
+      pState={start:psa,before:null,sinceCompleted:null,currentHour:null,
+              lastRefresh:0,fetching:false};
+      initPenaltyTracking(psa);
+    }else{
+      // Same penalty event — refresh only the current hour if due.
+      if(Date.now()-pState.lastRefresh>=PENALTY_REFRESH_MS){
+        refreshPenaltyCurrentHour();
+      }else{
+        renderPenaltyDisplay();
+      }
+    }
+  }else{
+    sec.style.display='none';
+    pState={start:null,before:null,sinceCompleted:null,currentHour:null,
+            lastRefresh:0,fetching:false};
   }
 }
 

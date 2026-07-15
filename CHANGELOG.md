@@ -4,6 +4,33 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.6] — 2026-07-15
+
+### Added
+
+- **Penalty event token tracking in the dashboard.** When the account
+  enters a penalty band (LOW, BOXED, or LOW_INTERACTIVITY), a new
+  "Penalty Event — Token Usage" card appears showing total token usage
+  for the 24 hours before the penalty started, alongside a running
+  count of tokens consumed since the penalty began.
+  - The 24h-before total is fetched once from the Umans
+    `/v1/usage/history` endpoint and cached for the duration of the
+    penalty event (immutable historical data — never re-fetched).
+  - The since-penalty total accumulates completed hourly buckets and
+    only re-fetches the current (incomplete) hour on each 60s refresh,
+    minimising API calls.
+  - A new admin endpoint `GET /admin/usage-history` proxies the Umans
+    `/v1/usage/history` API server-side (the usage API key never
+    reaches the browser). Admin-auth-gated, same as `/status.json`.
+  - The reconcile loop now tracks `penalty_started_at` — the wall-clock
+    timestamp when the band first transitioned into a penalty state —
+    surfaced in `/status.json` for the dashboard and external consumers.
+
+### Changed
+
+- **Penalty banner countdowns now display as hours and minutes**
+  (e.g. "4h 59m") instead of raw seconds.
+
 ## [1.3.5] — 2026-07-15
 
 ### Added

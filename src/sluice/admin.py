@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 from urllib.parse import parse_qs
 
+import httpx
+
 from sluice import __version__
 from sluice.reconcile import RETRY_AFTER_SHORT
 from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
@@ -727,3 +729,75 @@ async def handle_reload(
     else:
         log.info("config reloaded — no changes (user=%s, remote=%s)", user, remote)
     await send_json(send, 200, {"reloaded": True, "changes": changes}, extra_headers=cors)
+
+
+# ---------------------------------------------------------------------------
+# Usage history endpoint — proxies Umans /v1/usage/history for the dashboard
+# ---------------------------------------------------------------------------
+
+_USAGE_HISTORY_PATH = "/v1/usage/history"
+_USAGE_HISTORY_TIMEOUT = 30.0
+
+
+async def handle_usage_history(
+    send: Send,
+    scope: Scope,
+    admin_token: str | None,
+    usage_base_url: str,
+    usage_api_key: str,
+    usage_auth_header: str,
+    cors_allow_origin: str | None = None,
+) -> None:
+    """GET /admin/usage-history — proxy Umans /v1/usage/history for the dashboard.
+
+    Passes through ``from``, ``to``, and ``granularity`` query params from
+    the request.  Returns the raw Umans response JSON.  This is an admin-
+    only endpoint (same auth as /status.json) so the usage API key never
+    reaches the browser.
+
+    Fails safe: on any error, returns 502 with a JSON error body.
+    """
+    cors = cors_extra_headers(cors_allow_origin, None)
+    if not check_admin_auth(scope, admin_token):
+        await send_json(send, 401, {"error": "unauthorized"}, extra_headers=cors)
+        return
+
+    qs = scope.get("query_string", b"").decode("latin-1")
+    params: dict[str, str] = {}
+    if qs:
+        for pair in qs.split("&"):
+            k, _, v = pair.partition("=")
+            if k in ("from", "to", "granularity", "scope"):
+                params[k] = v
+
+    if "from" not in params or "to" not in params:
+        await send_json(send, 400, {"error": "missing required params 'from' and 'to'"}, extra_headers=cors)
+        return
+
+    if "granularity" not in params:
+        params["granularity"] = "hour"
+
+    url = usage_base_url.rstrip("/") + _USAGE_HISTORY_PATH
+    if usage_auth_header.lower() == "x-api-key":
+        headers = {"x-api-key": usage_api_key, "Accept": "application/json"}
+    else:
+        headers = {"Authorization": f"Bearer {usage_api_key}", "Accept": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=_USAGE_HISTORY_TIMEOUT) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.HTTPStatusError as exc:
+        log.warning("usage history fetch failed: %s", exc)
+        await send_json(send, 502, {"error": f"upstream returned {exc.response.status_code}"}, extra_headers=cors)
+        return
+    except Exception as exc:
+        log.warning("usage history fetch error: %s: %s", type(exc).__name__, exc)
+        await send_json(send, 502, {"error": f"upstream fetch failed: {type(exc).__name__}"}, extra_headers=cors)
+        return
+
+    await send_json(
+        send, 200, data,
+        extra_headers=cors_extra_headers(cors_allow_origin, [(b"cache-control", b"no-store")]),
+    )

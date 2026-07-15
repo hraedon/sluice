@@ -82,6 +82,13 @@ sluice is that shared choke point, and it closes the loop against upstream truth
   tables side by side below.
   Legend entries and every Reading/Config row carry hover explanations
   (native tooltips) of what the value means.
+- **Penalty event token tracking.** When the account enters a penalty
+  band (deprioritized, boxed, or low-interactivity), a card appears
+  showing total token usage for the 24 hours before the penalty started
+  and a running count of tokens consumed since it began. The 24h-before
+  total is fetched once from `/v1/usage/history` and cached; the
+  since-penalty count accumulates hourly buckets and only refreshes the
+  current hour every 60s.
 
 ![sluice live dashboard under real team load: local in-flight repeatedly touching the effective-permits line of 4, queue depth rising to 3 behind it, zero 429s](docs/dashboard.png)
 
@@ -339,7 +346,7 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **1.3.5 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
+Status: **1.3.6 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
 real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
 boxed). See `docs/concurrency-model.md` for the data model,
 `docs/client-configuration.md` to point clients at it, and `deploy/README.md`

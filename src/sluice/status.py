@@ -59,6 +59,7 @@ class StatusSnapshot:
     ready: bool
     gate_closed_reason: str
     config: dict[str, Any]
+    penalty_started_at: float | None
 
     # Request-window budget (umans Code Pro: limits.requests + usage.requests_in_window)
     requests_in_window: int | None
@@ -119,6 +120,7 @@ class StatusSnapshot:
             "ready": self.ready,
             "gate_closed_reason": self.gate_closed_reason,
             "config": self.config,
+            "penalty_started_at": self.penalty_started_at,
             "requests_in_window": self.requests_in_window,
             "requests_limit": self.requests_limit,
             "requests_remaining": self.requests_remaining,
@@ -201,6 +203,7 @@ def snapshot(
             "provider": reconcile.provider_name,
             "controller": reconcile.controller_name,
         },
+        penalty_started_at=reconcile.penalty_started_at,
         requests_in_window=reading.requests_in_window if reading else None,
         requests_limit=reading.requests_limit if reading else None,
         requests_remaining=reading.requests_remaining if reading else None,
