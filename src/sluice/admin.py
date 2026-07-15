@@ -763,12 +763,11 @@ async def handle_usage_history(
         return
 
     qs = scope.get("query_string", b"").decode("latin-1")
+    parsed = parse_qs(qs)
     params: dict[str, str] = {}
-    if qs:
-        for pair in qs.split("&"):
-            k, _, v = pair.partition("=")
-            if k in ("from", "to", "granularity", "scope"):
-                params[k] = v
+    for key in ("from", "to", "granularity", "scope"):
+        if key in parsed and parsed[key]:
+            params[key] = parsed[key][0]
 
     if "from" not in params or "to" not in params:
         await send_json(send, 400, {"error": "missing required params 'from' and 'to'"}, extra_headers=cors)

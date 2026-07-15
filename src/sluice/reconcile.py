@@ -891,16 +891,25 @@ class ReconciliationLoop:
         """Derive penalty_started_at from the reading when we didn't observe
         the transition (e.g. pod restart mid-penalty).
 
-        The penalty window is a fixed 24h, so start = resets_at - 86400.
+        The penalty window duration depends on the penalty type:
+        - low_interactivity: 24h (86400s)
+        - boxed (hard box): 5h (18000s), per the umans docs
+        - deprioritized (rate_limited): the request window duration
+          (``requests_window_seconds``), defaulting to 5h if unavailable
+
         Uses whichever deadline the reading provides.
         """
-        deadline = (
-            reading.service_mode_resets_at_epoch
-            or reading.resets_at_epoch
-            or reading.boxed_until_epoch
-        )
-        if deadline is not None:
-            return deadline - 86400.0
+        if reading.service_mode_resets_at_epoch is not None:
+            return reading.service_mode_resets_at_epoch - 86400.0
+        if reading.resets_at_epoch is not None:
+            return reading.resets_at_epoch - 18000.0
+        if reading.boxed_until_epoch is not None:
+            duration = (
+                float(reading.requests_window_seconds)
+                if reading.requests_window_seconds is not None
+                else 18000.0
+            )
+            return reading.boxed_until_epoch - duration
         return None
 
     @property

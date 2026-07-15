@@ -4,6 +4,26 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.8] — 2026-07-15
+
+### Fixes
+
+- **Correct per-type penalty duration for `penalty_started_at` derivation.**
+  The 24h assumption was only correct for `low_interactivity`; `boxed`
+  penalties are 5h (18000s) and `rate_limited` (deprioritized) use the
+  request window duration. Now uses the appropriate duration per penalty
+  type when deriving the start time from `resets_at` on pod restart.
+- **Dashboard: prevent concurrent fetch races in penalty tracking.**
+  `initPenaltyTracking` now sets `pState.fetching` to prevent
+  `refreshPenaltyCurrentHour` from running concurrently. Captures the
+  `pState` reference to avoid writing to a stale state if a new penalty
+  event starts while the old init is still fetching.
+- **Dashboard: retry failed "24h before" fetch.** If the initial
+  before-penalty fetch fails (transient network error), it is retried
+  on subsequent refresh cycles instead of permanently showing "-".
+- **Admin: use `parse_qs` for usage-history query params.** Prevents
+  double-encoding when callers URL-encode their query parameters.
+
 ## [1.3.7] — 2026-07-15
 
 ### Fixes

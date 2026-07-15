@@ -346,7 +346,7 @@ key-rotation (sluice exists so you *don't* have to rotate keys or buy a concurre
 4. **In-path but inert.** sluice gates and cancels; it never reads, stores, or rewrites
    request content.
 
-Status: **1.3.7 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
+Status: **1.3.8 — deployed and live** (internal-only, GitOps via ArgoCD); live-validated against
 real streaming agent traffic (opencode → umans on the OpenAI surface: 200s, zero 429s, not
 boxed). See `docs/concurrency-model.md` for the data model,
 `docs/client-configuration.md` to point clients at it, and `deploy/README.md`

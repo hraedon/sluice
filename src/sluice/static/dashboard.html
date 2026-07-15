@@ -621,6 +621,7 @@ var PENALTY_REFRESH_MS=60000;
 var pState={
   start:null,
   before:null,
+  beforeFailed:false,
   sinceCompleted:null,
   currentHour:null,
   lastRefresh:0,
@@ -706,22 +707,29 @@ function renderPenaltyDisplay(){
 }
 
 async function initPenaltyTracking(penaltyStart){
+  var myState=pState;
   var statusEl=document.getElementById('penalty-status');
   if(statusEl) statusEl.textContent='loading usage history...';
+  pState.fetching=true;
 
   // 1) Fetch the 24h before penalty — immutable, fetched once.
-  try{
-    var beforeBuckets=await fetchUsageBuckets(penaltyStart-86400,penaltyStart);
-    pState.before=sumBuckets(beforeBuckets);
-  }catch(e){
-    if(statusEl) statusEl.textContent='before: '+e.message;
-    return;
+  if(!myState.before && !myState.beforeFailed){
+    try{
+      var beforeBuckets=await fetchUsageBuckets(penaltyStart-86400,penaltyStart);
+      if(pState!==myState) return;
+      myState.before=sumBuckets(beforeBuckets);
+    }catch(e){
+      if(pState!==myState) return;
+      myState.beforeFailed=true;
+      if(statusEl) statusEl.textContent='before: '+e.message;
+    }
   }
 
   // 2) Fetch since penalty start to now — split into completed hours + current.
   try{
     var now=Date.now()/1000;
     var sinceBuckets=await fetchUsageBuckets(penaltyStart,now);
+    if(pState!==myState) return;
     var curHour=hourEpoch(now);
     var completed=[],current=[];
     for(var i=0;i<sinceBuckets.length;i++){
@@ -729,15 +737,18 @@ async function initPenaltyTracking(penaltyStart){
       if(bkt<curHour) completed.push(sinceBuckets[i]);
       else current.push(sinceBuckets[i]);
     }
-    pState.sinceCompleted=sumBuckets(completed);
-    pState.currentHour=current.length?sumBuckets(current):{tin:0,tout:0,reqs:0,total:0};
-    pState.currentHour.hour=curHour;
+    myState.sinceCompleted=sumBuckets(completed);
+    myState.currentHour=current.length?sumBuckets(current):{tin:0,tout:0,reqs:0,total:0};
+    myState.currentHour.hour=curHour;
   }catch(e){
+    if(pState!==myState) return;
     if(statusEl) statusEl.textContent='since: '+e.message;
+    pState.fetching=false;
     return;
   }
 
-  pState.lastRefresh=Date.now();
+  myState.lastRefresh=Date.now();
+  pState.fetching=false;
   if(statusEl) statusEl.textContent='';
   renderPenaltyDisplay();
 }
@@ -794,21 +805,25 @@ function renderPenaltySection(d){
     sec.style.display='block';
     if(pState.start!==psa){
       // New penalty event — reset and initialise.
-      pState={start:psa,before:null,sinceCompleted:null,currentHour:null,
-              lastRefresh:0,fetching:false};
+      pState={start:psa,before:null,beforeFailed:false,sinceCompleted:null,
+              currentHour:null,lastRefresh:0,fetching:false};
       initPenaltyTracking(psa);
-    }else{
-      // Same penalty event — refresh only the current hour if due.
-      if(Date.now()-pState.lastRefresh>=PENALTY_REFRESH_MS){
+    }else if(!pState.fetching){
+      // Same penalty event — retry before-fetch if it failed, or refresh current hour.
+      if(pState.beforeFailed && !pState.before){
+        initPenaltyTracking(psa);
+      }else if(Date.now()-pState.lastRefresh>=PENALTY_REFRESH_MS){
         refreshPenaltyCurrentHour();
       }else{
         renderPenaltyDisplay();
       }
+    }else{
+      renderPenaltyDisplay();
     }
   }else{
     sec.style.display='none';
-    pState={start:null,before:null,sinceCompleted:null,currentHour:null,
-            lastRefresh:0,fetching:false};
+    pState={start:null,before:null,beforeFailed:false,sinceCompleted:null,
+            currentHour:null,lastRefresh:0,fetching:false};
   }
 }
 
