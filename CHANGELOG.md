@@ -4,6 +4,17 @@ All notable changes to sluice are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.7] — 2026-07-15
+
+### Fixes
+
+- **`penalty_started_at` was reset to pod start time on restart.** The
+  in-memory penalty-start timestamp was lost when the pod restarted,
+  causing the dashboard to show "5m ago" for a penalty that had been
+  active for hours. Now derived from the reading's `resets_at` minus
+  the 24h penalty window when the transition wasn't observed (pod
+  restart mid-penalty), so the dashboard shows the real penalty age.
+
 ## [1.3.6] — 2026-07-15
 
 ### Added

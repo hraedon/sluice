@@ -34,6 +34,7 @@ from sluice.control import (
     BreakerState,
     ControllerConfig,
     ControllerState,
+    LimitState,
     AdaptiveConfig,
     AdaptiveSnapshot,
     classify_band,
@@ -462,11 +463,19 @@ class ReconciliationLoop:
         # Penalty event tracking: record when the account first enters a
         # penalty band (LOW, BOXED, LOW_INTERACTIVITY).  Cleared when the
         # account returns to NORMAL or REJECT (REJECT is transient — above
-        # hard_cap but not yet boxed — so it doesn't count as a penalty event).
+        # hard_cap, but not yet boxed — so it doesn't count as a penalty event).
+        #
+        # On pod restart, _prev_in_penalty defaults to False, so the first
+        # tick where the band is already a penalty state looks like a fresh
+        # transition.  Instead of using now, derive the start from the
+        # reading's deadline (resets_at - 24h) so the dashboard shows the
+        # real penalty age, not the pod's uptime.
         _PENALTY_BANDS = frozenset({Band.LOW, Band.BOXED, Band.LOW_INTERACTIVITY})
         in_penalty = self._last_band in _PENALTY_BANDS
         if in_penalty and not self._prev_in_penalty:
-            self._penalty_started_at = now_wall
+            self._penalty_started_at = (
+                self._derive_penalty_start(reading) or now_wall
+            )
         elif not in_penalty:
             self._penalty_started_at = None
         self._prev_in_penalty = in_penalty
@@ -877,6 +886,22 @@ class ReconciliationLoop:
     def is_idle(self) -> bool:
         """True when the system was idle at the last tick (WI-022)."""
         return self._idle
+
+    def _derive_penalty_start(self, reading: LimitState) -> float | None:
+        """Derive penalty_started_at from the reading when we didn't observe
+        the transition (e.g. pod restart mid-penalty).
+
+        The penalty window is a fixed 24h, so start = resets_at - 86400.
+        Uses whichever deadline the reading provides.
+        """
+        deadline = (
+            reading.service_mode_resets_at_epoch
+            or reading.resets_at_epoch
+            or reading.boxed_until_epoch
+        )
+        if deadline is not None:
+            return deadline - 86400.0
+        return None
 
     @property
     def penalty_started_at(self) -> float | None:
