@@ -28,8 +28,9 @@ adheres to [Semantic Versioning](https://semver.org/).
     values above 60 s). An upstream-supplied `Retry-After` is never overridden,
     and the response body is never modified (inert in-path, Rule 3).
   - **Dashboard:** a low-interactivity banner with a live countdown, 503
-    sparkline ticks, and stat/tooltip fields. The 503 legend entry is hidden
-    until the first 503 appears, so it doesn't clutter an idle chart.
+    sparkline ticks, and stat/tooltip fields. The low_interactivity band ribbon
+    is suppressed unless a 503 appears in the visible range, so the flat yellow
+    penalty line doesn't clutter an idle chart; the 503 legend entry always shows.
   - The band does **not** change `effective_permits` — the provider is still
     serving, so a direct sluice user keeps getting service instead of a blanket
     503 for the whole window. (switchboard, which has an alternate provider, is
