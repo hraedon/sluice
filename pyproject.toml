@@ -10,7 +10,7 @@ license = { text = "MIT" }
 # import-boundary test. These runtime deps belong to the proxy/usage SHELL only.
 dependencies = [
     "httpx>=0.27",      # upstream client + /v1/usage poller
-    "uvicorn>=0.50.2",    # ASGI server (the proxy is hand-rolled raw ASGI — no framework)
+    "uvicorn>=0.51.0",    # ASGI server (the proxy is hand-rolled raw ASGI — no framework)
 ]
 
 [project.optional-dependencies]
