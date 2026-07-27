@@ -170,6 +170,54 @@ async def test_kube_renew_success():
     assert guard.is_held() is True
 
 
+async def test_kube_renew_recovers_from_401_via_token_refresh(tmp_path, monkeypatch):
+    """Regression: on stock k8s the projected service-account token is ~1h; the
+    cached client's bearer expires and renew() would 401. The kubelet refreshes
+    the token file in place, so re-reading it + recreating the client must
+    recover within one retry. Without the refresh, renew() death-loops on 401
+    and the guard sheds leadership permanently once the token expires.
+    """
+    token_file = tmp_path / "token"
+    token_file.write_text("stale-token")
+    monkeypatch.setattr("sluice.singleton._TOKEN_PATH", str(token_file))
+
+    lease = {
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {"name": "sluice", "namespace": "default", "resourceVersion": "1"},
+        "spec": {
+            "holderIdentity": "pod-1",
+            "leaseDurationSeconds": 30,
+            "renewTime": _rfc3339(datetime.now(UTC)),
+            "acquireTime": _rfc3339(datetime.now(UTC)),
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Stale token → 401, and simulate kubelet having rotated the file.
+        if request.headers.get("Authorization") == "Bearer stale-token":
+            token_file.write_text("fresh-token")
+            return httpx.Response(401)
+        # Fresh token → behave as a healthy API for our holder.
+        if request.method == "GET":
+            return httpx.Response(200, json=lease)
+        return httpx.Response(200, json=lease)  # PUT
+
+    guard = KubeLeaseGuard(
+        identity="pod-1",
+        transport=httpx.MockTransport(handler),
+    )
+    # Simulate an already-held pod whose cached token has just expired.
+    guard._held = True
+    guard._mark_renewed()
+
+    assert await guard.renew() is True
+    assert guard.is_held() is True
+    # Proves the token file was actually re-read: the retry only succeeded
+    # because _invalidate_client + _ensure_client picked up the rotated token.
+    assert token_file.read_text() == "fresh-token"
+
+
 async def test_kube_renew_failure_flips_held():
     """If renew PUT fails, is_held() flips to False."""
     now = datetime.now(UTC)

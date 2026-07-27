@@ -128,6 +128,7 @@ class KubeLeaseGuard(SingletonGuard):
         lease_duration_seconds: int = 30,
         renew_interval: float = 10.0,
         client: httpx.AsyncClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if renew_interval >= lease_duration_seconds:
@@ -143,6 +144,7 @@ class KubeLeaseGuard(SingletonGuard):
         self._held = False
         self._client = client
         self._owns_client = client is None
+        self._transport = transport
         self._renewer_task: asyncio.Task[None] | None = None
         self._mono = monotonic_clock
         self._last_renewed_mono: float | None = None
@@ -171,9 +173,47 @@ class KubeLeaseGuard(SingletonGuard):
                 headers={"Authorization": f"Bearer {token}"},
                 verify=_CA_CERT_PATH,
                 timeout=10.0,
+                transport=self._transport,
             )
             self._owns_client = True
         return self._client
+
+    async def _invalidate_client(self) -> None:
+        """Drop the cached client so the next ``_ensure_client`` re-reads the
+        service-account token. The kubelet refreshes the projected token file
+        in place (default-k8s ~1h tokens), so on token expiry a re-read picks up
+        the fresh token. Only acts when we own the client — a caller-injected
+        client manages its own auth.
+        """
+        if not self._owns_client:
+            return
+        if self._client is not None and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                log.debug("KubeLeaseGuard: error closing client for token refresh", exc_info=True)
+        self._client = None
+
+    async def _send(
+        self, method: str, url: str, *, json: dict[str, object] | None = None
+    ) -> httpx.Response:
+        """HTTP call with one token-refresh retry on 401.
+
+        On clusters with short-lived projected tokens (k8s default ~1h), the
+        cached client's bearer can expire while the lease is still otherwise
+        valid. Rather than death-loop on 401 (the old behaviour shed leadership
+        permanently once the token expired), re-read the refreshed token and
+        retry the call once. Non-401 failures fall through unchanged; callers
+        still treat any non-200 as lost leadership (fail-safe).
+        """
+        client = await self._ensure_client()
+        resp = await client.request(method, url, json=json)
+        if resp.status_code == 401 and self._owns_client:
+            log.info("KubeLeaseGuard: 401 from API — refreshing service-account token")
+            await self._invalidate_client()
+            client = await self._ensure_client()
+            resp = await client.request(method, url, json=json)
+        return resp
 
     def _lease_body(self, now: str) -> dict[str, object]:
         return {
@@ -189,14 +229,13 @@ class KubeLeaseGuard(SingletonGuard):
         }
 
     async def acquire(self) -> bool:
-        client = await self._ensure_client()
         now = _now_rfc3339()
 
         try:
-            resp = await client.get(self._lease_url)
+            resp = await self._send("GET", self._lease_url)
 
             if resp.status_code == 404:
-                resp = await client.post(self._base_url, json=self._lease_body(now))
+                resp = await self._send("POST", self._base_url, json=self._lease_body(now))
                 if resp.status_code in (200, 201):
                     self._held = True
                     self._mark_renewed()
@@ -229,7 +268,7 @@ class KubeLeaseGuard(SingletonGuard):
                     # PUT includes metadata.resourceVersion from the
                     # GET, so a concurrent take-over by another pod
                     # results in 409 Conflict.
-                    resp = await client.put(self._lease_url, json=existing)
+                    resp = await self._send("PUT", self._lease_url, json=existing)
                     if resp.status_code == 200:
                         self._held = True
                         self._mark_renewed()
@@ -258,11 +297,10 @@ class KubeLeaseGuard(SingletonGuard):
         if not self._held:
             return False
 
-        client = await self._ensure_client()
         now = _now_rfc3339()
 
         try:
-            resp = await client.get(self._lease_url)
+            resp = await self._send("GET", self._lease_url)
             if resp.status_code != 200:
                 log.warning("KubeLeaseGuard: renew GET failed: %d", resp.status_code)
                 self._held = False
@@ -280,7 +318,7 @@ class KubeLeaseGuard(SingletonGuard):
             # write with 409 Conflict if another pod modified the lease
             # between our GET and PUT — the TOCTOU window is closed.
             lease["spec"]["renewTime"] = now
-            resp = await client.put(self._lease_url, json=lease)
+            resp = await self._send("PUT", self._lease_url, json=lease)
             if resp.status_code == 409:
                 log.info("KubeLeaseGuard: lost lease (resourceVersion conflict)")
                 self._held = False
