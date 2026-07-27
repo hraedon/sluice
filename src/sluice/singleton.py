@@ -165,7 +165,7 @@ class KubeLeaseGuard(SingletonGuard):
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            token = Path(_TOKEN_PATH).read_text().strip()
+            token = (await asyncio.to_thread(Path(_TOKEN_PATH).read_text)).strip()
             self._client = httpx.AsyncClient(
                 base_url=_API_BASE,
                 headers={"Authorization": f"Bearer {token}"},

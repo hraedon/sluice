@@ -43,7 +43,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-async def _wait_for(url: str, timeout: float = 10.0) -> None:
+async def _wait_for(url: str, timeout: float = 10.0) -> None:  # noqa: ASYNC109
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:

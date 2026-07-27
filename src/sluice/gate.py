@@ -89,7 +89,7 @@ class PermitGate:
         shared_avail = max(0, shared_cap - held_non_reserved)
         return min(total, shared_avail)
 
-    async def acquire(self, *, timeout: float, reserved: bool = False) -> bool:
+    async def acquire(self, *, timeout: float, reserved: bool = False) -> bool:  # noqa: ASYNC109
         """Try to acquire a permit.  Returns *True* on success, *False* on timeout.
 
         If ``reserved`` is *True* and the gate has a reserve configured, the
