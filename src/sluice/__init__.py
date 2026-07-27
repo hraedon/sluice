@@ -4,7 +4,8 @@ The deterministic decision logic lives in :mod:`sluice.control` and is stdlib-on
 The async proxy/usage/CLI shell imports the core, never the reverse.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 try:
     # Single source of truth: the installed package metadata (from pyproject).

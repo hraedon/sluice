@@ -21,7 +21,6 @@ from sluice.proxy import ProxyApp, _classify_429
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-
 # ---------------------------------------------------------------------------
 # Test helpers
 # ---------------------------------------------------------------------------
@@ -952,8 +951,8 @@ async def test_readyz_stays_503_after_failed_tick():
     app, _, reconcile = _make_app(first_poll_ok=False)
 
     # Simulate a failed tick by directly setting a non-ok cached reading.
-    from sluice.usage import CachedReading
     from sluice.control import UsageReading
+    from sluice.usage import CachedReading
 
     reconcile._last_reading_cached = CachedReading(
         reading=UsageReading(concurrent_sessions=8, limit=4, hard_cap=8, priority_low=True),
@@ -1049,6 +1048,7 @@ async def test_dashboard_renders_half_open_age():
     conditional, and uses the age value in the banner text construction.
     """
     import time as time_mod
+
     from sluice.control import BreakerSnapshot, BreakerState
 
     app, _, reconcile = _make_app()
@@ -1350,8 +1350,7 @@ async def test_fast_fail_on_boxed():
 
 async def test_fast_fail_on_breaker():
     """When breaker is open, the proxy returns 503 immediately."""
-    from sluice.control import BreakerState
-    from sluice.control import BreakerSnapshot
+    from sluice.control import BreakerSnapshot, BreakerState
 
     app, _, reconcile = _make_app(queue_timeout=30.0)
 
@@ -2294,7 +2293,7 @@ async def test_backpressure_real():
 
     class _GatedTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            async for chunk in request.stream:
+            async for _chunk in request.stream:
                 transport_waiting.set()
                 await chunk_consumed.wait()
                 chunk_consumed.clear()
@@ -2781,7 +2780,7 @@ class _CancelSurvivingTransport(httpx.AsyncBaseTransport):
         self.stream: _TrackableByteStream | None = None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        async for chunk in request.stream:
+        async for _chunk in request.stream:
             pass
         try:
             await asyncio.sleep(0.1)
@@ -2857,12 +2856,12 @@ class _CancelThenErrorTransport(httpx.AsyncBaseTransport):
     """
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        async for chunk in request.stream:
+        async for _chunk in request.stream:
             pass
         try:
             await asyncio.sleep(0.1)
         except asyncio.CancelledError:
-            raise httpx.ConnectError("different error after cancellation")
+            raise httpx.ConnectError("different error after cancellation") from None
 
 
 class _StreamCMTracker:
@@ -2960,7 +2959,7 @@ async def test_502_on_upstream_request_error():
 
     class _ErrorTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            async for chunk in request.stream:
+            async for _chunk in request.stream:
                 pass
             raise httpx.ConnectError("connection refused")
 

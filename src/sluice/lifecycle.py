@@ -27,12 +27,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import TYPE_CHECKING, Any
-
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import httpx
+
     from sluice.gate import PermitGate
     from sluice.reconcile import ReconciliationLoop
     from sluice.singleton import SingletonGuard
@@ -197,7 +197,7 @@ class LifecycleManager:
                     if self._owns_client:
                         await self._client.aclose()
                     await send({"type": "lifespan.shutdown.complete"})
-                    return
+                    return  # noqa: B012 (intentional: swallow CancelledError during shutdown)
 
     async def _retry_acquire(self) -> None:
         """Periodically retry lease acquisition when the initial acquire failed."""

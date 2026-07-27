@@ -28,10 +28,10 @@ import httpx
 
 from sluice.admin import (
     Receive,
-    Send,
     Scope,
-    cors_extra_headers,
+    Send,
     check_admin_auth,
+    cors_extra_headers,
     handle_config_delete,
     handle_config_post,
     handle_healthz,
@@ -54,16 +54,16 @@ from sluice.admin import (
 from sluice.gate import PermitGate
 from sluice.lifecycle import LifecycleManager
 from sluice.metrics import ClientMetrics
-from sluice.reconcile import ReconciliationLoop, RETRY_AFTER_SHORT
-from sluice.session import LoginThrottle
+from sluice.reconcile import RETRY_AFTER_SHORT, ReconciliationLoop
 from sluice.session import SESSION_COOKIE as _SESSION_COOKIE
+from sluice.session import LoginThrottle
 from sluice.singleton import SingletonGuard
 from sluice.trust import peer_is_trusted
 
 log = logging.getLogger("sluice.proxy")
 
 
-async def _cancel_task(task: "asyncio.Future[Any]") -> None:
+async def _cancel_task(task: asyncio.Future[Any]) -> None:
     """Cancel a racing task and await it, swallowing the fallout.
 
     Used to tear down the read/disconnect tasks in the streaming loop

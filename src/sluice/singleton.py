@@ -20,7 +20,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -56,10 +56,10 @@ class SingletonGuard(abc.ABC):
     async def release(self) -> None:
         """Release the claim."""
 
-    async def start_renewer(self) -> None:
+    async def start_renewer(self) -> None:  # noqa: B027 (optional hook; default no-op)
         """Start a background renewal task (no-op for guards that don't need it)."""
 
-    async def stop_renewer(self) -> None:
+    async def stop_renewer(self) -> None:  # noqa: B027 (optional hook; default no-op)
         """Stop the background renewal task (no-op for guards that don't need it)."""
 
 
@@ -91,7 +91,7 @@ class NoopGuard(SingletonGuard):
 
 
 def _now_rfc3339() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
 
 
 def _parse_rfc3339(value: str) -> float:

@@ -12,6 +12,7 @@ import time
 
 import httpx
 import pytest
+from test_proxy import _asgi_client, _make_app
 
 from sluice.admin import (
     _build_set_cookie,
@@ -22,8 +23,6 @@ from sluice.admin import (
 )
 from sluice.proxy import _SESSION_COOKIE
 from sluice.session import LoginThrottle, mint_session
-from test_proxy import _asgi_client, _make_app
-
 
 # ---------------------------------------------------------------------------
 # Session cookie auth in check_admin_auth
@@ -676,7 +675,7 @@ class TestNonAsciiRegression:
             "method": "GET",
             "path": "/status.json",
             "query_string": b"",
-            "headers": [(b"cookie", "sluice_session=9999999999.café".encode("utf-8"))],
+            "headers": [(b"cookie", "sluice_session=9999999999.café".encode())],
         }
         await app(scope, receive, send)
         start = [e for e in sent_events if e["type"] == "http.response.start"]
@@ -700,7 +699,7 @@ class TestNonAsciiRegression:
             "method": "GET",
             "path": "/",
             "query_string": b"",
-            "headers": [(b"cookie", "sluice_session=9999999999.日本語".encode("utf-8"))],
+            "headers": [(b"cookie", "sluice_session=9999999999.日本語".encode())],
         }
         await app(scope, receive, send)
         start = [e for e in sent_events if e["type"] == "http.response.start"]

@@ -21,14 +21,14 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs
 
 import httpx
 
 from sluice import __version__
 from sluice.reconcile import RETRY_AFTER_SHORT
-from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
+from sluice.session import SESSION_COOKIE, LoginThrottle, mint_session, verify_session
 from sluice.status import snapshot as status_snapshot
 from sluice.status import to_prometheus
 from sluice.trust import forwarded_proto_https

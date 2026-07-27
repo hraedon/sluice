@@ -5,7 +5,6 @@ Pure unit tests: no network, no clock — ``now`` is supplied.
 
 from __future__ import annotations
 
-
 from sluice.control import (
     AdaptiveConfig,
     AdaptiveSnapshot,

@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
 from sluice.singleton import KubeLeaseGuard, NoopGuard, SingletonGuard
-
 
 # ---------------------------------------------------------------------------
 # NoopGuard
@@ -77,8 +76,8 @@ class FakeLeaseAPI:
                 "spec": {
                     "holderIdentity": holder,
                     "leaseDurationSeconds": lease_duration,
-                    "renewTime": _rfc3339(renew_time or datetime.now(timezone.utc)),
-                    "acquireTime": _rfc3339(renew_time or datetime.now(timezone.utc)),
+                    "renewTime": _rfc3339(renew_time or datetime.now(UTC)),
+                    "acquireTime": _rfc3339(renew_time or datetime.now(UTC)),
                 },
             }
         self.deleted = False
@@ -139,7 +138,7 @@ async def test_kube_acquire_when_free():
 
 
 async def test_kube_refuse_when_held_by_live_peer():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-2", renew_time=now, lease_duration=300)
     guard = _make_guard(api, identity="pod-1")
     assert await guard.acquire() is False
@@ -147,7 +146,7 @@ async def test_kube_refuse_when_held_by_live_peer():
 
 
 async def test_kube_reacquire_after_peer_expired():
-    old = datetime.now(timezone.utc) - timedelta(seconds=600)
+    old = datetime.now(UTC) - timedelta(seconds=600)
     api = FakeLeaseAPI(holder="pod-2", renew_time=old, lease_duration=30)
     guard = _make_guard(api, identity="pod-1")
     assert await guard.acquire() is True
@@ -155,7 +154,7 @@ async def test_kube_reacquire_after_peer_expired():
 
 
 async def test_kube_already_held_by_us():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
     guard = _make_guard(api, identity="pod-1")
     assert await guard.acquire() is True
@@ -163,7 +162,7 @@ async def test_kube_already_held_by_us():
 
 
 async def test_kube_renew_success():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
     guard = _make_guard(api, identity="pod-1")
     await guard.acquire()
@@ -173,7 +172,7 @@ async def test_kube_renew_success():
 
 async def test_kube_renew_failure_flips_held():
     """If renew PUT fails, is_held() flips to False."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
 
     # Override PUT to return 409 (conflict).
@@ -204,7 +203,7 @@ async def test_kube_renew_failure_flips_held():
 
 async def test_kube_renew_held_by_another_flips_held():
     """If another pod grabbed the lease, renew detects it and flips."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
     guard = _make_guard(api, identity="pod-1")
     await guard.acquire()
@@ -217,7 +216,7 @@ async def test_kube_renew_held_by_another_flips_held():
 
 
 async def test_kube_release_deletes_lease():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
     guard = _make_guard(api, identity="pod-1")
     await guard.acquire()
@@ -328,7 +327,7 @@ def test_kube_renew_interval_greater_than_lease_duration_rejected():
 
 async def test_kube_renew_loop_reacquires_after_loss():
     """When renew() fails and _held goes False, _renew_loop re-acquires."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
 
     original_handler = api.handler

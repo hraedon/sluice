@@ -20,7 +20,6 @@ from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -341,7 +340,7 @@ async def test_multiple_ticks_write_to_store():
         loop, client, gate, m, w, history, store = _make_loop_with_store(
             _reading(concurrent_sessions=2), tmp
         )
-        for i in range(5):
+        for _i in range(5):
             m[0] += 5
             w[0] += 5
             await loop.tick()

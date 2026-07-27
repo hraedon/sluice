@@ -28,6 +28,8 @@ from collections.abc import Callable
 from typing import Any
 
 from sluice.control import (
+    AdaptiveConfig,
+    AdaptiveSnapshot,
     Band,
     BreakerConfig,
     BreakerSnapshot,
@@ -35,13 +37,11 @@ from sluice.control import (
     ControllerConfig,
     ControllerState,
     LimitState,
-    AdaptiveConfig,
-    AdaptiveSnapshot,
-    classify_band,
     adaptive_effective_permits,
     breaker_on_429,
     breaker_on_success,
     breaker_on_tick,
+    classify_band,
     effective_permits,
     is_hard_boxed,
     is_low_interactivity,
@@ -607,7 +607,7 @@ class ReconciliationLoop:
             self._poll_now.clear()
             try:
                 await asyncio.wait_for(self._poll_now.wait(), timeout=interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def _record_failed_tick(self) -> None:

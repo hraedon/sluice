@@ -144,7 +144,7 @@ async def test_disconnect_cancels_upstream_with_real_connections():
                     if event["type"] == "http.disconnect":
                         upstream_terminated.set()
                         return
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         except (Exception, asyncio.CancelledError):
             upstream_terminated.set()

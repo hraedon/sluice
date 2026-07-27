@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from sluice.control import (
+    AdaptiveConfig,
+    AdaptiveSnapshot,
     Band,
     BreakerConfig,
     BreakerSnapshot,
@@ -13,19 +15,17 @@ from sluice.control import (
     ControllerState,
     LimitState,
     UsageReading,
-    AdaptiveConfig,
-    AdaptiveSnapshot,
+    adaptive_effective_permits,
+    breaker_on_429,
+    breaker_on_success,
+    breaker_on_tick,
     classify_band,
     effective_permits,
     is_low_interactivity,
     phantom_estimate,
     phantom_estimate_instant,
-    breaker_on_429,
-    breaker_on_success,
-    breaker_on_tick,
-    adaptive_effective_permits,
-    validate_target_override,
     saturation_retry_after,
+    validate_target_override,
 )
 
 NOW = 1_000_000.0
@@ -627,7 +627,7 @@ def test_limit_state_is_frozen():
     ls = LimitState(concurrent_sessions=3)
     try:
         ls.concurrent_sessions = 5  # type: ignore[misc]
-        assert False, "should have raised FrozenInstanceError"
+        raise AssertionError("should have raised FrozenInstanceError")
     except Exception:
         pass
 

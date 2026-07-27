@@ -20,7 +20,7 @@ from enum import Enum
 # ---------------------------------------------------------------------------
 
 
-class Band(str, Enum):
+class Band(str, Enum):  # noqa: UP042 (StrEnum changes str()/repr semantics)
     """Where observed concurrency sits on the provider's enforcement ladder."""
 
     NORMAL = "normal"  # <= limit
@@ -30,7 +30,7 @@ class Band(str, Enum):
     LOW_INTERACTIVITY = "low_interactivity"  # service_mode penalty (distinct from concurrency)
 
 
-class BreakerState(str, Enum):
+class BreakerState(str, Enum):  # noqa: UP042 (StrEnum changes str()/repr semantics)
     CLOSED = "closed"  # normal
     OPEN = "open"  # backing off; gate closed
     HALF_OPEN = "half_open"  # probing recovery

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from sluice.cli import _resolve, _DEFAULTS
+from sluice.cli import _DEFAULTS, _resolve
 
 
 def _make_args(**overrides) -> object:

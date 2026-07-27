@@ -340,7 +340,7 @@ def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]
         try:
             reserve_count = int(count_str)
         except ValueError:
-            raise _ConfigError(f"--reserve count must be an integer, got '{count_str}'")
+            raise _ConfigError(f"--reserve count must be an integer, got '{count_str}'") from None
         reserved_labels = {label}
 
     log_format = _resolve("log_format", args)

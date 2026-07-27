@@ -39,6 +39,14 @@ packages = ["src/sluice"]
 line-length = 100
 target-version = "py312"
 
+# Explicit select so the lint gate is stable across ruff releases (ruff 0.16
+# expanded its built-in default rule set, which broke CI). Matches the
+# cert-watch / adcs-lens / gpo-lens family convention: E-core + F + I + UP + B.
+# E4/E7/E9 (not full E) excludes E501 — line length is governed by line-length
+# above, not the linter.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

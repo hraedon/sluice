@@ -30,7 +30,6 @@ from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -223,8 +222,9 @@ async def test_proxy_records_headers_on_429():
 
 async def test_polled_truth_source_ignores_response_headers():
     """For umans (polled truth), record_response_headers is a no-op."""
-    from sluice.providers import PolledTruthSource
     import httpx
+
+    from sluice.providers import PolledTruthSource
 
     ts = PolledTruthSource(
         base_url="https://api.example.com",

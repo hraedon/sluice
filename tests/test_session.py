@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sluice.session import LoginThrottle, SESSION_COOKIE, mint_session, verify_session
+from sluice.session import SESSION_COOKIE, LoginThrottle, mint_session, verify_session
 
 NOW = 1_700_000_000.0
 TOKEN = "a" * 64  # 64 hex chars, matching the real admin token shape
@@ -227,7 +227,7 @@ def test_throttle_retry_after_zero_when_not_locked():
 
 def test_throttle_retry_after_positive_when_locked():
     t = LoginThrottle(max_failures=10, lockout_seconds=300)
-    for i in range(10):
+    for _i in range(10):
         t.record_failure(now=0.0)
     ra = t.retry_after(now=100)
     assert ra > 0

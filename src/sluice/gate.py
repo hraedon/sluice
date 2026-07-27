@@ -119,7 +119,7 @@ class PermitGate:
                         return False
                     try:
                         await asyncio.wait_for(self._cond.wait(), timeout=remaining)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         self._timeouts += 1
                         return False
                 self._held += 1

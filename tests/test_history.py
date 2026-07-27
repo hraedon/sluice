@@ -18,7 +18,6 @@ from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
 
-
 # ---------------------------------------------------------------------------
 # Unit tests: HistoryEntry
 # ---------------------------------------------------------------------------
@@ -201,12 +200,12 @@ def test_history_maxlen_property():
 def test_history_rejects_invalid_maxlen():
     try:
         History(maxlen=0)
-        assert False, "should have raised"
+        raise AssertionError("should have raised")
     except ValueError:
         pass
     try:
         History(maxlen=-1)
-        assert False, "should have raised"
+        raise AssertionError("should have raised")
     except ValueError:
         pass
 
@@ -343,7 +342,7 @@ async def test_multiple_ticks_accumulate_history():
     loop, client, gate, m, w, history = _make_loop_with_history(
         _reading(concurrent_sessions=2)
     )
-    for i in range(5):
+    for _i in range(5):
         m[0] += 5
         w[0] += 5
         await loop.tick()
@@ -400,7 +399,7 @@ async def test_history_eviction_at_maxlen():
     loop, client, gate, m, w, history = _make_loop_with_history(
         _reading(concurrent_sessions=0), maxlen=3
     )
-    for i in range(5):
+    for _i in range(5):
         m[0] += 5
         w[0] += 5
         await loop.tick()

@@ -30,7 +30,6 @@ from sluice.reconcile import ReconciliationLoop
 from sluice.trust import forwarded_proto_https, parse_trusted_proxies, peer_is_trusted
 from sluice.usage import CachedReading
 
-
 # ---------------------------------------------------------------------------
 # Test helpers (mirrors test_proxy.py's helpers but self-contained)
 # ---------------------------------------------------------------------------
@@ -817,7 +816,7 @@ class TestMigrationHardening:
 
     def test_existing_columns_introspection(self, tmp_path):
         """_existing_columns returns the right column names from an existing table."""
-        from sluice.history_store import _existing_columns, _CREATE_TABLE
+        from sluice.history_store import _CREATE_TABLE, _existing_columns
         db = tmp_path / "test.db"
         conn = sqlite3.connect(str(db))
         conn.execute(_CREATE_TABLE)
@@ -838,7 +837,7 @@ class TestMigrationHardening:
 
     def test_migration_skips_existing_columns(self, tmp_path):
         """The migration loop does not re-ALTER columns that already exist."""
-        from sluice.history_store import SQLiteHistoryStore, _MIGRATIONS, _existing_columns
+        from sluice.history_store import _MIGRATIONS, SQLiteHistoryStore, _existing_columns
         db = tmp_path / "test.db"
         # Create the table WITH all migration columns already present.
         conn = sqlite3.connect(str(db))
@@ -865,8 +864,8 @@ class TestMigrationHardening:
     def test_migration_introspection_actually_skips(self, tmp_path):
         """Verify the introspection is exercised (not vacuous): open a store,
         record which migrations ran, then re-open and confirm none ran again."""
-        from sluice.history_store import SQLiteHistoryStore
         import sluice.history_store as hs
+        from sluice.history_store import SQLiteHistoryStore
 
         db = tmp_path / "test.db"
         # First open: CREATE TABLE + all migrations should run.
