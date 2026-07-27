@@ -27,7 +27,7 @@ import httpx
 
 log = logging.getLogger("sluice.singleton")
 
-_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"  # noqa: S105 (path, not a secret)
 _CA_CERT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 _API_BASE = "https://kubernetes.default.svc"
 

@@ -45,13 +45,18 @@ target-version = "py312"
 # E4/E7/E9 (not full E) excludes E501 — line length is governed by line-length
 # above, not the linter.
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ASYNC"]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = [
+    "S110",  # try/except/pass is the fail-safe cleanup idiom throughout the proxy
+]
 
 [tool.ruff.lint.per-file-ignores]
-# Async-lint noise that fires on normal test mechanics: condition polling
-# (ASYNC110), sync setup I/O (ASYNC230), and timeout params on test helpers
-# (ASYNC109). Production async correctness stays enforced under src/.
-"tests/*" = ["ASYNC109", "ASYNC110", "ASYNC230"]
+# Test/script noise: assert + dummy secrets + in-process HTTP (no timeout) +
+# subprocess + bind-all-interfaces are normal test mechanics; ASYNC110/230/109
+# fire on condition-polling and sync setup I/O. Production rules stay enforced
+# under src/ (and src/ is already S113-clean — every httpx call has a timeout).
+"tests/*" = ["ASYNC109", "ASYNC110", "ASYNC230", "S101", "S104", "S105", "S106", "S110", "S113", "S603"]
+"scripts/*" = ["S110", "S603"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -207,7 +207,7 @@ class LifecycleManager:
         while not self._acquired:
             # Jitter (±50%) so multiple non-leader pods retrying after a leader
             # crash don't stampede the apiserver in lockstep.
-            await asyncio.sleep(self._retry_interval * (0.5 + random.random()))
+            await asyncio.sleep(self._retry_interval * (0.5 + random.random()))  # noqa: S311 (jitter, not crypto)
             try:
                 acquired = await guard.acquire()
                 if acquired:
