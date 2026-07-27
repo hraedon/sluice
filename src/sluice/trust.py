@@ -119,3 +119,26 @@ def forwarded_proto_https(scope: Scope, trusted: frozenset[ipaddress.IPv4Network
             first: str = v.decode("latin-1").split(",")[0].strip().lower()
             return first == "https"
     return False
+
+
+def forwarded_client_ip(
+    scope: Scope, trusted: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network]
+) -> str | None:
+    """Return the original client IP from ``X-Forwarded-For`` when the immediate
+    peer is a trusted proxy, else None.
+
+    Used for audit attribution: in the deployed case the direct peer is the
+    ingress, so ``scope['client']`` is the ingress IP and useless for "who
+    performed this admin action". The leftmost ``X-Forwarded-For`` entry is the
+    originating client. The header is honoured only when the peer is trusted
+    (same spoofing discipline as QoS labels / Secure-cookie): an untrusted peer
+    must not be able to forge an audit identity. Callers fall back to the
+    direct peer IP when this returns None.
+    """
+    if not peer_is_trusted(scope, trusted):
+        return None
+    for k, v in scope.get("headers", []):
+        if k == b"x-forwarded-for":
+            first = v.decode("latin-1").split(",")[0].strip()
+            return first or None
+    return None

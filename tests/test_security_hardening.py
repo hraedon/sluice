@@ -27,7 +27,12 @@ from sluice.control import BreakerConfig, ControllerConfig, UsageReading
 from sluice.gate import PermitGate
 from sluice.proxy import ProxyApp
 from sluice.reconcile import ReconciliationLoop
-from sluice.trust import forwarded_proto_https, parse_trusted_proxies, peer_is_trusted
+from sluice.trust import (
+    forwarded_client_ip,
+    forwarded_proto_https,
+    parse_trusted_proxies,
+    peer_is_trusted,
+)
 from sluice.usage import CachedReading
 
 # ---------------------------------------------------------------------------
@@ -285,6 +290,66 @@ class TestForwardedProtoHttps:
             "headers": [(b"x-forwarded-proto", b"https, http")],
         }
         assert forwarded_proto_https(scope, frozenset()) is True
+
+
+# ---------------------------------------------------------------------------
+# forwarded_client_ip (audit attribution — L-1)
+# ---------------------------------------------------------------------------
+
+
+class TestForwardedClientIp:
+    def test_trusted_peer_returns_leftmost_xff(self):
+        scope = {
+            "client": ("10.0.0.5", 12345),  # the ingress
+            "headers": [(b"x-forwarded-for", b"198.51.100.7, 10.0.0.5")],
+        }
+        trusted = frozenset({ipaddress.ip_network("10.0.0.0/8")})
+        assert forwarded_client_ip(scope, trusted) == "198.51.100.7"
+
+    def test_untrusted_peer_returns_none(self):
+        # A direct (non-ingress) client must not forge an audit identity.
+        scope = {
+            "client": ("203.0.113.9", 12345),
+            "headers": [(b"x-forwarded-for", b"198.51.100.7")],
+        }
+        assert forwarded_client_ip(scope, frozenset()) is None
+
+    def test_no_xff_header_returns_none(self):
+        scope = {"client": ("10.0.0.5", 12345), "headers": []}
+        trusted = frozenset({ipaddress.ip_network("10.0.0.0/8")})
+        assert forwarded_client_ip(scope, trusted) is None
+
+    def test_loopback_trusted_even_without_allowlist(self):
+        scope = {
+            "client": ("127.0.0.1", 12345),
+            "headers": [(b"x-forwarded-for", b"198.51.100.7")],
+        }
+        assert forwarded_client_ip(scope, frozenset()) == "198.51.100.7"
+
+
+class TestExtractRemoteAuditIp:
+    """_extract_remote (admin audit logging) attributes the real client via
+    X-Forwarded-For when the peer is a trusted proxy, else the direct peer."""
+
+    def test_trusted_ingress_uses_forwarded_client(self):
+        from sluice.admin import _extract_remote
+
+        scope = {
+            "client": ("10.0.0.5", 12345),
+            "headers": [(b"x-forwarded-for", b"198.51.100.7")],
+        }
+        trusted = frozenset({ipaddress.ip_network("10.0.0.0/8")})
+        assert _extract_remote(scope, trusted) == "198.51.100.7"
+
+    def test_untrusted_peer_falls_back_to_direct_peer(self):
+        from sluice.admin import _extract_remote
+
+        scope = {
+            "client": ("203.0.113.9", 12345),
+            "headers": [(b"x-forwarded-for", b"198.51.100.7")],
+        }
+        # Without trust, the forged header is ignored — the direct peer is logged.
+        assert _extract_remote(scope, frozenset()) == "203.0.113.9"
 
 
 # ---------------------------------------------------------------------------

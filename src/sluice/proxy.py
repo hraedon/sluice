@@ -338,19 +338,19 @@ class ProxyApp:
         if path == "/admin/config" and scope["method"] == "POST":
             await handle_config_post(
                 send, receive, self._reconcile, self._admin_token, scope, self._guard,
-                self._cors_allow_origin,
+                self._cors_allow_origin, self._trusted_proxies,
             )
             return
         if path == "/admin/config/target" and scope["method"] == "DELETE":
             await handle_config_delete(
                 send, self._reconcile, self._admin_token, scope, self._guard,
-                self._cors_allow_origin,
+                self._cors_allow_origin, self._trusted_proxies,
             )
             return
         if path == "/admin/reload" and scope["method"] == "POST":
             await handle_reload(
                 send, self, self._admin_token, scope, self._guard,
-                self._cors_allow_origin,
+                self._cors_allow_origin, self._trusted_proxies,
             )
             return
 

@@ -31,7 +31,7 @@ from sluice.reconcile import RETRY_AFTER_SHORT
 from sluice.session import SESSION_COOKIE, LoginThrottle, mint_session, verify_session
 from sluice.status import snapshot as status_snapshot
 from sluice.status import to_prometheus
-from sluice.trust import forwarded_proto_https
+from sluice.trust import forwarded_client_ip, forwarded_proto_https
 
 if TYPE_CHECKING:
     from sluice.reconcile import ReconciliationLoop
@@ -402,7 +402,7 @@ async def handle_login_post(
         throttle.record_failure(now)
         log.warning(
             "login failed — remote=%s",
-            _extract_remote(scope),
+            _extract_remote(scope, trusted_proxies),
         )
         await asyncio.sleep(0.2)
         await send_text(
@@ -419,7 +419,7 @@ async def handle_login_post(
     if not _should_set_secure(scope, trusted_proxies):
         log.warning(
             "session cookie set without Secure — plain-HTTP origin (remote=%s)",
-            _extract_remote(scope),
+            _extract_remote(scope, trusted_proxies),
         )
     await send_text(
         send,
@@ -537,8 +537,20 @@ def _extract_audit_user(scope: Scope) -> str:
     return "unknown"
 
 
-def _extract_remote(scope: Scope) -> str:
-    """Extract the client IP from the ASGI scope."""
+def _extract_remote(
+    scope: Scope,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
+) -> str:
+    """Extract the client IP for audit logging.
+
+    Prefers the original client IP from ``X-Forwarded-For`` when the immediate
+    peer is a trusted proxy (the deployed case: traffic enters via the ingress,
+    so ``scope['client']`` is the ingress, not the operator). Falls back to the
+    direct peer IP — which for an unproxied or untrusted peer *is* the client.
+    """
+    forwarded = forwarded_client_ip(scope, trusted_proxies)
+    if forwarded:
+        return forwarded
     client = scope.get("client")
     return client[0] if client else "unknown"
 
@@ -551,6 +563,7 @@ async def handle_config_post(
     scope: Scope,
     guard: SingletonGuard | None = None,
     cors_allow_origin: str | None = None,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
 ) -> None:
     """POST /admin/config — apply a runtime config override.
 
@@ -610,7 +623,7 @@ async def handle_config_post(
         previous = reconcile.target
         reconcile.clear_override("target")
         user = _extract_audit_user(scope)
-        remote = _extract_remote(scope)
+        remote = _extract_remote(scope, trusted_proxies)
         log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
         await send_json(send, 200, {"target": reconcile.target, "overridden": False}, extra_headers=cors)
         return
@@ -627,7 +640,7 @@ async def handle_config_post(
         return
 
     user = _extract_audit_user(scope)
-    remote = _extract_remote(scope)
+    remote = _extract_remote(scope, trusted_proxies)
     log.info(
         "config override: target %d -> %d (user=%s, remote=%s)%s",
         previous,
@@ -650,6 +663,7 @@ async def handle_config_delete(
     scope: Scope,
     guard: SingletonGuard | None = None,
     cors_allow_origin: str | None = None,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
 ) -> None:
     """DELETE /admin/config/target — revert a runtime override."""
     cors = cors_extra_headers(cors_allow_origin, None)
@@ -672,7 +686,7 @@ async def handle_config_delete(
     previous = reconcile.target
     reconcile.clear_override("target")
     user = _extract_audit_user(scope)
-    remote = _extract_remote(scope)
+    remote = _extract_remote(scope, trusted_proxies)
     log.info("config override: target %d -> reverted (user=%s, remote=%s)", previous, user, remote)
     await send_json(send, 200, {"target": reconcile.target, "overridden": False}, extra_headers=cors)
 
@@ -684,6 +698,7 @@ async def handle_reload(
     scope: Scope,
     guard: SingletonGuard | None = None,
     cors_allow_origin: str | None = None,
+    trusted_proxies: frozenset[ipaddress.IPv4Network | ipaddress.IPv6Network] = frozenset(),
 ) -> None:
     """POST /admin/reload — re-read the config file and apply safe changes.
 
@@ -723,7 +738,7 @@ async def handle_reload(
         return
 
     user = _extract_audit_user(scope)
-    remote = _extract_remote(scope)
+    remote = _extract_remote(scope, trusted_proxies)
     if changes:
         log.info("config reloaded (user=%s, remote=%s): %s", user, remote, changes)
     else:
