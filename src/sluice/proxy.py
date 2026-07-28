@@ -211,9 +211,9 @@ def _classify_429(
         # Not a delta-seconds integer — check if it's an HTTP-date
         # (RFC 7231 §7.1.3: "Wed, 21 Oct 2015 07:28:00 GMT").  An
         # HTTP-date retry-after means "retry at this specific time" — a
-        # rate-limit window, not a concurrency rejection.  Both
-        # classifications feed the breaker equally; the distinction is
-        # for telemetry accuracy only (WI-031).
+        # rate-limit window, not a concurrency rejection.  As above:
+        # only ``concurrency`` 429s feed the breaker; ``rate_limit``
+        # 429s must NOT (capture 2026-07-07).
         try:
             parsedate_to_datetime(retry_after.strip())
             return "rate_limit"

@@ -242,6 +242,31 @@ async def test_prometheus_format():
     assert "sluice_total_503s 0" in text
 
 
+async def test_prometheus_client_metrics_including_503():
+    """The live /metrics renderer emits all per-label counters — including
+    sluice_client_overloaded_503, which was collected but dropped (the
+    dead-code ClientMetrics.to_prometheus had it; the live path did not)."""
+    loop = _make_reconcile()
+    await loop.tick()
+
+    client_metrics = {
+        "interactive": {
+            "forwarded": 3,
+            "succeeded": 2,
+            "concurrency_429": 0,
+            "rate_limit_429": 0,
+            "gateway_429": 0,
+            "queue_timeouts": 0,
+            "overloaded_503": 1,
+        }
+    }
+    snap = snapshot(loop, client_metrics=client_metrics)
+    text = to_prometheus(snap)
+
+    assert 'sluice_client_forwarded{label="interactive"} 3' in text
+    assert 'sluice_client_overloaded_503{label="interactive"} 1' in text
+
+
 async def test_prometheus_stale_usage():
     """When the usage poll is stale, sluice_usage_stale must be 1."""
     loop = _make_reconcile(UsageReading(concurrent_sessions=0, limit=4, hard_cap=8))

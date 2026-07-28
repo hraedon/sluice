@@ -295,6 +295,7 @@ def to_prometheus(snap: StatusSnapshot) -> str:
             ("sluice_client_rate_limit_429", "Total rate-limit 429s per client label", "rate_limit_429"),
             ("sluice_client_gateway_429", "Total gateway 429s per client label", "gateway_429"),
             ("sluice_client_queue_timeouts", "Total queue timeouts per client label", "queue_timeouts"),
+            ("sluice_client_overloaded_503", "Total upstream 503s per client label", "overloaded_503"),
         )
         for metric_name, help_text, attr in client_metric_names:
             has_data = any(c.get(attr, 0) > 0 for c in snap.client_metrics.values())

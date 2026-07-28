@@ -330,6 +330,18 @@ def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]
     if drain_timeout is not None and drain_timeout < 0:
         raise _ConfigError("--drain-timeout must be >= 0")
 
+    # Numeric interval validation — mirrors the reload path's guards
+    # (proxy.reload_config).  A non-positive poll interval busy-polls the
+    # provider; a non-positive queue timeout refuses all traffic with 503s;
+    # a non-positive retry interval tight-loops the guard.  Fail fast at
+    # boot rather than discovering these live.
+    if poll_interval is not None and poll_interval <= 0:
+        raise _ConfigError("--poll-interval must be > 0")
+    if queue_timeout is not None and queue_timeout <= 0:
+        raise _ConfigError("--queue-timeout must be > 0")
+    if retry_interval is not None and retry_interval <= 0:
+        raise _ConfigError("--retry-interval must be > 0")
+
     reserve_count = 0
     reserved_labels: set[str] = set()
     if reserve_raw:
@@ -341,6 +353,8 @@ def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]
             reserve_count = int(count_str)
         except ValueError:
             raise _ConfigError(f"--reserve count must be an integer, got '{count_str}'") from None
+        if reserve_count < 0:
+            raise _ConfigError("--reserve count must be >= 0")
         reserved_labels = {label}
 
     log_format = _resolve("log_format", args)
@@ -369,7 +383,12 @@ def _build_serve_app(args: argparse.Namespace) -> tuple[ProxyApp, str, int, str]
         host = host.strip("[]")
     if not host or not port_str:
         raise _ConfigError(f"--listen must be host:port, got '{listen}'")
-    port = int(port_str)
+    try:
+        port = int(port_str)
+    except ValueError:
+        raise _ConfigError(f"--listen port must be an integer, got '{port_str}'") from None
+    if not 1 <= port <= 65535:
+        raise _ConfigError(f"--listen port must be 1..65535, got {port}")
 
     guard: SingletonGuard
     guard_mode = _resolve("singleton_guard", args) or "noop"

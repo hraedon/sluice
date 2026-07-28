@@ -339,6 +339,85 @@ def test_cors_allow_origin_env_passthrough(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Startup validation of numeric config (fail fast, mirroring reload guards)
+# ---------------------------------------------------------------------------
+
+
+def _serve_env(monkeypatch):
+    monkeypatch.setenv("SLUICE_UPSTREAM", "https://api.example.com")
+    monkeypatch.setenv("SLUICE_USAGE_KEY", "test-key")
+    monkeypatch.delenv("SLUICE_CONFIG", raising=False)
+
+
+def test_listen_non_numeric_port_exits_2(monkeypatch, capsys):
+    """--listen host:abc is a clean config error, not a traceback."""
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--listen", "127.0.0.1:abc"])
+    assert rc == 2
+    assert "port" in capsys.readouterr().err.lower()
+
+
+def test_listen_out_of_range_port_exits_2(monkeypatch, capsys):
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--listen", "127.0.0.1:70000"])
+    assert rc == 2
+    assert "port" in capsys.readouterr().err.lower()
+
+
+def test_negative_poll_interval_exits_2(monkeypatch, capsys):
+    """A non-positive poll interval would busy-poll the provider — reject."""
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--poll-interval", "-5"])
+    assert rc == 2
+    assert "poll-interval" in capsys.readouterr().err.lower()
+
+
+def test_zero_queue_timeout_exits_2(monkeypatch, capsys):
+    """A non-positive queue timeout would 503 all traffic — reject."""
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--queue-timeout", "0"])
+    assert rc == 2
+    assert "queue-timeout" in capsys.readouterr().err.lower()
+
+
+def test_negative_retry_interval_exits_2(monkeypatch, capsys):
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--retry-interval", "-2"])
+    assert rc == 2
+    assert "retry-interval" in capsys.readouterr().err.lower()
+
+
+def test_non_positive_poll_interval_idle_disables_backoff(monkeypatch):
+    """WI-022: 0 or negative --poll-interval-idle disables idle backoff
+    (coerced to None), it is not a config error."""
+    _serve_env(monkeypatch)
+    from sluice.cli import _build_serve_app, build_parser
+
+    args = build_parser().parse_args(["serve", "--poll-interval-idle", "-1"])
+    app, _host, _port, _log = _build_serve_app(args)
+    assert app._reconcile._poll_interval_idle_cfg is None
+
+
+def test_negative_reserve_count_exits_2(monkeypatch, capsys):
+    _serve_env(monkeypatch)
+    from sluice.cli import main
+
+    rc = main(["serve", "--reserve", "interactive=-1"])
+    assert rc == 2
+    assert "reserve" in capsys.readouterr().err.lower()
+
+
+# ---------------------------------------------------------------------------
 # TCP keepalive (orphaned-permit fix): dead clients must be detectable
 # ---------------------------------------------------------------------------
 

@@ -194,6 +194,10 @@ class LifecycleManager:
                         await self._guard.stop_renewer()
                         if self._acquired:
                             await self._guard.release()
+                        # Close guard-owned resources (e.g. the kube client)
+                        # even when the singleton was never acquired —
+                        # release() skips cleanup when the claim wasn't held.
+                        await self._guard.close()
                     if self._owns_client:
                         await self._client.aclose()
                     await send({"type": "lifespan.shutdown.complete"})

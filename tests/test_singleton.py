@@ -407,3 +407,62 @@ async def test_kube_renew_loop_reacquires_after_loss():
     assert guard.is_held() is True
 
     await guard.stop_renewer()
+
+
+async def test_kube_close_releases_owned_client_when_never_held(tmp_path, monkeypatch):
+    """Regression: a pod that never became leader leaked its kube client —
+    release() returns early when the claim wasn't held, and the lifecycle
+    only called release() when acquired.  close() must close the owned
+    client regardless of held state."""
+    token_file = tmp_path / "token"
+    token_file.write_text("test-token")
+    monkeypatch.setattr("sluice.singleton._TOKEN_PATH", str(token_file))
+
+    now = datetime.now(UTC)
+    api = FakeLeaseAPI(holder="pod-2", renew_time=now, lease_duration=300)
+    guard = KubeLeaseGuard(
+        lease_name="sluice",
+        namespace="default",
+        identity="pod-1",
+        transport=httpx.MockTransport(api.handler),
+    )
+    # Failed acquire → guard never held the lease, but an owned client was
+    # created by _ensure_client.
+    assert await guard.acquire() is False
+    assert guard.is_held() is False
+    assert guard._client is not None
+    assert not guard._client.is_closed
+
+    await guard.close()
+
+    assert guard._client is None
+
+
+async def test_kube_close_does_not_close_caller_injected_client():
+    """A caller-injected client is managed by its owner — close() must not
+    close it (mirrors _invalidate_client's ownership rule)."""
+    api = FakeLeaseAPI()
+    client = api.make_client()
+    guard = _make_guard(api, identity="pod-1")
+    guard._client = client
+    guard._owns_client = False
+
+    await guard.close()
+
+    assert not client.is_closed
+    await client.aclose()
+
+
+async def test_kube_close_idempotent_after_release():
+    """release() (when held) already closes the client; a following close()
+    must be a safe no-op."""
+    now = datetime.now(UTC)
+    api = FakeLeaseAPI(holder="pod-1", renew_time=now, lease_duration=30)
+    guard = _make_guard(api, identity="pod-1")
+    # _make_guard injects the client → take ownership for this test.
+    guard._owns_client = True
+
+    await guard.acquire()
+    await guard.release()
+    await guard.close()  # must not raise
+    assert guard._client is None

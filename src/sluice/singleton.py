@@ -62,6 +62,12 @@ class SingletonGuard(abc.ABC):
     async def stop_renewer(self) -> None:  # noqa: B027 (optional hook; default no-op)
         """Stop the background renewal task (no-op for guards that don't need it)."""
 
+    async def close(self) -> None:  # noqa: B027 (optional hook; default no-op)
+        """Release any resources held by the guard itself (no-op for guards
+        that hold none).  Called on shutdown regardless of whether the
+        singleton was ever acquired — unlike :meth:`release`, which only
+        acts when the claim was held."""
+
 
 class NoopGuard(SingletonGuard):
     """Default guard — always holds.  For local/dev runs with no cluster."""
@@ -375,6 +381,20 @@ class KubeLeaseGuard(SingletonGuard):
                 pass
             if self._owns_client:
                 await self._client.aclose()
+
+    async def close(self) -> None:
+        """Close the owned HTTP client, if one was created.  A failed
+        ``acquire()`` still creates the client via ``_ensure_client``, and
+        ``release()`` only closes it when the lease was held — so a pod
+        that never became leader would otherwise leak its kube client."""
+        if not self._owns_client:
+            return
+        if self._client is not None and not self._client.is_closed:
+            try:
+                await self._client.aclose()
+            except Exception:
+                log.debug("KubeLeaseGuard: error closing client", exc_info=True)
+        self._client = None
 
     async def start_renewer(self) -> None:
         if self._renewer_task is None:
