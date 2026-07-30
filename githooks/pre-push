@@ -50,6 +50,10 @@ fi
 zero_sha="0000000000000000000000000000000000000000"
 status=0
 
+# remote_ref is named but unused: git's stdin contract is four fields, and naming
+# all four documents the format at the point of use. Silenced explicitly rather
+# than dropped, so the contract stays readable.
+# shellcheck disable=SC2034
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -z "${local_ref:-}" ] && continue
   # A zero local sha is a branch deletion: nothing is being published.
