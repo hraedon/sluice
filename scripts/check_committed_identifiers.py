@@ -33,6 +33,7 @@ import argparse
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -199,21 +200,31 @@ def _is_binary(chunk: bytes) -> bool:
 
 
 def scan_files(
-    identifiers: frozenset[str], paths: list[Path]
-) -> tuple[list[Violation], list[Path]]:
+    identifiers: frozenset[str],
+    paths: list[Path],
+    *,
+    unreadable: list[Path] | None = None,
+) -> list[Violation]:
     """Scan every readable text file in *paths* for forbidden identifiers.
 
     UTF-16 files (common in Windows tooling output) are detected via BOM and
     decoded correctly rather than misclassified as binary by the null-byte
     heuristic.
 
-    Returns ``(violations, unreadable)``. A tracked file the gate could not read
-    is *reported*, not skipped (WI-027): silently skipping an unreadable file
-    lets one containing a forbidden identifier pass, which is precisely the
-    fails-open case this gate exists to prevent.
+    Returns the violations. A tracked file the gate could not read is collected
+    into *unreadable* when a list is supplied (WI-027): silently skipping an
+    unreadable file lets one containing a forbidden identifier pass, which is
+    precisely the fails-open case this gate exists to prevent.
+
+    The out-parameter is deliberate. This script is COPIED into every repo in the
+    estate and several of them test ``scan_files`` directly, so returning a tuple
+    instead of a list broke seven repositories' test suites at once. An optional
+    keyword collector keeps the signature backward compatible while still letting
+    the CLI fail closed on an unreadable file.
     """
     violations: list[Violation] = []
-    unreadable: list[Path] = []
+    if unreadable is None:
+        unreadable = []
     for path in paths:
         # A tracked symlink's blob content is its target path, not file data.
         # Scan the target string without following the link: following it either
@@ -241,7 +252,20 @@ def scan_files(
             continue
         for violation in scan_text(text, identifiers):
             violations.append(replace(violation, path=path))
-    return violations, unreadable
+    return violations
+
+
+def _resolve_git() -> str:
+    """Absolute path to git, or raise GateError.
+
+    A bare name resolves through PATH — a lint finding (ruff S607, selected by
+    several repos in this estate) and a real ambiguity for a gate that is meant to
+    be deterministic.
+    """
+    path = shutil.which("git")
+    if path is None:
+        raise GateError("git is not available on PATH")
+    return path
 
 
 def _run_git(args: list[str]) -> str:
@@ -251,9 +275,10 @@ def _run_git(args: list[str]) -> str:
     (WI-027): a CI gate must fail clean, not emit a CalledProcessError traceback
     that reads as an infrastructure crash rather than a blocked publication.
     """
+    resolved = [_resolve_git(), *args[1:]] if args and args[0] == "git" else args
     try:
         result = subprocess.run(
-            args,
+            resolved,
             capture_output=True,
             text=True,
             check=True,
@@ -461,7 +486,8 @@ def _run(args: argparse.Namespace) -> int:
         return 0
 
     scan_paths = [p for p in paths if not any(part in _SKIP_DIRS for part in p.parts)]
-    violations, unreadable = scan_files(identifiers, scan_paths)
+    unreadable: list[Path] = []
+    violations = scan_files(identifiers, scan_paths, unreadable=unreadable)
     if violations:
         print_report(violations)
         return 1

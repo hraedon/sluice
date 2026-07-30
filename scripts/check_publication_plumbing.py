@@ -138,10 +138,25 @@ def parse_remote_owner(url: str) -> str | None:
     return match.group(1)
 
 
+def _resolve_exe(name: str) -> str:
+    """Absolute path to *name*, or raise PlumbingError.
+
+    Invoking a bare executable name resolves through PATH, which is both a lint
+    finding (ruff S607, selected by several repos in this estate) and a real
+    ambiguity for a guard: the whole point is a deterministic check. Resolving up
+    front also turns "git is missing" into a clean refusal instead of an OSError
+    surfacing from deep inside a subprocess call.
+    """
+    path = shutil.which(name)
+    if path is None:
+        raise PlumbingError(f"{name} is not available on PATH")
+    return path
+
+
 def git_output(args: list[str], repo_root: Path) -> str:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_root), *args],
+            [_resolve_exe("git"), "-C", str(repo_root), *args],
             capture_output=True,
             text=True,
             check=True,
@@ -176,11 +191,12 @@ def remote_visibility(owner: str, repo: str) -> str | None:
     stay possible. The caller warns rather than blocks in that case and says so,
     because a guard that silently cannot check is worse than one that admits it.
     """
-    if shutil.which("gh") is None:
+    gh = shutil.which("gh")
+    if gh is None:
         return None
     try:
         result = subprocess.run(
-            ["gh", "repo", "view", f"{owner}/{repo}", "--json", "visibility"],
+            [gh, "repo", "view", f"{owner}/{repo}", "--json", "visibility"],
             capture_output=True,
             text=True,
             check=True,
