@@ -1,0 +1,35 @@
+# Publication plumbing declaration (canonical template).
+#
+# Read by githooks/pre-push via scripts/check_publication_plumbing.py before any
+# push. The content denylist answers "may these bytes be published"; this file
+# answers "may this repository be published HERE, by THIS identity, at THIS
+# visibility" — the accident class content scanning cannot see.
+#
+# Keep this in sync with reality in the SAME commit that changes reality. If a
+# publication review clears the repo for public release, flip `visibility` to
+# "public" as part of that change, not afterwards.
+#
+# Honest scope: a git hook is layer 3/4 accident prevention, not a security
+# boundary. CI is the hard gate.
+
+[publication]
+# Expected owner of the push URL. A push to any other owner is refused.
+remote_owner = "hraedon"
+
+# Expected author identity on every commit being pushed. Guards the
+# multi-identity-box accident: right code, wrong signature. May be a single
+# address or a list — real history often carries more than one (a web-UI commit
+# lands as <user>@users.noreply.github.com). List every identity legitimate for
+# this repo; anything else refuses the push.
+author_email = ["41898282+github-actions[bot]@users.noreply.github.com", "49699333+dependabot[bot]@users.noreply.github.com", "hraedon@users.noreply.github.com", "plm@hraedon.com"]
+
+# "private-until-review" | "public"
+#
+# private-until-review: the guard refuses the push if the remote is NOT private,
+# so a repository awaiting publication review cannot reach a public remote by
+# accident. This is the correct default for a new project.
+#
+# public: the repo has been cleared by a publication review. The CI identifier
+# gate fails closed on a missing denylist secret once this is set, because a
+# public repo with an unconfigured gate is a silent pass.
+visibility = "public"

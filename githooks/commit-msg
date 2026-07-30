@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# sluice commit-message identifier gate.
+#
+# The pre-commit hook scans staged file CONTENT. Commit messages were never
+# scanned by anything — not by the hook, not by CI. That blind spot is not
+# theoretical: a public repository carried work-domain identifiers in three
+# commit messages, and two of those three were the commits that redacted the
+# same identifiers from files. The message described what the diff removed.
+#
+# Activate (once per clone):   scripts/install-git-hooks.sh
+#
+# Denylist resolution is identical to pre-commit (see that hook for the order).
+# Fail-open if no denylist is found so a fresh clone is not bricked; CI remains
+# the hard gate.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+message_file="$1"
+
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  for candidate in \
+    "$repo_root/.identifiers-denylist.local" \
+    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    if [ -f "$candidate" ]; then
+      SLUICE_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export SLUICE_FORBIDDEN_IDENTIFIERS
+      break
+    fi
+  done
+fi
+
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  echo "sluice commit-msg: identifier gate INACTIVE — no denylist found." >&2
+  exit 0
+fi
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+
+exec "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
+  --message-file "$message_file"

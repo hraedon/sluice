@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# sluice local identifier gate (project-initiation scaffold).
+#
+# Mirrors the CI `identifier-gate` job so a forbidden work-domain identifier is
+# caught BEFORE it lands in a commit. The CI gate only runs after push, so by the
+# time it flags a token it is already in history; this hook closes that window.
+#
+# Companion hooks (all installed together): `commit-msg` scans the commit message,
+# `pre-push` checks publication plumbing and messages in the push range.
+#
+# Activate (once per clone):   scripts/install-git-hooks.sh
+#
+# The denylist is never committed — NAMING A FORBIDDEN IDENTIFIER IN A TRACKED
+# FILE, INCLUDING IN A COMMENT LIKE THIS ONE, IS ITSELF THE LEAK. This comment
+# once named the work domain as an illustrative example; the gate could not match
+# it (multi-word entries were unrepresentable) and the copy of this scaffold in
+# sixteen repositories, eight of them public, published it. Describe the denylist;
+# never quote it.
+#
+# It is resolved, in order, from:
+#   1. $SLUICE_FORBIDDEN_IDENTIFIERS            (already exported, e.g. CI)
+#   2. <repo>/.identifiers-denylist.local            (gitignored, per-repo)
+#   3. ~/.config/agent-suite/forbidden-identifiers   (shared canonical set)
+#
+# The shared canonical denylist holds work-domain identifiers only; homelab/lab
+# identifiers are deliberately NOT in it — lab topology is allowed in public
+# repos (docs/publication-review.md). Multi-word entries must be double-quoted.
+# Fail-open if no denylist is found so a fresh clone is not bricked; CI remains
+# the hard gate.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  for candidate in \
+    "$repo_root/.identifiers-denylist.local" \
+    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    if [ -f "$candidate" ]; then
+      SLUICE_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export SLUICE_FORBIDDEN_IDENTIFIERS
+      break
+    fi
+  done
+fi
+
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  echo "sluice pre-commit: identifier gate INACTIVE — no denylist found." >&2
+  echo "  Set \$SLUICE_FORBIDDEN_IDENTIFIERS, or create .identifiers-denylist.local (gitignored)" >&2
+  echo "  or ~/.config/agent-suite/forbidden-identifiers to enable it. Allowing commit." >&2
+  exit 0
+fi
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+
+exec "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" --staged

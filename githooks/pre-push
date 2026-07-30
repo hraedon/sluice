@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# sluice pre-push publication guard (WI-019).
+#
+# Two checks the other hooks cannot make, because both need to know WHERE the
+# push is going:
+#
+#   1. Plumbing (scripts/check_publication_plumbing.py) — the push URL's owner,
+#      the author identity on every commit being pushed, and the repository's
+#      declared visibility, all read from the tracked publication.toml. This is
+#      the accident class the content denylist never covered: right bytes, wrong
+#      destination.
+#   2. Commit messages in the push range — the last chance to catch an identifier
+#      in a message before it is published. The commit-msg hook covers new
+#      commits; this covers rebases, amends, cherry-picks, and anything authored
+#      before the hook was installed.
+#
+# git passes "<remote-name> <remote-url>" as argv and the ref updates on stdin as
+# "<local-ref> <local-sha> <remote-ref> <remote-sha>".
+#
+# Activate (once per clone):   scripts/install-git-hooks.sh
+#
+# HONEST SCOPE: layer 3/4 accident prevention, not a security boundary — a hook
+# is bypassable with --no-verify and absent until installed. CI is the hard gate.
+set -euo pipefail
+
+remote_name="${1:-origin}"
+remote_url="${2:-}"
+repo_root="$(git rev-parse --show-toplevel)"
+
+python_bin="$repo_root/.venv/bin/python"
+[ -x "$python_bin" ] || python_bin="$(command -v python3 || command -v python)"
+
+# Resolve the denylist once (same order as pre-commit; see that hook).
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  for candidate in \
+    "$repo_root/.identifiers-denylist.local" \
+    "$HOME/.config/agent-suite/forbidden-identifiers"; do
+    if [ -f "$candidate" ]; then
+      SLUICE_FORBIDDEN_IDENTIFIERS="$(cat "$candidate")"
+      export SLUICE_FORBIDDEN_IDENTIFIERS
+      break
+    fi
+  done
+fi
+if [ -z "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+  echo "sluice pre-push: message gate INACTIVE — no denylist found." >&2
+fi
+
+zero_sha="0000000000000000000000000000000000000000"
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -z "${local_ref:-}" ] && continue
+  # A zero local sha is a branch deletion: nothing is being published.
+  [ "$local_sha" = "$zero_sha" ] && continue
+
+  # Three cases, and the third one matters more than it looks. After a history
+  # rewrite (git-filter-repo, rebase, amend) the remote's sha is no longer
+  # reachable locally, so "$remote_sha..$local_sha" is an INVALID range — the
+  # scanners would fail closed and refuse every force-push, permanently. A
+  # publication scrub is exactly when a force-push must remain possible, so an
+  # unreachable remote sha is treated like a new branch: scan the whole set being
+  # published rather than a diff against a commit that no longer exists.
+  if [ "$remote_sha" = "$zero_sha" ] \
+     || ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    # Passed as one string; the Python side splits it into git log arguments.
+    rev_range="$local_sha --not --remotes=$remote_name"
+  else
+    rev_range="$remote_sha..$local_sha"
+  fi
+
+  if ! "$python_bin" "$repo_root/scripts/check_publication_plumbing.py" \
+      --remote-url "$remote_url" --rev-range "$rev_range" --repo-root "$repo_root"; then
+    status=1
+  fi
+
+  if [ -n "${SLUICE_FORBIDDEN_IDENTIFIERS:-}" ]; then
+    if ! "$python_bin" "$repo_root/scripts/check_committed_identifiers.py" \
+        --rev-range "$rev_range"; then
+      status=1
+    fi
+  fi
+done
+
+exit "$status"
