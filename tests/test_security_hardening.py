@@ -560,6 +560,68 @@ class TestRequestBodySizeLimit:
         # Permit must be released.
         assert gate.held == 0
 
+    async def test_chunked_body_over_limit_aborts_hanging_upstream_entry(self):
+        """Overflow must win the entry race even when upstream never returns headers."""
+        body_consumed = asyncio.Event()
+        upstream_cancelled = asyncio.Event()
+        upstream_release = asyncio.Event()
+        received_body = bytearray()
+
+        class HangingTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                async for chunk in request.stream:
+                    received_body.extend(chunk)
+                body_consumed.set()
+                try:
+                    await upstream_release.wait()
+                except asyncio.CancelledError:
+                    upstream_cancelled.set()
+                    raise
+                raise AssertionError("hanging upstream was unexpectedly released")
+
+        app, gate, _ = _make_app(max_request_body_bytes=64)
+        original_client = app._client
+        app._client = httpx.AsyncClient(transport=HangingTransport(), timeout=None)
+
+        receive_queue: asyncio.Queue = asyncio.Queue()
+        sent_events: list[dict] = []
+
+        async def receive() -> dict:
+            return await receive_queue.get()
+
+        async def send(event: dict) -> None:
+            sent_events.append(event)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+            "client": ("127.0.0.1", 9999),
+        }
+        await receive_queue.put({"type": "http.request", "body": b"x" * 40, "more_body": True})
+        await receive_queue.put({"type": "http.request", "body": b"x" * 40, "more_body": False})
+
+        proxy_task = asyncio.create_task(app(scope, receive, send))
+        try:
+            await asyncio.wait_for(body_consumed.wait(), timeout=5.0)
+            await asyncio.wait_for(proxy_task, timeout=5.0)
+        finally:
+            if not proxy_task.done():
+                proxy_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await proxy_task
+            await app._client.aclose()
+            await original_client.aclose()
+
+        start = next((event for event in sent_events if event["type"] == "http.response.start"), None)
+        assert start is not None
+        assert start["status"] == 413
+        assert upstream_cancelled.is_set()
+        assert len(received_body) <= 64
+        assert gate.held == 0
+
 
 # ---------------------------------------------------------------------------
 # Upstream idle timeout watchdog (WI-028 finding 5)

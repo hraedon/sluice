@@ -69,6 +69,12 @@ async def test_snapshot_fields():
     assert d["retry_after_hint"] == 5  # floor (no hold samples)
     assert d["queue_timeouts"] == 0
     assert d["total_503s"] == 0
+    assert d["completions"] == 0
+    assert d["sample_sequence"] == 1
+    assert isinstance(d["sample_id"], str)
+    assert d["sample_id"].endswith(":1")
+    assert d["tick_failed"] is False
+    assert d["nonleader"] is False
     assert "config" in d
     assert d["config"]["target"] == 3
     assert d["config"]["breaker_threshold"] == 5
@@ -136,6 +142,7 @@ async def test_prometheus_request_window_metrics():
     assert "sluice_requests_limit 200" in text
     assert "sluice_requests_remaining 152" in text
     assert "sluice_total_requests_forwarded 0" in text
+    assert "sluice_completions 0" in text
 
 
 async def test_snapshot_queue_wait_reflects_gate():

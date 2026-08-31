@@ -47,6 +47,9 @@ Compact field names in ``to_dict()`` (used by /history.json):
     rlw  local_requests_in_window
     rdelta request_window_delta
     tp   throughput (requests forwarded since previous tick)
+    cp   completions (successful permit releases since previous tick)
+    sid  process/boot-qualified sample identity
+    nl   nonleader interval
     ===  ==========================
     """
 
@@ -92,6 +95,9 @@ class HistoryEntry:
     request_window_delta: int | None = None
     throughput: int = 0  # requests forwarded since the previous tick (WI-023)
     tick_failed: bool = False
+    completions: int = 0  # permit releases since the previous tick (WI-023)
+    sample_id: str | None = None  # process/boot-qualified sample identity
+    nonleader: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -121,6 +127,9 @@ class HistoryEntry:
             "rlw": self.local_requests_in_window,
             "rdelta": self.request_window_delta,
             "tp": self.throughput,
+            "cp": self.completions,
+            "sid": self.sample_id,
+            "nl": self.nonleader,
         }
 
 

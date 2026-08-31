@@ -53,6 +53,7 @@ class PermitGate:
         self._clock = clock
         self._held = 0
         self._held_reserved = 0
+        self._total_releases = 0
         self._cooldowns: deque[float] = deque()
         self._waiters = 0
         self._cond = asyncio.Condition()
@@ -144,6 +145,7 @@ class PermitGate:
                 log.warning("release called with no held permits (double-release?)")
                 return
             self._held -= 1
+            self._total_releases += 1
             if reserved and self._held_reserved > 0:
                 self._held_reserved -= 1
             if self._release_cooldown > 0:
@@ -168,6 +170,11 @@ class PermitGate:
     @property
     def held(self) -> int:
         return self._held
+
+    @property
+    def total_releases(self) -> int:
+        """Total successful permit releases since this gate was created."""
+        return self._total_releases
 
     @property
     def held_reserved(self) -> int:

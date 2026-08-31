@@ -71,12 +71,18 @@ class StatusSnapshot:
     request_window_delta: int | None
     total_requests_forwarded: int
     throughput: int
+    completions: int
     idle: bool
     poll_interval_idle: float | None
     client_metrics: dict[str, dict[str, int]] | None
 
     # Runtime overrides (Plan 011)
     overrides: dict[str, Any]
+    # Live telemetry identity (defaults preserve older direct constructors).
+    sample_sequence: int = 0
+    sample_id: str | None = None
+    tick_failed: bool = False
+    nonleader: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +136,11 @@ class StatusSnapshot:
             "request_window_delta": self.request_window_delta,
             "total_requests_forwarded": self.total_requests_forwarded,
             "throughput": self.throughput,
+            "completions": self.completions,
+            "sample_sequence": self.sample_sequence,
+            "sample_id": self.sample_id,
+            "tick_failed": self.tick_failed,
+            "nonleader": self.nonleader,
             "idle": self.idle,
             "poll_interval_idle": self.poll_interval_idle,
             "client_metrics": self.client_metrics,
@@ -213,10 +224,15 @@ def snapshot(
         request_window_delta=reconcile.request_window_delta,
         total_requests_forwarded=reconcile.total_requests_forwarded,
         throughput=reconcile.last_throughput,
+        completions=reconcile.last_completions,
         idle=reconcile.is_idle,
         poll_interval_idle=reconcile.poll_interval_idle,
         client_metrics=client_metrics,
         overrides=reconcile.overrides,
+        sample_sequence=reconcile.sample_sequence,
+        sample_id=reconcile.sample_id,
+        tick_failed=reconcile.tick_failed,
+        nonleader=reconcile.nonleader,
     )
 
 
@@ -283,6 +299,7 @@ def to_prometheus(snap: StatusSnapshot) -> str:
     gauge("sluice_request_window_delta", "Provider requests_in_window minus sluice local count (leakage)", snap.request_window_delta)
     gauge("sluice_total_requests_forwarded", "Total requests forwarded upstream since startup", snap.total_requests_forwarded)
     gauge("sluice_throughput", "Requests forwarded in the last tick interval", snap.throughput)
+    gauge("sluice_completions", "Permit releases in the last tick interval", snap.completions)
     gauge("sluice_idle", "1 when the system is idle (no traffic, no 429s, normal band, no phantoms, breaker closed)", 1 if snap.idle else 0)
 
     # Per-client metrics (WI-023 feature #4)

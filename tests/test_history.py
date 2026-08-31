@@ -66,6 +66,22 @@ def test_history_entry_to_dict_keys():
     assert d["rrem"] is None
     assert d["rlw"] is None
     assert d["rdelta"] is None
+    assert d["cp"] == 0
+    assert d["sid"] is None
+    assert d["nl"] is False
+
+
+def test_history_entry_completions_field():
+    e = _entry(completions=4)
+    assert e.completions == 4
+    assert e.to_dict()["cp"] == 4
+
+
+def test_history_entry_sample_identity_field():
+    e = _entry(sample_id="boot-a:7", nonleader=True)
+    assert e.sample_id == "boot-a:7"
+    assert e.to_dict()["sid"] == "boot-a:7"
+    assert e.to_dict()["nl"] is True
 
 
 def test_history_entry_request_window_fields():
@@ -336,6 +352,24 @@ async def test_tick_records_history_entry():
     assert entry.effective_permits == 3
     assert entry.breaker == "closed"
     assert entry.stale is False
+
+
+async def test_tick_records_completion_delta_in_history():
+    loop, _, gate, _, _, history = _make_loop_with_history(
+        _reading(concurrent_sessions=0)
+    )
+
+    await loop.tick()
+    assert history.entries()[-1].completions == 0
+
+    for _ in range(2):
+        assert await gate.acquire(timeout=0.1)
+        await gate.release()
+    await loop.tick()
+
+    entry = history.entries()[-1]
+    assert entry.completions == 2
+    assert entry.to_dict()["cp"] == 2
 
 
 async def test_multiple_ticks_accumulate_history():

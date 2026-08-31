@@ -12,22 +12,28 @@
 <script src="/static/theme.js"></script>
 <link rel="stylesheet" href="/static/css/tokens.css">
 <style>
-body{font-family:var(--font-mono);background:var(--bg);color:var(--text);margin:0;padding:var(--space-4);font-size:var(--fs-sm);line-height:1.5}
-.header{display:flex;justify-content:space-between;align-items:center;margin:0 0 var(--space-4)}
+ *,*::before,*::after{box-sizing:border-box}
+ body{font-family:var(--font-mono);background:var(--bg);color:var(--text);margin:0;padding:var(--space-4);font-size:var(--fs-sm);line-height:1.5}
+.header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:var(--space-2);margin:0 0 var(--space-4)}
 h1{font-size:var(--fs-base);font-weight:500;margin:0;color:var(--accent)}
-.controls{display:flex;gap:var(--space-2);align-items:center}
+.controls{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}
 .controls button{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text-2);
-padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm);cursor:pointer;
+ min-height:44px;padding:var(--space-1) var(--space-3);border-radius:var(--radius-sm);cursor:pointer;
 font-family:var(--font-mono);font-size:var(--fs-xs)}
 .controls button:hover{border-color:var(--accent);color:var(--accent)}
 .step-btn{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text-2);
-padding:0 6px;border-radius:var(--radius-sm);cursor:pointer;
+ min-width:44px;min-height:44px;padding:0 6px;border-radius:var(--radius-sm);cursor:pointer;
 font-family:var(--font-mono);font-size:var(--fs-xs);line-height:1.6}
 .step-btn:hover{border-color:var(--accent);color:var(--accent)}
 .step-btn:disabled{opacity:.4;cursor:default}
 .ov-badge{color:var(--warn);font-size:var(--fs-xs);margin-left:var(--space-1)}
-.ov-revert{color:var(--accent);font-size:var(--fs-xs);text-decoration:none;cursor:pointer;margin-left:var(--space-1)}
+.ov-revert{color:var(--accent);font-size:var(--fs-xs);font-family:var(--font-mono);background:none;border:0;min-height:44px;padding:var(--space-1);text-decoration:underline;cursor:pointer;margin-left:var(--space-1)}
 .ov-revert:hover{text-decoration:underline}
+.target-control{display:inline-flex;align-items:center;gap:var(--space-1);max-width:100%}
+.target-value{min-width:1.5em;text-align:center}
+#config-table{table-layout:fixed}
+#config-table td{overflow:hidden}
+.target-control .ov-badge{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #theme-toggle{background:none;border:none;color:var(--text-3);cursor:pointer;padding:var(--space-1);font-size:var(--fs-md)}
 #theme-toggle:hover{color:var(--accent)}
 #theme-icon-dark{display:none}
@@ -36,7 +42,7 @@ font-family:var(--font-mono);font-size:var(--fs-xs);line-height:1.6}
 :root[data-theme="light"] #theme-icon-dark{display:block}
 :root[data-theme="light"] #theme-icon-light{display:none}
 .row{display:flex;gap:var(--space-4);flex-wrap:wrap;margin-bottom:var(--space-4)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-4);flex:1;min-width:260px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:var(--space-4);flex:1;min-width:min(260px,100%)}
 .card h2{font-size:var(--fs-xs);font-weight:400;color:var(--text-3);margin:0 0 var(--space-3);text-transform:uppercase;letter-spacing:.05em}
 table{width:100%;border-collapse:collapse;font-size:var(--fs-xs)}
 td,th{padding:var(--space-1) var(--space-2);text-align:left;border-bottom:1px solid var(--border)}
@@ -74,6 +80,8 @@ tr.row-bold td{font-weight:600}
 .dash{width:12px;height:0;border-top:2px dashed var(--ok);display:inline-block}
 .spark-obs{stroke:var(--accent)}.spark-loc{stroke:var(--warn)}.spark-ph{stroke:var(--text-3)}
 .spark-ep{stroke:var(--ok);stroke-dasharray:2,1}
+.spark-tp{fill:var(--ok);fill-opacity:.4}
+.spark-cp{fill:var(--accent);fill-opacity:.18}
 .spark-grid{stroke:var(--border);stroke-dasharray:2,2}
 .spark-lim,.spark-hc{stroke:var(--border-2);stroke-width:0.5}
 .spark-hc{stroke:var(--crit);stroke-opacity:.35}
@@ -128,19 +136,40 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 .penalty-detail{font-size:var(--fs-xs);color:var(--text-3);margin-top:var(--space-1);font-variant-numeric:tabular-nums}
 .penalty-loading{color:var(--text-3);font-size:var(--fs-xs)}
 .penalty-error{color:var(--crit);font-size:var(--fs-xs)}
+.events{max-height:300px;overflow:auto}
+.events table{table-layout:fixed}
+.events td:first-child{width:5.5em;color:var(--text-3);white-space:nowrap}
+.events td:last-child{word-break:break-word}
+.events-empty{color:var(--text-3);font-size:var(--fs-xs);margin:0}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media (max-width:400px){
+  body{padding:var(--space-2)}
+  .header,.controls{align-items:stretch}
+  .controls{width:100%}
+  .controls button{flex:1 1 auto}
+  .ranges{float:none;display:flex;margin-top:var(--space-2)}
+  .rbtn{flex:1 1 0;min-height:44px}
+  #config-table{table-layout:fixed}
+   #config-table td{overflow-wrap:anywhere;vertical-align:top}
+   .target-control{display:grid;grid-template-columns:44px minmax(1.5em,1fr) 44px;column-gap:var(--space-1);row-gap:0;width:100%}
+   .target-control .step-btn{min-width:44px}
+   .target-control .ov-badge{grid-column:1 / 3;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;align-self:center}
+   .target-control .ov-revert{grid-column:3;grid-row:2;margin:0;min-width:44px;padding:var(--space-1);text-align:center}
+  .card{padding:var(--space-3)}
+}
 </style>
 </head>
 <body>
 <div class="header">
   <h1>sluice <span id="build" style="color:var(--text-3);font-size:.55em;font-weight:normal"></span></h1>
   <div class="controls">
-    <button id="btn-pause" onclick="togglePause()">pause</button>
-    <button onclick="refresh()">refresh</button>
-    <button id="theme-toggle" title="toggle theme">
+    <button type="button" id="btn-pause" onclick="togglePause()">pause</button>
+    <button type="button" onclick="refresh()">refresh</button>
+    <button type="button" id="theme-toggle" title="toggle theme">
       <span id="theme-icon-dark">☀</span>
       <span id="theme-icon-light">☽</span>
     </button>
-    <button id="btn-logout" onclick="doLogout()" title="log out">logout</button>
+    <button type="button" id="btn-logout" onclick="doLogout()" title="log out">logout</button>
   </div>
 </div>
 <div id="banner-error" class="banner error" onclick="this.style.display='none'" title="click to dismiss"></div>
@@ -159,13 +188,14 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
   <div class="card" id="spark-card">
     <h2>Sparkline <span id="spark-info" style="color:var(--text-3)"></span>
       <span class="ranges">
-        <button class="rbtn active" id="r-5m" onclick="setRange('5m')">5m</button>
-        <button class="rbtn" id="r-1h" onclick="setRange('1h')">1h</button>
-        <button class="rbtn" id="r-4h" onclick="setRange('4h')">4h</button>
+        <button class="rbtn active" id="r-5m" onclick="setRange('5m')" aria-pressed="true" aria-current="true">5m</button>
+        <button class="rbtn" id="r-1h" onclick="setRange('1h')" aria-pressed="false">1h</button>
+        <button class="rbtn" id="r-4h" onclick="setRange('4h')" aria-pressed="false">4h</button>
       </span></h2>
-    <svg class="spark" id="spark" viewBox="0 0 200 120" preserveAspectRatio="none"><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/></svg>
-    <svg class="ribbon" id="ribbon" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
-    <svg class="qspark" id="qspark" viewBox="0 0 200 28" preserveAspectRatio="none"><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/></svg>
+    <p id="spark-summary" class="sr-only">Chart waiting for data.</p>
+    <svg class="spark" id="spark" role="img" aria-labelledby="spark-title spark-desc" aria-describedby="spark-summary" viewBox="0 0 200 120" preserveAspectRatio="none"><title id="spark-title">Concurrency history</title><desc id="spark-desc">Observed and local concurrency, effective permits, throughput, and completions over the selected range.</desc><line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/></svg>
+    <svg class="ribbon" id="ribbon" role="img" aria-label="Provider enforcement band history" viewBox="0 0 200 4" preserveAspectRatio="none"></svg>
+    <svg class="qspark" id="qspark" role="img" aria-labelledby="qspark-title qspark-desc" aria-describedby="spark-summary" viewBox="0 0 200 28" preserveAspectRatio="none"><title id="qspark-title">Queue depth history</title><desc id="qspark-desc">Queue depth and request error events over the selected range.</desc><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/></svg>
     <div class="sleg">
       <span title="concurrent_sessions from the provider usage endpoint - ground truth, includes phantoms"><span class="dot" style="background:var(--accent)"></span> observed</span>
       <span title="local_in_flight - requests sluice is holding a permit for"><span class="dot" style="background:var(--warn)"></span> local</span>
@@ -175,7 +205,8 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
       <span title="tick where queue_timeouts incremented between samples"><span class="dot" style="background:var(--warn)"></span> timeout</span>
       <span title="tick where total_429s incremented between samples"><span class="dot" style="background:var(--crit)"></span> 429</span>
       <span title="tick where total_503s incremented between samples (upstream overload during low-interactivity)"><span class="dot" style="background:var(--warn);opacity:.6"></span> 503</span>
-      <span title="throughput - requests forwarded per tick interval; bars at the bottom of the spark show traffic, distinguishing idle from healthy (WI-023)"><span class="dot" style="background:var(--ok);opacity:.4"></span> throughput</span>
+      <span title="throughput - requests forwarded per tick interval; bars behind the spark show streaming traffic (WI-023)"><span class="dot" style="background:var(--ok);opacity:.4"></span> throughput</span>
+      <span title="completions - permit releases per tick interval; faint bars behind the spark distinguish completed permits from streaming traffic (WI-023)"><span class="dot" style="background:var(--accent);opacity:.18"></span> completions</span>
     </div>
     <div id="req-section" class="req-section">
       <div class="req-head">
@@ -183,7 +214,8 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
         <span><span class="req-val" id="req-used">-</span> / <span id="req-limit">-</span> &middot; <span class="req-remain" id="req-remain">-</span> remaining</span>
       </div>
       <div class="budget" id="budget-bar"></div>
-      <svg class="rspark" id="rspark" viewBox="0 0 200 50" preserveAspectRatio="none"></svg>
+      <p id="rspark-summary" class="sr-only">Request budget chart waiting for data.</p>
+      <svg class="rspark" id="rspark" role="img" aria-labelledby="rspark-title rspark-desc" aria-describedby="rspark-summary" viewBox="0 0 200 50" preserveAspectRatio="none"><title id="rspark-title">Request budget history</title><desc id="rspark-desc">Provider and sluice request counts over the selected range.</desc></svg>
       <div class="rleg">
         <span title="requests_in_window as reported by the provider"><span class="dot" style="background:var(--accent)"></span> provider</span>
         <span title="requests sluice itself forwarded within the provider window"><span class="dot" style="background:var(--warn)"></span> sluice</span>
@@ -196,7 +228,7 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
         <tr><th>time</th><td id="tip-ts" colspan="5">-</td></tr>
         <tr><th>obs</th><td id="tip-obs">-</td><th>loc</th><td id="tip-loc">-</td><th>ep</th><td id="tip-ep">-</td></tr>
         <tr><th>qd</th><td id="tip-qd">-</td><th>band</th><td id="tip-band" colspan="3">-</td></tr>
-        <tr><th>tp</th><td id="tip-tp">-</td><th>503</th><td id="tip-503" colspan="3">-</td></tr>
+        <tr><th>cp</th><td id="tip-cp">-</td><th>tp</th><td id="tip-tp">-</td><th>503</th><td id="tip-503">-</td></tr>
         <tr><th>age</th><td id="tip-age">-</td><th>lim</th><td id="tip-lim">-</td><th>hc</th><td id="tip-hc">-</td></tr>
         <tr><th>brk</th><td id="tip-brk" colspan="5">-</td></tr>
       </table>
@@ -223,6 +255,12 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 </div>
 <div class="row">
   <div class="card">
+    <h2>Recent Events <span id="events-info" style="color:var(--text-3)"></span></h2>
+    <div id="recent-events" class="events"><p class="events-empty">No recorded transitions in loaded history.</p></div>
+  </div>
+</div>
+<div class="row">
+  <div class="card">
     <h2>Reading</h2>
     <table id="stats"></table>
   </div>
@@ -234,34 +272,105 @@ border-radius:var(--radius-sm);cursor:pointer;text-transform:none;letter-spacing
 <script>
 let paused=false,isActive=false,timer=null,fetching=false;
 let mutationsDisabled=false,configSaving=false;
-let lastValid=[];
+let lastValid=[],lastValidIndexes=[],lastDomainSpan=1;
 const HIST_MAX=60;
 // Long ranges pull from /history.json (5s tick cadence): 720 ticks = 1h, 2880 = 4h.
 const RANGES={'5m':{limit:HIST_MAX},'1h':{limit:720},'4h':{limit:2880}};
 const BUCKETS=120,LONG_REFRESH_MS=15000;
-let hist=[],viewRange='5m',longHist=[],lastLongFetch=0,lastD=null;
+const EVENT_HISTORY_LIMIT=RANGES['4h'].limit;
+let hist=[],viewRange='5m',longHist=[],eventHist=[],lastLongFetch=0,lastEventFetch=0,lastD=null;
+let longFetchRequest=0,longFetchController=null;
+let eventFetchRequest=0,eventFetchController=null;
+let concurrencyTruthAvailable=true;
+let lastLiveSampleId=null,lastLiveSampleSequence=null,lastLiveBootId=null;
 const PRIMARY_KEYS={'band':1,'effective_permits':1,'local_in_flight':1,'breaker':1};
 
 function esc(v){var e=document.createElement('span');e.textContent=String(v);return e.innerHTML;}
 function fmtTime(ts){if(!ts)return '-';var d=new Date(ts*1000);return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+function sampleIdParts(id){
+  if(typeof id!=='string'||!id) return {boot:null,sequence:null};
+  var split=id.lastIndexOf(':');
+  if(split<=0) return {boot:id,sequence:null};
+  var sequence=Number(id.slice(split+1));
+  return {boot:id.slice(0,split),sequence:Number.isSafeInteger(sequence)?sequence:null};
+}
+function seedLiveSampleId(id){
+  var parts=sampleIdParts(id);
+  if(!parts.boot) return;
+  lastLiveSampleId=id;
+  lastLiveBootId=parts.boot;
+  if(parts.sequence!==null) lastLiveSampleSequence=parts.sequence;
+}
+function shouldAppendLiveSample(d){
+  var sampleId=typeof d.sample_id==='string'&&d.sample_id?d.sample_id:null;
+  var parts=sampleIdParts(sampleId);
+  var sampleSequence=typeof d.sample_sequence==='number'&&Number.isSafeInteger(d.sample_sequence)
+    ? d.sample_sequence : parts.sequence;
+  var append=true;
+  if(sampleId){
+    if(lastLiveSampleId!==null){
+      // Full identities distinguish equal sequence numbers across restarts.
+      append=sampleId!==lastLiveSampleId;
+    }else if(sampleSequence!==null&&lastLiveSampleSequence!==null&&sampleSequence===lastLiveSampleSequence){
+      // A legacy sequence-only response can coexist with a new response.  If
+      // the boot is known, only a different boot makes this a new sample.
+      append=lastLiveBootId!==null&&parts.boot!==lastLiveBootId;
+    }
+    lastLiveSampleId=sampleId;
+    lastLiveBootId=parts.boot;
+    if(sampleSequence!==null) lastLiveSampleSequence=sampleSequence;
+    return append;
+  }
+  if(sampleSequence!==null){
+    // Sequence-only payloads are supported for older daemons.  Keep the last
+    // boot ID separately so a later full identity can still detect a restart.
+    append=lastLiveSampleSequence===null||sampleSequence!==lastLiveSampleSequence;
+    lastLiveSampleId=null;
+    lastLiveSampleSequence=sampleSequence;
+    return append;
+  }
+  // Old payloads without either identity field retain the historical behavior
+  // and append each response.
+  lastLiveSampleId=null;
+  return true;
+}
 
 function fromHistEntry(e){
   return {ts:e.ts,obs:e.obs,loc:e.loc,ph:e.ph,ep:e.ep,lim:e.lim,hc:e.hc,
           band:e.band,brk:e.brk,stl:e.stl,age:e.age,qd:e.qd,qt:e.qt,t429:e.t429,
-          t503:e.t503||0,li:!!e.li,
-          rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta,tp:e.tp||0};
+           t503:e.t503||0,li:!!e.li,
+           rwin:e.rwin,rlim:e.rlim,rrem:e.rrem,rlw:e.rlw,rdelta:e.rdelta,
+           tp:e.tp||0,cp:e.cp||0,sid:e.sid||null};
 }
 
 async function initHistory(){
+  // fetchEventHistory redirects to / on 401 before this initial render.
+  await fetchEventHistory(true);
+  if(eventHist.length){
+    hist=eventHist.slice(-HIST_MAX);
+    var latestSid=eventHist[eventHist.length-1].sid;
+    if(latestSid) seedLiveSampleId(latestSid);
+  }
+}
+
+async function fetchEventHistory(force){
+  if(!force&&Date.now()-lastEventFetch<LONG_REFRESH_MS) return;
+  lastEventFetch=Date.now();
+  var requestId=++eventFetchRequest;
+  if(eventFetchController) eventFetchController.abort();
+  eventFetchController=typeof AbortController==='undefined'?null:new AbortController();
   try{
-    const r=await fetch('/history.json?limit='+HIST_MAX,{credentials:'include'});
+    var options={credentials:'include'};
+    if(eventFetchController) options.signal=eventFetchController.signal;
+    const r=await fetch('/history.json?limit='+EVENT_HISTORY_LIMIT,options);
+    if(requestId!==eventFetchRequest) return;
     if(!r.ok){
       if(r.status===401){window.location.href='/';return;}
       return;
     }
     const d=await r.json();
-    if(!d.entries||!d.entries.length) return;
-    hist=d.entries.map(fromHistEntry);
+    if(requestId!==eventFetchRequest) return;
+    eventHist=(d.entries||[]).map(fromHistEntry);
   }catch(e){}
 }
 
@@ -288,7 +397,11 @@ function hideError(){
 function setRange(rg){
   viewRange=rg;
   ['5m','1h','4h'].forEach(function(k){
-    document.getElementById('r-'+k).className='rbtn'+(k===rg?' active':'');
+    var button=document.getElementById('r-'+k),selected=k===rg;
+    button.className='rbtn'+(selected?' active':'');
+    button.setAttribute('aria-pressed',selected?'true':'false');
+    if(selected) button.setAttribute('aria-current','true');
+    else button.removeAttribute('aria-current');
   });
   if(rg==='5m'){renderSparks();}
   else{fetchLong(true);}
@@ -297,16 +410,27 @@ function setRange(rg){
 async function fetchLong(force){
   if(!force&&Date.now()-lastLongFetch<LONG_REFRESH_MS) return;
   lastLongFetch=Date.now();
+  var requestedRange=viewRange;
+  var requestId=++longFetchRequest;
+  if(longFetchController) longFetchController.abort();
+  longFetchController=typeof AbortController==='undefined'?null:new AbortController();
   try{
-    const r=await fetch('/history.json?limit='+RANGES[viewRange].limit,{credentials:'include'});
+    var options={credentials:'include'};
+    if(longFetchController) options.signal=longFetchController.signal;
+    const r=await fetch('/history.json?limit='+RANGES[requestedRange].limit,options);
+    if(requestId!==longFetchRequest||requestedRange!==viewRange) return;
     if(!r.ok){
       if(r.status===401){window.location.href='/';return;}
       return;
     }
     const d=await r.json();
+    if(requestId!==longFetchRequest||requestedRange!==viewRange) return;
     longHist=(d.entries||[]).map(fromHistEntry);
     renderSparks();
-  }catch(e){}
+  }catch(e){
+    // A superseded range is deliberately aborted.  Other fetch failures leave
+    // the current chart intact and are handled by the next refresh.
+  }
 }
 
 async function doPoll(){
@@ -323,16 +447,22 @@ async function doPoll(){
     lastD=d;
     document.getElementById('build').textContent='v'+d.version+(d.build?' @ '+d.build:'');
     render(d);
-    hist.push({ts:Date.now()/1000,obs:d.concurrent_sessions,loc:d.local_in_flight,
-               ph:d.phantom_estimate,ep:d.effective_permits,
-               lim:d.limit,hc:d.hard_cap,band:d.band,brk:d.breaker,
-               stl:d.stale,age:d.usage_age,qd:d.queue_depth,
-               qt:d.queue_timeouts,t429:d.total_429s,
-               t503:d.total_503s||0,li:!!d.low_interactivity,
-               rwin:d.requests_in_window,rlim:d.requests_limit,
-               rrem:d.requests_remaining,rlw:d.local_requests_in_window,
-               rdelta:d.request_window_delta,tp:d.throughput||0});
-    if(hist.length>HIST_MAX) hist.shift();
+    var sampleId=typeof d.sample_id==='string'&&d.sample_id?d.sample_id:null;
+    var appendLiveSample=shouldAppendLiveSample(d);
+    if(appendLiveSample){
+      hist.push({ts:Date.now()/1000,obs:d.concurrent_sessions,loc:d.local_in_flight,
+                 ph:d.phantom_estimate,ep:d.effective_permits,
+                 lim:d.limit,hc:d.hard_cap,band:d.band,brk:d.breaker,
+                 stl:d.stale,age:d.usage_age,qd:d.queue_depth,
+                 qt:d.queue_timeouts,t429:d.total_429s,
+                 t503:d.total_503s||0,li:!!d.low_interactivity,
+                 rwin:d.requests_in_window,rlim:d.requests_limit,
+                 rrem:d.requests_remaining,rlw:d.local_requests_in_window,
+                 rdelta:d.request_window_delta,tp:d.throughput||0,
+                 cp:d.completions||0,sid:sampleId});
+      if(hist.length>HIST_MAX) hist.shift();
+    }
+    fetchEventHistory(false);
     if(viewRange==='5m'){renderSparks();}
     else{fetchLong(false);}
   }catch(e){
@@ -365,14 +495,61 @@ function togglePause(){
   if(!paused) schedule(0);
 }
 
+function extractErrorText(body){
+  if(body==null) return null;
+  if(typeof body==='string') return body;
+  if(typeof body!=='object') return String(body);
+  if(Array.isArray(body)){
+    for(var ai=0;ai<body.length;ai++){
+      var arrayText=extractErrorText(body[ai]);
+      if(arrayText) return arrayText;
+    }
+    return null;
+  }
+  var keys=['error','detail','message','reason','error_message','error_description','title','errors'];
+  for(var i=0;i<keys.length;i++){
+    var value=body[keys[i]];
+    if(value==null) continue;
+    if(typeof value==='object'){
+      var nested=extractErrorText(value);
+      if(nested) return nested;
+      try{return JSON.stringify(value);}catch(e){}
+    }else{
+      var text=String(value);
+      if(text) return text;
+    }
+  }
+  return null;
+}
+
+async function responseErrorMessage(r,fallback){
+  var body=null,text='';
+  try{
+    if(typeof r.text==='function') text=(await r.text()).trim();
+  }catch(e){}
+  if(text){
+    try{body=JSON.parse(text);}catch(e){return text;}
+  }else{
+    try{if(typeof r.json==='function') body=await r.json();}catch(e){}
+  }
+  return extractErrorText(body)||fallback;
+}
+
 async function stepTarget(delta){
   if(mutationsDisabled||configSaving||!lastD) return;
   configSaving=true;
   hideError();
-  render(lastD);
-  var cur=lastD.config.target;
-  var newVal=cur+delta;
   try{
+    render(lastD);
+    var cfg=lastD.config||{};
+    var cur=cfg.target!=null?cfg.target:lastD.target;
+    if(cur==null||cur===''){showError('target override failed — current target unavailable');return;}
+    var numericCur=Number(cur);
+    if(!Number.isFinite(numericCur)){
+      showError('target override failed — current target unavailable');
+      return;
+    }
+    var newVal=numericCur+delta;
     var r=await fetch('/admin/config',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -386,20 +563,19 @@ async function stepTarget(delta){
       window.location.href='/';return;
     }else if(!r.ok){
       var msg='target override failed ('+r.status+')';
-      try{var b=await r.json();if(b.error)msg=b.error;}catch(e){}
-      showError(msg);
+      showError(await responseErrorMessage(r,msg));
     }
   }catch(e){showError('network error: '+e.message);}
-  configSaving=false;
+  finally{configSaving=false;}
   await doPoll();
 }
 
 async function revertTarget(){
-  if(mutationsDisabled||configSaving) return;
+  if(mutationsDisabled||configSaving||!lastD) return;
   configSaving=true;
   hideError();
-  render(lastD);
   try{
+    render(lastD);
     var r=await fetch('/admin/config/target',{
       method:'DELETE',
       credentials:'include'
@@ -411,11 +587,10 @@ async function revertTarget(){
       window.location.href='/';return;
     }else if(!r.ok){
       var msg='target revert failed ('+r.status+')';
-      try{var b=await r.json();if(b.error)msg=b.error;}catch(e){}
-      showError(msg);
+      showError(await responseErrorMessage(r,msg));
     }
   }catch(e){showError('network error: '+e.message);}
-  configSaving=false;
+  finally{configSaving=false;}
   await doPoll();
 }
 
@@ -435,11 +610,15 @@ function recentInc(histField,currentField){
 }
 
 function render(d){
-  const limit=d.limit??4,hc=d.hard_cap??8,tgt=d.target??3;
+  const hasConcurrencyTruth=!(d.config&&d.config.controller==='adaptive');
+  const limit=hasConcurrencyTruth?d.limit:null,hc=hasConcurrencyTruth?d.hard_cap:null,tgt=d.target;
   const obs=d.concurrent_sessions,loc=d.local_in_flight;
   // Gauge
   const g=document.getElementById('gauge');
-  if(obs==null||hc==null||limit==null){
+  if(!hasConcurrencyTruth){
+    g.innerHTML='<div style="text-align:center;color:var(--text-3);font-size:var(--fs-xs);line-height:24px">concurrency unavailable (adaptive provider)</div>';
+    document.getElementById('gauge-labels').innerHTML='';
+  }else if(obs==null||hc==null||limit==null){
     g.innerHTML='<div style="text-align:center;color:var(--text-3);font-size:var(--fs-xs);line-height:24px">waiting for data...</div>';
     document.getElementById('gauge-labels').innerHTML='';
   }else{
@@ -465,10 +644,10 @@ function render(d){
     ['priority_reason',d.priority_reason,'Provider priority.reason - rate_limited means deprioritized (still serving, reduced permits), not a full box'],
     ['service_mode',d.service_mode,'Provider service_mode — low_interactivity means the account is in a fixed-duration penalty where interactive requests may get 503'],
     ['effective_permits',d.effective_permits,'Permits the controller currently grants: target minus phantom absorption and band/breaker backoff'],
-    ['concurrent_sessions',obs,'Sessions the provider reports as running - ground truth, includes phantoms sluice cannot see'],
+    ['concurrent_sessions',hasConcurrencyTruth?obs:'unavailable','Sessions the provider reports as running - ground truth, includes phantoms sluice cannot see'],
     ['local_in_flight',loc,'Requests sluice is holding a permit for right now'],
     ['cooling_down',d.cooling_down,'Recently released permits still cooling down before they can be re-acquired'],
-    ['phantom_estimate',d.phantom_estimate,'Sustained excess of provider-observed sessions over local in-flight (windowed min) - sessions the provider still counts but sluice is not running'],
+    ['phantom_estimate',hasConcurrencyTruth?d.phantom_estimate:'unavailable','Sustained excess of provider-observed sessions over local in-flight (windowed min) - sessions the provider still counts but sluice is not running'],
     ['breaker',d.breaker,'Circuit breaker on upstream 429s: closed (normal), open (backing off), half_open (probing)'],
     ['breaker_half_open_age',
       d.breaker_half_open_age_seconds!=null
@@ -515,7 +694,9 @@ function render(d){
   var ov=d.overrides||{};
   var tgtOv=ov.target||null;
   var isOverridden=!!tgtOv;
-  var tgtVal=c.target;
+  var tgtVal=c.target!=null?c.target:tgt;
+  var targetAtMinimum=tgtVal<=1;
+  var targetAtHardCap=hc!=null&&tgtVal>=hc;
   var cfgHtml='';
   var tgtTitle='Steady-state concurrency sluice aims to keep in flight';
   if(mutationsDisabled){
@@ -524,13 +705,14 @@ function render(d){
       +'</td></tr>';
   }else{
     cfgHtml+='<tr><th class="help" title="'+esc(tgtTitle)+'">target</th><td>';
-    cfgHtml+='<div style="display:inline-flex;align-items:center;gap:var(--space-1)">';
-    cfgHtml+='<button class="step-btn" onclick="stepTarget(-1)"'+(configSaving?' disabled':'')+'>\u2212</button>';
-    cfgHtml+='<span style="min-width:1.5em;text-align:center">'+esc(tgtVal)+'</span>';
-    cfgHtml+='<button class="step-btn" onclick="stepTarget(1)"'+(configSaving?' disabled':'')+'>+</button>';
-    if(isOverridden){
-      cfgHtml+='<span class="ov-badge">override (boot='+esc(tgtOv.boot)+')</span>';
-      cfgHtml+='<a class="ov-revert" onclick="revertTarget();return false"'+(configSaving?' style="pointer-events:none;opacity:.4"':'')+'>revert</a>';
+     cfgHtml+='<div class="target-control">';
+     cfgHtml+='<button type="button" class="step-btn" aria-label="Decrease target" onclick="stepTarget(-1)"'+((configSaving||targetAtMinimum)?' disabled':'')+'>\u2212</button>';
+     cfgHtml+='<span class="target-value">'+esc(tgtVal)+'</span>';
+     cfgHtml+='<button type="button" class="step-btn" aria-label="Increase target" onclick="stepTarget(1)"'+((configSaving||targetAtHardCap)?' disabled':'')+'>+</button>';
+     if(isOverridden){
+        var overrideLabel='Override active; boot value '+tgtOv.boot;
+        cfgHtml+='<span class="ov-badge" aria-label="'+esc(overrideLabel)+'" title="'+esc(overrideLabel)+'">override (boot='+esc(tgtOv.boot)+')</span>';
+        cfgHtml+='<button type="button" class="ov-revert" aria-label="Revert target override" onclick="revertTarget()"'+(configSaving?' disabled':'')+'>revert</button>';
     }
     cfgHtml+='</div></td></tr>';
   }
@@ -882,10 +1064,11 @@ function withIncs(samples){
     var p=i>0?samples[i-1]:null;
     return {ts:s.ts,obs:s.obs,loc:s.loc,ph:s.ph,ep:s.ep,lim:s.lim,hc:s.hc,
             qd:s.qd||0,band:s.band||'normal',brk:s.brk||'closed',stl:!!s.stl,age:s.age||0,
+            fresh:s.obs!=null&&!s.stl,
             qtInc:!!(p&&s.qt>p.qt),t429Inc:!!(p&&s.t429>p.t429),
             t503Inc:!!(p&&s.t503>(p.t503||0)),li:!!s.li,
             rwin:s.rwin,rlim:s.rlim,rrem:s.rrem,rlw:s.rlw,rdelta:s.rdelta,
-            tp:s.tp||0};
+            tp:s.tp||0,cp:s.cp||0};
   });
 }
 
@@ -899,12 +1082,17 @@ function bucketize(samples,n){
   for(var i=0;i<samples.length;i+=k){
     var b={ts:0,obs:null,loc:0,ph:0,ep:0,lim:null,hc:null,qd:0,
            band:'normal',brk:'closed',stl:false,qtInc:false,t429Inc:false,
-           t503Inc:false,li:false,
-           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null,tp:0};
+           t503Inc:false,li:false,fresh:true,
+           rwin:null,rlim:null,rrem:null,rlw:null,rdelta:null,tp:0,cp:0};
     for(var j=i;j<Math.min(i+k,samples.length);j++){
       var s=samples[j];
       b.ts=s.ts||b.ts;
-      if(s.obs!=null&&(b.obs==null||s.obs>b.obs)) b.obs=s.obs;
+      // A bucket represents an interval, not just its best point.  Drawing
+      // through one stale input would hide an untrusted interval.
+      b.fresh=b.fresh&&s.obs!=null&&!s.stl;
+      if(s.obs!=null&&!s.stl){
+        if(b.obs==null||s.obs>b.obs) b.obs=s.obs;
+      }
       if(s.loc>b.loc) b.loc=s.loc;
       if(s.ph>b.ph) b.ph=s.ph;
       if(s.ep!==undefined) b.ep=s.ep;
@@ -924,135 +1112,272 @@ function bucketize(samples,n){
       if(s.rlw!=null&&(b.rlw==null||s.rlw>b.rlw)) b.rlw=s.rlw;
       if(s.rdelta!=null&&(b.rdelta==null||s.rdelta>b.rdelta)) b.rdelta=s.rdelta;
       b.tp+=s.tp||0;
+      // Completions are already per-tick deltas; keep the bucket maximum so
+      // a short burst remains visible instead of being averaged away.
+      if((s.cp||0)>b.cp) b.cp=s.cp||0;
     }
     out.push(b);
   }
   return out;
 }
 
+function renderRecentEvents(){
+  var byIdentity={},samples=[];
+  // Long history overlaps the live buffer.  Keep one copy of each known sample
+  // so an overlap cannot manufacture a transition in the event list.
+  (eventHist.concat(hist)).forEach(function(sample){
+    var key=sample.sid||String(sample.ts);
+    byIdentity[key]=sample;
+  });
+  Object.keys(byIdentity).forEach(function(key){samples.push(byIdentity[key]);});
+  samples.sort(function(a,b){return (a.ts||0)-(b.ts||0);});
+  var events=[];
+  for(var i=1;i<samples.length;i++){
+    var previous=samples[i-1],current=samples[i],time=fmtTime(current.ts);
+    // Boot-qualified IDs are the only evidence of a restart.  Do not invent a
+    // transition across one; legacy entries without IDs retain their history.
+    var previousBoot=sampleIdParts(previous.sid).boot;
+    var currentBoot=sampleIdParts(current.sid).boot;
+    if(previousBoot&&currentBoot&&previousBoot!==currentBoot) continue;
+    if(current.band!==previous.band){
+      var bandSeverity=Math.max(SEV[previous.band]||0,SEV[current.band]||0);
+      var bandClass=bandSeverity>=2?'row-crit':bandSeverity===1?'row-warn':'';
+      events.push({time:time,text:'band '+previous.band+' → '+current.band,cls:bandClass});
+    }
+    if(current.brk!==previous.brk)
+      events.push({time:time,text:'breaker '+previous.brk+' → '+current.brk,
+                   cls:current.brk==='open'?'row-crit':'row-warn'});
+    var t429=(current.t429||0)-(previous.t429||0);
+    if(t429>0) events.push({time:time,text:'429 +'+t429,cls:'row-crit'});
+    var timeout=(current.qt||0)-(previous.qt||0);
+    if(timeout>0) events.push({time:time,text:'queue timeout +'+timeout,cls:'row-warn'});
+    if(!!current.stl!==!!previous.stl)
+      events.push({time:time,text:current.stl?'usage became stale':'usage became fresh',cls:'row-warn'});
+  }
+  events=events.slice(-20).reverse();
+  var container=document.getElementById('recent-events');
+  var info=document.getElementById('events-info');
+  info.textContent=events.length?'('+events.length+' newest)':'';
+  if(!events.length){
+    container.innerHTML='<p class="events-empty">No recorded transitions in loaded history.</p>';
+    return;
+  }
+  container.innerHTML='<table><caption>Recent state transitions from the last four hours</caption><thead><tr><th scope="col">Time</th><th scope="col">Event</th></tr></thead><tbody>'+events.map(function(event){
+    return '<tr class="'+event.cls+'"><td>'+esc(event.time)+'</td><td>'+esc(event.text)+'</td></tr>';
+  }).join('')+'</tbody></table>';
+}
+
 function renderSparks(){
   var d=lastD||{};
-  var curHc=d.hard_cap??8,curLimit=d.limit??4;
+  concurrencyTruthAvailable=!(d.config&&d.config.controller==='adaptive');
+  var curHc=concurrencyTruthAvailable?d.hard_cap:null;
+  var curLimit=concurrencyTruthAvailable?d.limit:null;
   var raw=viewRange==='5m'?hist:longHist;
+  renderRecentEvents();
   var samples=bucketize(withIncs(raw),BUCKETS);
   var denom=viewRange==='5m'?HIST_MAX:samples.length;
   var svg=document.getElementById('spark');
   var info=document.getElementById('spark-info');
-  var valid=samples.filter(function(h){return h.obs!=null;});
+  var summary=document.getElementById('spark-summary');
+  // Every visual uses the complete sample domain.  Fresh points are kept as
+  // indexed segments so a stale interval creates a gap instead of shifting
+  // later points left or connecting across untrusted usage.
+  var valid=[],validIndexes=[],freshRuns=[],run=[];
+  for(var si=0;si<samples.length;si++){
+    var sample=samples[si];
+    if(sample.fresh||!concurrencyTruthAvailable){
+      valid.push(sample);
+      validIndexes.push(si);
+      run.push(si);
+    }else if(run.length){
+      freshRuns.push(run);
+      run=[];
+    }
+  }
+  if(run.length) freshRuns.push(run);
   lastValid=valid;
+  lastValidIndexes=validIndexes;
   var infoBase=viewRange==='5m'
     ? valid.length+'/'+denom+' samples'
     : viewRange+' · '+raw.length+' ticks';
   info.textContent=infoBase;
+  var W=200,pad=3,H=120,QH=28;
+  var domainSpan=Math.max(denom-1,samples.length-1,1);
+  lastDomainSpan=domainSpan;
+  function xAt(i){return pad+(i/domainSpan)*(W-2*pad);}
+  // Both bars use every sample, including stale ones.  They are local gate
+  // signals and do not depend on provider usage freshness.
+  var maxTp=0;
+  for(var ti=0;ti<samples.length;ti++){if(samples[ti].tp>maxTp)maxTp=samples[ti].tp;}
+  var maxCp=0;
+  for(var ci=0;ci<samples.length;ci++){if(samples[ci].cp>maxCp)maxCp=samples[ci].cp;}
+  function throughputBars(){
+    var bars='';
+    if(maxTp>0){
+      var tpBarH=10;
+      var tpBase=H-pad;
+      for(var tb=0;tb<samples.length;tb++){
+        if(samples[tb].tp>0){
+          var bh=Math.max(1,(samples[tb].tp/maxTp)*tpBarH);
+          var bx=xAt(tb).toFixed(1);
+          bars+='<rect class="spark-tp" x="'+(bx-0.5)+'" y="'+(tpBase-bh).toFixed(1)+'" width="1" height="'+bh.toFixed(1)+'" fill="var(--ok)" opacity="0.4"/>';
+        }
+      }
+    }
+    return bars;
+  }
+  function completionBars(){
+    var bars='';
+    if(maxCp>0){
+      var cpBarH=10;
+      var cpBase=H-pad;
+      var cpBarW=Math.max(1,(W-2*pad)/Math.max(denom,1));
+      for(var cb=0;cb<samples.length;cb++){
+        if(samples[cb].cp>0){
+          var ch=Math.max(1,(samples[cb].cp/maxCp)*cpBarH);
+          var cx=xAt(cb)-cpBarW/2;
+          bars+='<rect class="spark-cp" x="'+cx.toFixed(1)+'" y="'+(cpBase-ch).toFixed(1)+'" width="'+cpBarW.toFixed(1)+'" height="'+ch.toFixed(1)+'"/>';
+        }
+      }
+    }
+    return bars;
+  }
+  function staleMarkers(){
+    var marks='';
+    for(var mi=0;mi<samples.length;mi++){
+      var mx=xAt(mi).toFixed(1);
+      if(samples[mi].brk==='open') marks+='<line x1="'+mx+'" y1="'+pad+'" x2="'+mx+'" y2="13" class="tick-brk-open" stroke-width="1.5"/>';
+      else if(samples[mi].brk==='half_open') marks+='<line x1="'+mx+'" y1="'+pad+'" x2="'+mx+'" y2="8" class="tick-brk-half" stroke-width="1.2"/>';
+      else if(samples[mi].stl) marks+='<line x1="'+mx+'" y1="'+pad+'" x2="'+mx+'" y2="6" class="tick-stale" stroke-width="1"/>';
+    }
+    return marks;
+  }
   if(valid.length<2){
-    svg.innerHTML='<text x="100" y="62" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
+    hideSparkTip();
+    svg.innerHTML='<title id="spark-title">Concurrency history</title><desc id="spark-desc">No fresh concurrency data is available.</desc>'+throughputBars()+completionBars()+staleMarkers()+'<text x="100" y="62" text-anchor="middle" fill="var(--text-3)" font-size="7" font-family="var(--font-mono)">waiting for data...</text>';
     document.getElementById('ribbon').innerHTML='';
-    document.getElementById('qspark').innerHTML='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
+    document.getElementById('qspark').innerHTML='<title id="qspark-title">Queue depth history</title><desc id="qspark-desc">No fresh concurrency data is available.</desc><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
     var rs2=document.getElementById('rspark');
     if(rs2){rs2.innerHTML='';rs2.style.display='none';}
+     document.getElementById('rspark-info').textContent='';
+     document.getElementById('rdelta-text').textContent='';
+     document.getElementById('rspark-summary').textContent='No fresh request budget data is available for the selected range.';
+    info.textContent='No fresh chart data';
+    summary.textContent='No fresh chart data is available for the selected range.';
     return;
   }
-  var W=200,pad=3,H=120,QH=28;
-  var span=Math.max(denom-1,valid.length-1,1);
-  function xAt(i){return pad+(i/span)*(W-2*pad);}
   function yFor(v){return H-pad-(v/maxV)*(H-2*pad);}
   // -- main spark: observed / local / phantom / effective-permits against guide lines
-  var maxV=curHc;
+  var maxV=curHc||0;
   for(var i=0;i<valid.length;i++){
     if(valid[i].obs>maxV) maxV=valid[i].obs;
     if(valid[i].loc>maxV) maxV=valid[i].loc;
     if(valid[i].ep>maxV) maxV=valid[i].ep;
   }
   if(maxV<1) maxV=1;
-  function pts(key){
-    return valid.map(function(h,i){
-      var v=h[key]||0;
-      var y=yFor(v);
-      return xAt(i).toFixed(1)+','+y.toFixed(1);
+  function segmentPts(key,indices){
+    return indices.map(function(index){
+      var v=samples[index][key]||0;
+      return xAt(index).toFixed(1)+','+yFor(v).toFixed(1);
     }).join(' ');
   }
-  function stepPts(key){
+  function stepSegmentPts(key,indices){
     var out=[];
-    for(var i=0;i<valid.length;i++){
-      var y=yFor(valid[i][key]||0).toFixed(1);
-      var x=xAt(i).toFixed(1);
+    for(var i=0;i<indices.length;i++){
+      var index=indices[i],y=yFor(samples[index][key]||0).toFixed(1);
+      var x=xAt(index).toFixed(1);
       out.push(x+','+y);
-      if(i<valid.length-1) out.push(xAt(i+1).toFixed(1)+','+y);
+      if(i<indices.length-1) out.push(xAt(indices[i+1]).toFixed(1)+','+y);
     }
     return out.join(' ');
   }
-  var limitY=yFor(curLimit).toFixed(1),hcY=yFor(curHc).toFixed(1);
-  var s='';
-  // Guide lines: limit and hard cap
-  s+='<line x1="'+pad+'" y1="'+limitY+'" x2="'+(W-pad)+'" y2="'+limitY+'" class="spark-lim" />';
-  s+='<line x1="'+pad+'" y1="'+hcY+'" x2="'+(W-pad)+'" y2="'+hcY+'" class="spark-hc" />';
-  s+='<polyline points="'+pts('obs')+'" fill="none" class="spark-obs" stroke-width="1"/>';
-  s+='<polyline points="'+pts('loc')+'" fill="none" class="spark-loc" stroke-width="1"/>';
-  s+='<polyline points="'+stepPts('ep')+'" fill="none" class="spark-ep" stroke-width="1.2"/>';
+  function segmentedLine(key,cls,width,dash){
+    var out='';
+    for(var i=0;i<freshRuns.length;i++){
+      var extra=dash?' stroke-dasharray="'+dash+'"':'';
+      out+='<polyline points="'+segmentPts(key,freshRuns[i])+'" fill="none" class="'+cls+'" stroke-width="'+width+'"'+extra+'/>';
+    }
+    return out;
+  }
+  function segmentedStep(key,cls,width){
+    var out='';
+    for(var i=0;i<freshRuns.length;i++){
+      out+='<polyline points="'+stepSegmentPts(key,freshRuns[i])+'" fill="none" class="'+cls+'" stroke-width="'+width+'"/>';
+    }
+    return out;
+  }
+  // Throughput and completion bars form distinct background layers behind
+  // the main spark.  Both use the complete timestamp domain, including stale
+  // provider samples, because they are local gate signals.
+  var s='<title id="spark-title">Concurrency history</title><desc id="spark-desc">Observed and local concurrency, effective permits, throughput, and completions over the selected range.</desc>'+throughputBars()+completionBars();
+  // Provider concurrency guide lines and observations do not exist for
+  // adaptive providers; do not turn LimitState's conservative defaults into
+  // invented telemetry.
+  if(concurrencyTruthAvailable&&curLimit!=null)
+    s+='<line x1="'+pad+'" y1="'+yFor(curLimit).toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yFor(curLimit).toFixed(1)+'" class="spark-lim" />';
+  if(concurrencyTruthAvailable&&curHc!=null)
+    s+='<line x1="'+pad+'" y1="'+yFor(curHc).toFixed(1)+'" x2="'+(W-pad)+'" y2="'+yFor(curHc).toFixed(1)+'" class="spark-hc" />';
+  if(concurrencyTruthAvailable) s+=segmentedLine('obs','spark-obs','1');
+  s+=segmentedLine('loc','spark-loc','1');
+  s+=segmentedStep('ep','spark-ep','1.2');
   var hasPh=false;
   for(var j=0;j<valid.length;j++){if(valid[j].ph>0){hasPh=true;break;}}
-  if(hasPh) s+='<polyline points="'+pts('ph')+'" fill="none" class="spark-ph" stroke-width="0.8" stroke-dasharray="1.5,1.5"/>';
-  // Breaker / stale tick marks at the top of the spark
-  for(var b=0;b<valid.length;b++){
-    var x=xAt(b).toFixed(1);
-    if(valid[b].brk==='open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="13" class="tick-brk-open" stroke-width="1.5"/>';
-    else if(valid[b].brk==='half_open') s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="8" class="tick-brk-half" stroke-width="1.2"/>';
-    else if(valid[b].stl) s+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="6" class="tick-stale" stroke-width="1"/>';
-  }
+  if(concurrencyTruthAvailable&&hasPh) s+=segmentedLine('ph','spark-ph','0.8','1.5,1.5');
+  // Breaker / stale tick marks use the same complete timestamp domain.
+  s+=staleMarkers();
   // Keep crosshair line on top and off-canvas by default
   s+='<line id="crosshair-main" class="crosshair" x1="-10" y1="0" x2="-10" y2="120"/>';
-  // Throughput bars at the bottom of the spark (WI-023)
-  var maxTp=0;
-  for(var ti=0;ti<valid.length;ti++){if(valid[ti].tp>maxTp)maxTp=valid[ti].tp;}
-  if(maxTp>0){
-    var tpBarH=10;
-    var tpBase=H-pad;
-    for(var tb=0;tb<valid.length;tb++){
-      if(valid[tb].tp>0){
-        var bh=Math.max(1,(valid[tb].tp/maxTp)*tpBarH);
-        var bx=xAt(tb).toFixed(1);
-        s+='<rect x="'+(bx-0.5)+'" y="'+(tpBase-bh).toFixed(1)+'" width="1" height="'+bh.toFixed(1)+'" fill="var(--ok)" opacity="0.4"/>';
-      }
-    }
-  }
   svg.innerHTML=s;
   // -- band ribbon: one segment per non-normal sample
   var has503=false;
-  for(var h5=0;h5<valid.length;h5++){if(valid[h5].t503Inc){has503=true;break;}}
+  for(var h5=0;h5<samples.length;h5++){if(samples[h5].t503Inc){has503=true;break;}}
   var rb='';
-  var segW=(W-2*pad)/Math.max(valid.length,1);
-  for(var m=0;m<valid.length;m++){
-    var sev=SEV[valid[m].band]||0;
-    if(sev>0 && (valid[m].band!=='low_interactivity'||has503)) rb+='<rect x="'+xAt(m).toFixed(1)+'" y="0" width="'+Math.max(segW,1).toFixed(1)+'" height="4" fill="'+SEV_COLOR[sev]+'"/>';
+  var segW=(W-2*pad)/Math.max(samples.length,1);
+  for(var m=0;m<samples.length;m++){
+    var sev=SEV[samples[m].band]||0;
+    if(sev>0 && (samples[m].band!=='low_interactivity'||has503)) rb+='<rect x="'+xAt(m).toFixed(1)+'" y="0" width="'+Math.max(segW,1).toFixed(1)+'" height="4" fill="'+SEV_COLOR[sev]+'"/>';
   }
   document.getElementById('ribbon').innerHTML=rb;
   // -- queue spark: depth area + event ticks, own scale
   var maxQ=1;
-  for(var q=0;q<valid.length;q++){if(valid[q].qd>maxQ) maxQ=valid[q].qd;}
+  for(var q=0;q<samples.length;q++){if(samples[q].qd>maxQ) maxQ=samples[q].qd;}
   function qy(v){return QH-pad-(v/maxQ)*(QH-2*pad);}
-  var qpts=valid.map(function(h,i){return xAt(i).toFixed(1)+','+qy(h.qd||0).toFixed(1);}).join(' ');
-  var first=xAt(0).toFixed(1),last=xAt(valid.length-1).toFixed(1),base=(QH-pad).toFixed(1);
-  var qs='<line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
+  var qpts=samples.map(function(h,i){return xAt(i).toFixed(1)+','+qy(h.qd||0).toFixed(1);}).join(' ');
+  var first=xAt(0).toFixed(1),last=xAt(samples.length-1).toFixed(1),base=(QH-pad).toFixed(1);
+  var qs='<title id="qspark-title">Queue depth history</title><desc id="qspark-desc">Queue depth and request error events over the selected range.</desc><line id="crosshair-q" class="crosshair" x1="-10" y1="0" x2="-10" y2="28"/>';
   qs+='<polygon points="'+first+','+base+' '+qpts+' '+last+','+base+'" class="qfill" stroke="none"/>';
   qs+='<polyline points="'+qpts+'" fill="none" class="spark-qd" stroke-width="1"/>';
-  for(var t=0;t<valid.length;t++){
+  for(var t=0;t<samples.length;t++){
     var x=xAt(t).toFixed(1);
-    if(valid[t].t429Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-429" stroke-width="1"/>';
-    else if(valid[t].t503Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-503" stroke-width="1"/>';
-    else if(valid[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
+    if(samples[t].t429Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-429" stroke-width="1"/>';
+    else if(samples[t].t503Inc) qs+='<line x1="'+x+'" y1="'+pad+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-503" stroke-width="1"/>';
+    else if(samples[t].qtInc) qs+='<line x1="'+x+'" y1="'+(QH/2).toFixed(1)+'" x2="'+x+'" y2="'+(QH-pad)+'" class="tick-qt" stroke-width="1"/>';
   }
   document.getElementById('qspark').innerHTML=qs;
-  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ+(maxTp>0?' · throughput max '+maxTp:'');
+  info.textContent=infoBase+' · y max '+maxV+' · lim '+(curLimit??'?')+' · hc '+(curHc??'?')+' · queue max '+maxQ+(maxTp>0?' · throughput max '+maxTp:'')+(maxCp>0?' · completions max '+maxCp:'');
+  summary.textContent='Concurrency chart: '+info.textContent+'.';
   // -- reconciliation spark: provider requests_in_window vs sluice local count
-  var rspark=document.getElementById('rspark');
-  var rinfo=document.getElementById('rspark-info');
-  var rdeltaText=document.getElementById('rdelta-text');
-  var rvalid=samples.filter(function(h){return h.rwin!=null;});
-  if(rvalid.length<2){
-    rspark.innerHTML='';
+   var rspark=document.getElementById('rspark');
+   var rinfo=document.getElementById('rspark-info');
+   var rdeltaText=document.getElementById('rdelta-text');
+   var rsummary=document.getElementById('rspark-summary');
+  var rvalid=[],rvalidIndexes=[],rFreshRuns=[],rRun=[];
+  for(var rsi=0;rsi<samples.length;rsi++){
+    // Request-window counts are provider telemetry.  Preserve their x axis,
+    // but never draw a line through an interval where that telemetry was stale.
+    if(samples[rsi].rwin!=null&&!samples[rsi].stl){
+      rvalid.push(samples[rsi]);rvalidIndexes.push(rsi);rRun.push(rsi);
+    }else if(rRun.length){
+      rFreshRuns.push(rRun);rRun=[];
+    }
+  }
+  if(rRun.length) rFreshRuns.push(rRun);
+   if(rvalid.length<2){
+     rspark.innerHTML='';
     rspark.style.display='none';
     rinfo.textContent='';
     rdeltaText.textContent='';
+    rsummary.textContent='No fresh request budget data is available for the selected range.';
   }else{
     rspark.style.display='block';
     var RH=50,rpad=3;
@@ -1063,38 +1388,47 @@ function renderSparks(){
       if(rvalid[ri].rlw!=null&&rvalid[ri].rlw>rmaxV) rmaxV=rvalid[ri].rlw;
     }
     if(rmaxV<1) rmaxV=1;
-    var rspan=Math.max(denom-1,rvalid.length-1,1);
-    function rxAt(i){return rpad+(i/rspan)*(W-2*rpad);}
+    function rxAt(i){return rpad+(i/domainSpan)*(W-2*rpad);}
     function ryFor(v){return RH-rpad-(v/rmaxV)*(RH-2*rpad);}
     var rs='';
     if(rlimVal>0){
       var limY=ryFor(rlimVal).toFixed(1);
       rs+='<line x1="'+rpad+'" y1="'+limY+'" x2="'+(W-rpad)+'" y2="'+limY+'" class="rspark-lim"/>';
     }
-    var rwinPts=rvalid.map(function(h,i){return rxAt(i).toFixed(1)+','+ryFor(h.rwin).toFixed(1);}).join(' ');
-    rs+='<polyline points="'+rwinPts+'" fill="none" class="spark-rwin" stroke-width="1"/>';
+    function rPoints(indices,key){
+      return indices.map(function(index){
+        return rxAt(index).toFixed(1)+','+ryFor(samples[index][key]).toFixed(1);
+      }).join(' ');
+    }
+    for(var rri=0;rri<rFreshRuns.length;rri++)
+      rs+='<polyline points="'+rPoints(rFreshRuns[rri],'rwin')+'" fill="none" class="spark-rwin" stroke-width="1"/>';
     var hasRlw=false;
     for(var ri2=0;ri2<rvalid.length;ri2++){if(rvalid[ri2].rlw!=null){hasRlw=true;break;}}
     if(hasRlw){
-      var rlwPts=rvalid.map(function(h,i){
-        var v=h.rlw!=null?h.rlw:0;
-        return rxAt(i).toFixed(1)+','+ryFor(v).toFixed(1);
-      }).join(' ');
-      rs+='<polyline points="'+rlwPts+'" fill="none" class="spark-rlw" stroke-width="1"/>';
-      var gapPts='';
-      for(var gi=0;gi<rvalid.length;gi++){
-        gapPts+=rxAt(gi).toFixed(1)+','+ryFor(rvalid[gi].rwin).toFixed(1)+' ';
+      for(var rri2=0;rri2<rFreshRuns.length;rri2++){
+        var rindices=rFreshRuns[rri2];
+        var rlwPts=rindices.map(function(index){
+          var v=samples[index].rlw!=null?samples[index].rlw:0;
+          return rxAt(index).toFixed(1)+','+ryFor(v).toFixed(1);
+        }).join(' ');
+        rs+='<polyline points="'+rlwPts+'" fill="none" class="spark-rlw" stroke-width="1"/>';
+        var gapPts=rPoints(rindices,'rwin')+' ';
+        for(var gi2=rindices.length-1;gi2>=0;gi2--){
+          var lv=samples[rindices[gi2]].rlw!=null?samples[rindices[gi2]].rlw:0;
+          gapPts+=rxAt(rindices[gi2]).toFixed(1)+','+ryFor(lv).toFixed(1)+' ';
+        }
+        rs+='<polygon points="'+gapPts+'" class="rgap" stroke="none"/>';
       }
-      for(var gi2=rvalid.length-1;gi2>=0;gi2--){
-        var lv=rvalid[gi2].rlw!=null?rvalid[gi2].rlw:0;
-        gapPts+=rxAt(gi2).toFixed(1)+','+ryFor(lv).toFixed(1)+' ';
-      }
-      rs+='<polygon points="'+gapPts+'" class="rgap" stroke="none"/>';
     }
-    rspark.innerHTML=rs;
+    rspark.innerHTML='<title id="rspark-title">Request budget history</title><desc id="rspark-desc">Provider and sluice request counts over the selected range.</desc>'+rs;
     var curDelta=rvalid[rvalid.length-1].rdelta;
+    var latestRequest=rvalid[rvalid.length-1];
     rdeltaText.textContent=curDelta!=null?'Δ '+curDelta+(curDelta>0?' (leakage)':''):'';
     rinfo.textContent='max '+rmaxV+' · lim '+rlimVal;
+    rsummary.textContent='Request budget chart: provider count '+latestRequest.rwin
+      +'; sluice count '+(latestRequest.rlw!=null?latestRequest.rlw:'unavailable')
+      +'; difference '+(curDelta!=null?curDelta:'unavailable')
+      +'; provider limit '+rlimVal+'.';
   }
 }
 
@@ -1106,16 +1440,21 @@ function onSparkHover(e){
   var x=e.clientX-rect.left;
   var W=200,pad=3;
   var xView=Math.max(pad,Math.min(W-pad,(x/rect.width)*W));
-  var denom=viewRange==='5m'?HIST_MAX:v.length;
-  var span=Math.max(denom-1,v.length-1,1);
-  var idx=Math.round(((xView-pad)/(W-2*pad))*span);
-  idx=Math.max(0,Math.min(v.length-1,idx));
-  var s=v[idx];
+  var domainIdx=Math.round(((xView-pad)/(W-2*pad))*lastDomainSpan);
+  domainIdx=Math.max(0,Math.min(lastDomainSpan,domainIdx));
+  var nearest=0,nearestDistance=Infinity;
+  for(var vi=0;vi<lastValidIndexes.length;vi++){
+    var distance=Math.abs(lastValidIndexes[vi]-domainIdx);
+    if(distance<nearestDistance){nearest=vi;nearestDistance=distance;}
+  }
+  var selectedIdx=lastValidIndexes[nearest];
+  var s=v[nearest];
   document.getElementById('tip-ts').textContent=fmtTime(s.ts);
-  document.getElementById('tip-obs').textContent=s.obs!=null?s.obs:'-';
+  document.getElementById('tip-obs').textContent=concurrencyTruthAvailable&&s.obs!=null?s.obs:'unavailable';
   document.getElementById('tip-loc').textContent=s.loc;
   document.getElementById('tip-ep').textContent=s.ep;
   document.getElementById('tip-qd').textContent=s.qd;
+  document.getElementById('tip-cp').textContent=s.cp!=null?s.cp:'-';
   document.getElementById('tip-tp').textContent=s.tp!=null?s.tp:'-';
   document.getElementById('tip-503').textContent=s.t503!=null?s.t503:'-';
   document.getElementById('tip-band').textContent=s.band;
@@ -1136,9 +1475,11 @@ function onSparkHover(e){
   var top=e.clientY-cRect.top+12;
   if(left+tip.offsetWidth>cRect.width-8) left=cRect.width-tip.offsetWidth-8;
   if(top+tip.offsetHeight>cRect.height-8) top=cRect.height-tip.offsetHeight-8;
+  left=Math.max(0,left);
+  top=Math.max(0,top);
   tip.style.left=left+'px';
   tip.style.top=top+'px';
-  var cx=(pad+(idx/span)*(W-2*pad)).toFixed(1);
+  var cx=(pad+(selectedIdx/lastDomainSpan)*(W-2*pad)).toFixed(1);
   var cm=document.getElementById('crosshair-main');
   if(cm){cm.setAttribute('x1',cx);cm.setAttribute('x2',cx);}
   var cq=document.getElementById('crosshair-q');

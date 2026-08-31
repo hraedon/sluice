@@ -17,6 +17,8 @@ import pytest
 
 from sluice.control import BreakerConfig, ControllerConfig, UsageReading
 from sluice.gate import PermitGate
+from sluice.history import History
+from sluice.history_store import SQLiteHistoryStore
 from sluice.proxy import ProxyApp, _classify_429
 from sluice.reconcile import ReconciliationLoop
 from sluice.usage import CachedReading
@@ -1111,7 +1113,7 @@ async def test_dashboard_sparkline_depth_elements():
     assert "qd:d.queue_depth" in html
     assert "t429:d.total_429s" in html
     # Effective-permits line and guide lines.
-    assert "stepPts('ep')" in html
+    assert "segmentedStep('ep'" in html
     assert "spark-ep" in html
     assert "spark-lim" in html
     assert "spark-hc" in html
@@ -3184,6 +3186,106 @@ async def test_drain_waits_for_in_flight_requests():
     assert app._lifecycle.is_draining is True  # draining flag stays set
 
 
+async def test_drain_flushes_completion_history_before_store_close(tmp_path):
+    """A first-tick cancellation after resize still persists drain releases.
+
+    The resize hook applies the new capacity and then blocks the first tick
+    before its normal completion sample.  A request is admitted through that
+    resize, and shutdown cancels the suspended tick.  Events, rather than
+    sleeps or polling, pin the ordering so the final shutdown flush must use
+    the baseline established by ``ReconciliationLoop.start``.
+    """
+    release_event = asyncio.Event()
+    resize_reached = asyncio.Event()
+    resize_cancelled = asyncio.Event()
+    request_started = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+
+        async def gen():
+            await release_event.wait()
+            yield b'{"done": true}'
+
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    app, gate, reconcile = _make_app(gate_capacity=0, upstream_handler=handler)
+    original_resize = gate.resize
+
+    async def controlled_resize(new_capacity: int) -> None:
+        await original_resize(new_capacity)
+        resize_reached.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            resize_cancelled.set()
+            raise
+
+    gate.resize = controlled_resize  # type: ignore[method-assign]
+    history = History(maxlen=20)
+    store = SQLiteHistoryStore(str(tmp_path / "drain-history.db"))
+    reconcile._history = history
+    reconcile._history_store = store
+
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_task = asyncio.create_task(
+        app({"type": "lifespan"}, lifespan_receive_fn, lifespan_send_fn)
+    )
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    try:
+        async with _asgi_client(app) as client:
+            await asyncio.wait_for(resize_reached.wait(), timeout=5.0)
+            assert gate.capacity > 0
+            assert reconcile._prev_total_releases == 0
+            assert reconcile._completion_sampled is False
+
+            request_task = asyncio.create_task(
+                client.post("/v1/messages", json={"prompt": "hi"})
+            )
+            await asyncio.wait_for(request_started.wait(), timeout=5.0)
+            assert gate.held == 1
+
+            await lifespan_receive.put({"type": "lifespan.shutdown"})
+            await asyncio.wait_for(resize_cancelled.wait(), timeout=5.0)
+            assert app._lifecycle.is_draining
+
+            release_event.set()
+            await asyncio.wait_for(request_task, timeout=5.0)
+            await asyncio.wait_for(lifespan_task, timeout=5.0)
+            assert store.is_available is False
+    finally:
+        if not lifespan_task.done():
+            lifespan_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await lifespan_task
+        await app._client.aclose()
+
+    assert history.entries()[-1].completions == 1
+    assert history.entries()[-1].throughput == 0
+    shutdown_sample_id = history.entries()[-1].sample_id
+    assert shutdown_sample_id is not None
+    reopened = SQLiteHistoryStore(str(tmp_path / "drain-history.db"))
+    try:
+        entries = reopened.load_recent(20)
+        assert entries[-1].completions == 1
+        assert entries[-1].sample_id == shutdown_sample_id
+    finally:
+        reopened.close()
+
+
 async def test_drain_timeout_closes_with_in_flight():
     """Drain timeout expires and closes the client even if requests are still in-flight."""
 
@@ -3254,6 +3356,278 @@ async def test_drain_timeout_closes_with_in_flight():
         await request_task
     except (asyncio.CancelledError, Exception):
         pass
+
+
+async def test_drain_timeout_cancels_proxy_tasks_before_final_history_flush(tmp_path):
+    """Timed-out drains quiesce request finally-blocks before sampling releases."""
+    request_started = asyncio.Event()
+    upstream_blocked = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_started.set()
+
+        async def gen():
+            await upstream_blocked.wait()
+            yield b'{"never": "needed"}'
+
+        return httpx.Response(200, content=gen(), headers={"content-type": "application/json"})
+
+    app, gate, reconcile = _make_app(upstream_handler=handler)
+    app._lifecycle._drain_timeout = 0.0
+    history = History(maxlen=20)
+    store = SQLiteHistoryStore(str(tmp_path / "timeout-history.db"))
+    reconcile._history = history
+    reconcile._history_store = store
+
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_task = asyncio.create_task(
+        app({"type": "lifespan"}, lifespan_receive_fn, lifespan_send_fn)
+    )
+    await lifespan_receive.put({"type": "lifespan.startup"})
+    await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+    request_task: asyncio.Task | None = None
+    try:
+        async with _asgi_client(app) as client:
+            request_task = asyncio.create_task(
+                client.post("/v1/messages", json={"prompt": "timeout"})
+            )
+            await asyncio.wait_for(request_started.wait(), timeout=5.0)
+            assert gate.held == 1
+
+            await lifespan_receive.put({"type": "lifespan.shutdown"})
+            await asyncio.wait_for(lifespan_task, timeout=5.0)
+
+            assert request_task.done()
+            assert gate.held == 0
+            assert not app._proxy_tasks
+            assert history.entries()[-1].completions == 1
+            assert store.is_available is False
+            if request_task.cancelled():
+                with pytest.raises(asyncio.CancelledError):
+                    await request_task
+            else:
+                await request_task
+    finally:
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+        if not lifespan_task.done():
+            lifespan_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await lifespan_task
+        await app._client.aclose()
+
+    reopened = SQLiteHistoryStore(str(tmp_path / "timeout-history.db"))
+    try:
+        assert reopened.load_recent(20)[-1].completions == 1
+    finally:
+        reopened.close()
+
+
+async def test_shutdown_before_headers_cleans_all_proxy_siblings():
+    """Shutdown-before-headers does not leak disconnect or upstream waiters."""
+    headers_started = asyncio.Event()
+    upstream_cancelled = asyncio.Event()
+    release_headers = asyncio.Event()
+
+    class BlockingHeadersTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async for _chunk in request.stream:
+                pass
+            headers_started.set()
+            try:
+                await release_headers.wait()
+            except asyncio.CancelledError:
+                upstream_cancelled.set()
+                raise
+            return _resp()
+
+    app, gate, _ = _make_app()
+    original_client = app._client
+    app._client = httpx.AsyncClient(
+        transport=BlockingHeadersTransport(),
+        timeout=None,
+    )
+    app._lifecycle._client = app._client
+    app._lifecycle._drain_timeout = 0.0
+
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    baseline_tasks = set(asyncio.all_tasks())
+    lifespan_task = asyncio.create_task(
+        app({"type": "lifespan"}, lifespan_receive_fn, lifespan_send_fn)
+    )
+    request_task: asyncio.Task | None = None
+    try:
+        await lifespan_receive.put({"type": "lifespan.startup"})
+        await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+        async with _asgi_client(app) as client:
+            request_task = asyncio.create_task(
+                client.post("/v1/messages", json={"prompt": "headers"})
+            )
+            await asyncio.wait_for(headers_started.wait(), timeout=5.0)
+            assert gate.held == 1
+
+            await lifespan_receive.put({"type": "lifespan.shutdown"})
+            await asyncio.wait_for(lifespan_task, timeout=5.0)
+            response = await asyncio.wait_for(request_task, timeout=5.0)
+
+            assert response.status_code == 503
+            assert upstream_cancelled.is_set()
+            assert gate.held == 0
+            assert not app._proxy_tasks
+
+            await asyncio.sleep(0)
+            leaked = [
+                task
+                for task in asyncio.all_tasks()
+                if task not in baseline_tasks and not task.done()
+            ]
+            assert not leaked, [
+                (task.get_name(), repr(task.get_coro())) for task in leaked
+            ]
+    finally:
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+        if not lifespan_task.done():
+            lifespan_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await lifespan_task
+        await app._client.aclose()
+        await original_client.aclose()
+
+
+async def test_shutdown_failed_when_transport_resists_cancellation(tmp_path):
+    """A cancellation-resistant transport keeps shutdown bounded and honest.
+
+    The transport suppresses cancellation while waiting to produce response
+    headers.  Shutdown must not wait forever or emit ``shutdown.complete``
+    while the request still owns its permit; the final history sample must
+    likewise retain the in-flight accounting.  Once the transport is released,
+    the request may finish and release its permit normally.
+    """
+    headers_started = asyncio.Event()
+    cancel_seen = asyncio.Event()
+    release_headers = asyncio.Event()
+
+    class CancellationResistantTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            async for _chunk in request.stream:
+                pass
+            headers_started.set()
+            while not release_headers.is_set():
+                try:
+                    await release_headers.wait()
+                except asyncio.CancelledError:
+                    cancel_seen.set()
+                    # Deliberately suppress cancellation to model a transport
+                    # that cannot be stopped synchronously.
+            return _resp()
+
+    app, gate, reconcile = _make_app()
+    old_client = app._client
+    app._client = httpx.AsyncClient(
+        transport=CancellationResistantTransport(),
+        timeout=None,
+    )
+    app._lifecycle._client = app._client
+    app._lifecycle._drain_timeout = 0.0
+    history = History(maxlen=20)
+    store = SQLiteHistoryStore(str(tmp_path / "resistant-history.db"))
+    reconcile._history = history
+    reconcile._history_store = store
+
+    lifespan_receive: asyncio.Queue = asyncio.Queue()
+    lifespan_sent: list[dict] = []
+    startup_done = asyncio.Event()
+
+    async def lifespan_receive_fn() -> dict:
+        return await lifespan_receive.get()
+
+    async def lifespan_send_fn(event: dict) -> None:
+        lifespan_sent.append(event)
+        if event["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    lifespan_task = asyncio.create_task(
+        app({"type": "lifespan"}, lifespan_receive_fn, lifespan_send_fn)
+    )
+    request_task: asyncio.Task | None = None
+    try:
+        await lifespan_receive.put({"type": "lifespan.startup"})
+        await asyncio.wait_for(startup_done.wait(), timeout=5.0)
+
+        async def send_request() -> None:
+            async with _asgi_client(app) as client:
+                await client.post("/v1/messages", json={"prompt": "resistant"})
+
+        request_task = asyncio.create_task(send_request())
+        await asyncio.wait_for(headers_started.wait(), timeout=5.0)
+        assert gate.held == 1
+
+        start = asyncio.get_running_loop().time()
+        await lifespan_receive.put({"type": "lifespan.shutdown"})
+        await asyncio.wait_for(lifespan_task, timeout=5.0)
+        elapsed = asyncio.get_running_loop().time() - start
+
+        assert elapsed < 4.0, "shutdown must remain bounded when transport resists cancellation"
+        assert cancel_seen.is_set()
+        assert [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.complete"] == []
+        failed = [e for e in lifespan_sent if e["type"] == "lifespan.shutdown.failed"]
+        assert len(failed) == 1
+        assert gate.held == 1, "the resistant request still owns its permit"
+        assert gate.total_releases == 0
+        assert app._proxy_tasks, "the resistant request must remain tracked"
+        assert history.entries()[-1].local_in_flight == 1
+        assert history.entries()[-1].completions == 0
+        assert store.is_available is False
+
+        release_headers.set()
+        await asyncio.wait_for(request_task, timeout=5.0)
+        assert gate.held == 0
+        assert gate.total_releases == 1
+    finally:
+        release_headers.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+        if not lifespan_task.done():
+            lifespan_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await lifespan_task
+        await app._client.aclose()
+        await old_client.aclose()
+
+    reopened = SQLiteHistoryStore(str(tmp_path / "resistant-history.db"))
+    try:
+        entry = reopened.load_recent(20)[-1]
+        assert entry.local_in_flight == 1
+        assert entry.completions == 0
+    finally:
+        reopened.close()
 
 
 async def test_new_requests_503_during_drain():

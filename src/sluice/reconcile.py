@@ -23,6 +23,7 @@ import logging
 import math
 import random
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -141,6 +142,17 @@ class ReconciliationLoop:
         self._last_local_requests_in_window: int | None = None
         self._last_request_window_delta: int | None = None
         self._last_throughput: int = 0  # requests forwarded since previous tick (WI-023)
+        # PermitGate's release counter is sampled at tick boundaries.  Direct
+        # calls to tick() establish the first-sample baseline here; start()
+        # initializes it synchronously before scheduling the first tick.
+        self._prev_total_releases: int | None = None
+        self._completion_gate: PermitGate = gate
+        self._last_completions: int = 0
+        self._completion_sampled = False
+        self._boot_id = uuid.uuid4().hex
+        self._sample_sequence = 0
+        self._last_tick_failed = False
+        self._last_nonleader = False
 
         self._adaptive = AdaptiveSnapshot()
 
@@ -364,10 +376,55 @@ class ReconciliationLoop:
     # -- the tick ------------------------------------------------------------
 
     async def tick(self) -> None:
+        """Run one reconciliation cycle and advance completion sampling.
+
+        The completion counter belongs to the tick interval, not to whether
+        the usage fetch succeeded.  Keep the sampling in this wrapper so a
+        failed fetch still advances the baseline before ``run()`` records its
+        fail-safe history entry.
+        """
+        self._completion_sampled = False
+        self._last_tick_failed = False
+        self._last_nonleader = False
+        try:
+            await self._tick_once()
+        except Exception:
+            # A failed interval is represented as zero throughput even when
+            # no history sink is configured; status.json is still a live
+            # consumer and must not republish the previous successful delta.
+            self._idle = False
+            self._last_throughput = 0
+            self._prev_total_requests_forwarded = self._total_requests_forwarded
+            self._last_tick_failed = True
+            self._last_nonleader = False
+            if self._last_reading_cached is not None:
+                self._last_reading_cached = dataclasses.replace(
+                    self._last_reading_cached, ok=False
+                )
+            if not self._completion_sampled:
+                self._last_completions = self._sample_completions()
+                self._completion_sampled = True
+            raise
+
+    async def _tick_once(self) -> None:
         """One reconciliation cycle: fetch → compute → resize."""
         # Non-leader: don't poll, hold the gate closed (fail-safe).
         if self._guard is not None and not self._guard.is_held():
             await self._gate.resize(0)
+            self._last_tick_failed = False
+            self._last_nonleader = True
+            self._last_permits = 0
+            # No request can be forwarded while non-leader.  Advance the
+            # throughput baseline so the last successful tick's delta is not
+            # republished as traffic for this interval or the next one.
+            self._last_throughput = 0
+            self._prev_total_requests_forwarded = self._total_requests_forwarded
+            # Advance the release baseline, but do not attribute completions
+            # to an interval in which this instance was not serving traffic.
+            self._sample_completions()
+            self._last_completions = 0
+            self._completion_sampled = True
+            self._record_nonleader_tick()
             return
 
         now_mono = self._mono()
@@ -485,6 +542,8 @@ class ReconciliationLoop:
         # actual traffic in this tick interval — zero means idle.
         self._last_throughput = self._total_requests_forwarded - self._prev_total_requests_forwarded
         self._prev_total_requests_forwarded = self._total_requests_forwarded
+        self._last_completions = self._sample_completions()
+        self._completion_sampled = True
 
         # Request-window reconciliation: prune local timestamps to the
         # provider's window and compute the delta against requests_in_window.
@@ -558,6 +617,8 @@ class ReconciliationLoop:
                 local_requests_in_window=self._last_local_requests_in_window,
                 request_window_delta=self._last_request_window_delta,
                 throughput=self._last_throughput,
+                completions=self._last_completions,
+                sample_id=self.sample_id,
             )
             if self._history is not None:
                 self._history.append(entry)
@@ -592,6 +653,7 @@ class ReconciliationLoop:
                 raise
             except Exception:
                 log.exception("reconciliation tick failed — closing gate (fail-safe)")
+                self._idle = False
                 self._last_permits = 0
                 try:
                     await self._gate.resize(0)
@@ -610,13 +672,8 @@ class ReconciliationLoop:
             except TimeoutError:
                 pass
 
-    def _record_failed_tick(self) -> None:
-        """Record a fail-safe history entry when tick() raises.
-
-        Uses the last-known state (which may be stale) and marks
-        ``effective_permits=0``, ``stale=True``, ``tick_failed=True`` so the
-        trend shows the gap rather than silently skipping it.
-        """
+    def _record_nonleader_tick(self) -> None:
+        """Persist a zero-metric interval while this instance is not leader."""
         if self._history is None and self._history_store is None:
             return
         reading = None
@@ -651,7 +708,65 @@ class ReconciliationLoop:
             local_requests_in_window=self._last_local_requests_in_window,
             request_window_delta=self._last_request_window_delta,
             throughput=0,
+            completions=0,
+            sample_id=self.sample_id,
+            nonleader=True,
+        )
+        if self._history is not None:
+            self._history.append(entry)
+        if self._history_store is not None:
+            self._history_store.append(entry)
+
+    def _record_failed_tick(self) -> None:
+        """Record a fail-safe history entry when tick() raises.
+
+        Uses the last-known state (which may be stale) and marks
+        ``effective_permits=0``, ``stale=True``, ``tick_failed=True`` so the
+        trend shows the gap rather than silently skipping it.
+        """
+        if self._history is None and self._history_store is None:
+            return
+        reading = None
+        if self._last_reading_cached is not None:
+            reading = self._last_reading_cached.reading
+        # Failed ticks are fail-safe samples, not successful polling
+        # intervals.  Preserve the existing zero-throughput semantics and
+        # consume the cumulative counter so the next successful tick starts a
+        # fresh interval instead of carrying this failed interval forward.
+        self._last_throughput = 0
+        self._prev_total_requests_forwarded = self._total_requests_forwarded
+        entry = HistoryEntry(
+            timestamp=self._wall(),
+            concurrent_sessions=reading.concurrent_sessions if reading else None,
+            local_in_flight=self._gate.held,
+            phantom_estimate=self._last_phantom_estimate,
+            effective_permits=0,
+            limit=reading.limit if reading else None,
+            hard_cap=reading.hard_cap if reading else None,
+            band=self._last_band.value,
+            breaker=self._breaker.state.value,
+            priority_low=reading.priority_low if reading else False,
+            usage_age=self._last_age,
+            stale=True,
+            recent_429s=len(self._recent_429s),
+            total_429s=self._total_429s,
+            rate_limit_429s=self._total_rate_limit_429s,
+            total_503s=self._total_503s,
+            low_interactivity=(
+                is_low_interactivity(reading, now=self._wall())
+                if reading else False
+            ),
+            queue_depth=self._gate.queue_depth,
+            queue_timeouts=self._gate.queue_timeouts,
+            requests_in_window=reading.requests_in_window if reading else None,
+            requests_limit=reading.requests_limit if reading else None,
+            requests_remaining=reading.requests_remaining if reading else None,
+            local_requests_in_window=self._last_local_requests_in_window,
+            request_window_delta=self._last_request_window_delta,
+            throughput=0,
+            completions=self._last_completions,
             tick_failed=True,
+            sample_id=self.sample_id,
         )
         if self._history is not None:
             self._history.append(entry)
@@ -664,14 +779,24 @@ class ReconciliationLoop:
         if self._poll_now is None:
             self._poll_now = asyncio.Event()
         if self._task is None:
+            # Establish the release baseline synchronously, before scheduling
+            # the first tick.  The first tick opens the gate after its usage
+            # fetch; if shutdown cancels that tick while it is suspended just
+            # after resize, the final shutdown flush must still see releases
+            # from requests admitted by that resize.
+            self._completion_gate = self._gate
+            self._prev_total_releases = self._gate.total_releases
+            self._last_completions = 0
             self._task = asyncio.create_task(self.run())
 
-    async def stop(self) -> None:
+    async def stop(self, *, close_history_store: bool = True) -> None:
         """Cancel the background loop and close the truth source + store.
 
         Sets ``_stopped`` first so in-flight proxy requests calling
         :meth:`record_response_headers` during the drain window return
-        early instead of touching the closed truth source (WI-030).
+        early instead of touching the closed truth source (WI-030).  Lifecycle
+        shutdown defers the telemetry store close until after its drain so
+        releases from in-flight requests can be sampled and persisted.
         """
         self._stopped = True
         if self._task is not None:
@@ -682,8 +807,74 @@ class ReconciliationLoop:
                 pass
             self._task = None
         await self._truth.close()
+        if close_history_store:
+            self.close_history_store()
+
+    def flush_shutdown_history(self) -> None:
+        """Sample and persist releases that happened after the last tick.
+
+        The lifecycle manager stops polling before graceful drain, but permits
+        can still be released by requests that were already admitted.  This
+        telemetry-only flush must happen before the history store is closed;
+        it never acquires, resizes, or cancels the gate.
+        """
+        self._last_throughput = 0
+        self._prev_total_requests_forwarded = self._total_requests_forwarded
+        self._last_completions = self._sample_completions()
+        self._completion_sampled = True
+        if self._history is None and self._history_store is None:
+            return
+        try:
+            self._record_shutdown_tick()
+        except Exception:
+            log.warning("shutdown history flush failed", exc_info=True)
+
+    def close_history_store(self) -> None:
+        """Close the optional history store after shutdown telemetry is flushed."""
         if self._history_store is not None:
             self._history_store.close()
+
+    def _record_shutdown_tick(self) -> None:
+        """Append a final state snapshot carrying the shutdown release delta."""
+        cached = self._last_reading_cached
+        reading = cached.reading if cached is not None else None
+        fresh = cached is not None and cached.ok
+        entry = HistoryEntry(
+            timestamp=self._wall(),
+            concurrent_sessions=reading.concurrent_sessions if fresh and reading else None,
+            local_in_flight=self._gate.held,
+            phantom_estimate=self._last_phantom_estimate,
+            effective_permits=self._last_permits,
+            limit=reading.limit if fresh and reading else None,
+            hard_cap=reading.hard_cap if fresh and reading else None,
+            band=self._last_band.value,
+            breaker=self._breaker.state.value,
+            priority_low=reading.priority_low if reading else False,
+            usage_age=self._last_age,
+            stale=not fresh,
+            recent_429s=len(self._recent_429s),
+            total_429s=self._total_429s,
+            rate_limit_429s=self._total_rate_limit_429s,
+            total_503s=self._total_503s,
+            low_interactivity=(
+                is_low_interactivity(reading, now=self._wall())
+                if reading else False
+            ),
+            queue_depth=self._gate.queue_depth,
+            queue_timeouts=self._gate.queue_timeouts,
+            requests_in_window=reading.requests_in_window if fresh and reading else None,
+            requests_limit=reading.requests_limit if fresh and reading else None,
+            requests_remaining=reading.requests_remaining if fresh and reading else None,
+            local_requests_in_window=self._last_local_requests_in_window,
+            request_window_delta=self._last_request_window_delta,
+            throughput=0,
+            completions=self._last_completions,
+            sample_id=self.sample_id,
+        )
+        if self._history is not None:
+            self._history.append(entry)
+        if self._history_store is not None:
+            self._history_store.append(entry)
 
     # -- observability (read by /metrics, /status, etc.) ---------------------
 
@@ -800,7 +991,23 @@ class ReconciliationLoop:
 
     @property
     def last_fetch_ok(self) -> bool:
-        return self._last_reading_cached.ok if self._last_reading_cached else False
+        cached = self._last_reading_cached
+        return bool(
+            cached is not None
+            and not self._last_tick_failed
+            and not self._last_nonleader
+            and cached.ok
+        )
+
+    @property
+    def tick_failed(self) -> bool:
+        """Whether the latest interval ended with a reconciliation exception."""
+        return self._last_tick_failed
+
+    @property
+    def nonleader(self) -> bool:
+        """Whether the latest interval ran without the singleton lease."""
+        return self._last_nonleader
 
     @property
     def observed_concurrent_sessions(self) -> int | None:
@@ -935,6 +1142,27 @@ class ReconciliationLoop:
             return min(self._poll_interval_idle_cfg, cap)
         return self._poll_interval
 
+    def _sample_completions(self) -> int:
+        """Return the non-negative release delta since the previous tick.
+
+        ``PermitGate`` counters are process-local and therefore reset on a
+        restart (or if a gate is replaced).  A decreasing counter is a reset,
+        not a burst of completions; use zero for that sample and establish the
+        new baseline.
+        """
+        gate = self._gate
+        current = gate.total_releases
+        self._sample_sequence += 1
+        if gate is not self._completion_gate:
+            self._completion_gate = gate
+            self._prev_total_releases = current
+            return 0
+        previous = self._prev_total_releases
+        self._prev_total_releases = current
+        if previous is None or current < previous:
+            return 0
+        return current - previous
+
     @property
     def total_requests_forwarded(self) -> int:
         """Total requests forwarded upstream since startup."""
@@ -944,6 +1172,21 @@ class ReconciliationLoop:
     def last_throughput(self) -> int:
         """Requests forwarded in the last tick interval (WI-023)."""
         return self._last_throughput
+
+    @property
+    def last_completions(self) -> int:
+        """Permit releases observed in the last tick interval (WI-023)."""
+        return self._last_completions
+
+    @property
+    def sample_sequence(self) -> int:
+        """Monotonic identifier for the latest completion/throughput sample."""
+        return self._sample_sequence
+
+    @property
+    def sample_id(self) -> str:
+        """Boot-qualified identity for the latest completion/throughput sample."""
+        return f"{self._boot_id}:{self._sample_sequence}"
 
     @property
     def local_requests_in_window(self) -> int | None:

@@ -76,6 +76,21 @@ async def test_queue_timeout_is_counted_not_sampled():
     assert gate.avg_wait_seconds == 0.0  # a timeout is not a grant sample
 
 
+async def test_total_releases_counts_successful_releases_only():
+    """The release counter advances once per held permit, not on double-release."""
+    gate = PermitGate(initial_capacity=1)
+
+    assert gate.total_releases == 0
+    assert await gate.acquire(timeout=0.1)
+    await gate.release()
+    assert gate.total_releases == 1
+
+    # A release with no held permit is ignored and must not create a fake
+    # completion sample.
+    await gate.release()
+    assert gate.total_releases == 1
+
+
 # ---------------------------------------------------------------------------
 # p95_wait_seconds: nearest-rank method and small-sample behavior
 #

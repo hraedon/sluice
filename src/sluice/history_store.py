@@ -105,7 +105,10 @@ CREATE TABLE IF NOT EXISTS history (
     rrem INTEGER,
     rlw  INTEGER,
     rdelta INTEGER,
-    tp   INTEGER NOT NULL DEFAULT 0
+    tp   INTEGER NOT NULL DEFAULT 0,
+    cp   INTEGER NOT NULL DEFAULT 0,
+    sid  TEXT,
+    nl   INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -122,15 +125,24 @@ _MIGRATIONS = [
     "ALTER TABLE history ADD COLUMN tp INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE history ADD COLUMN t503 INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE history ADD COLUMN li INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE history ADD COLUMN cp INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE history ADD COLUMN sid TEXT",
+    "ALTER TABLE history ADD COLUMN nl INTEGER NOT NULL DEFAULT 0",
 ]
 
 _INSERT = """\
-INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp, cp, sid, nl)
+VALUES (
+    ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?,
+    ?
+)
 """
 
 _SELECT = """\
-SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp
+SELECT ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, rlw, rdelta, tp, cp, sid, nl
 FROM history ORDER BY ts DESC, rowid DESC LIMIT ?
 """
 
@@ -231,6 +243,9 @@ class SQLiteHistoryStore:
                     entry.local_requests_in_window,
                     entry.request_window_delta,
                     entry.throughput,
+                    entry.completions,
+                    entry.sample_id,
+                    entry.nonleader,
                 ),
             )
         except Exception:
@@ -275,6 +290,9 @@ class SQLiteHistoryStore:
                 local_requests_in_window=row[23] if len(row) > 23 else None,
                 request_window_delta=row[24] if len(row) > 24 else None,
                 throughput=row[25] if len(row) > 25 and row[25] is not None else 0,
+                completions=row[26] if len(row) > 26 and row[26] is not None else 0,
+                sample_id=row[27] if len(row) > 27 else None,
+                nonleader=bool(row[28]) if len(row) > 28 and row[28] is not None else False,
             )
             for row in rows
         ]

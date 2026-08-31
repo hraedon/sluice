@@ -205,6 +205,9 @@ def test_store_roundtrip_all_fields():
             rate_limit_429s=7,
             queue_depth=5,
             queue_timeouts=2,
+            completions=6,
+            sample_id="boot-a:7",
+            nonleader=True,
             tick_failed=True,
         )
         store.append(entry)
@@ -228,6 +231,9 @@ def test_store_roundtrip_all_fields():
         assert e.rate_limit_429s == 7
         assert e.queue_depth == 5
         assert e.queue_timeouts == 2
+        assert e.completions == 6
+        assert e.sample_id == "boot-a:7"
+        assert e.nonleader is True
         assert e.tick_failed is True
         store.close()
 
@@ -878,18 +884,25 @@ CREATE TABLE history (
         store = SQLiteHistoryStore(path)
         assert store.is_available, "store should be available after migration"
 
-        # Old row should be loadable with throughput=0 (DEFAULT 0 backfill)
+        # Old row should be loadable with both new counters at zero (DEFAULT
+        # backfill for columns added after the row was written).
         entries = store.load_recent(10)
         assert len(entries) == 1
         assert entries[0].concurrent_sessions == 3
         assert entries[0].throughput == 0, "old rows should have throughput=0 after migration"
+        assert entries[0].completions == 0, "old rows should have completions=0 after migration"
+        assert entries[0].sample_id is None, "old rows should have no sample identity"
+        assert entries[0].nonleader is False, "old rows should have nonleader=0 after migration"
 
-        # New row should store the throughput value correctly
-        store.append(_entry(timestamp=1001.0, concurrent_sessions=1, throughput=5))
+        # New rows should store both counters correctly.
+        store.append(_entry(timestamp=1001.0, concurrent_sessions=1, throughput=5, completions=7, sample_id="boot-a:1"))
         entries = store.load_recent(10)
         assert len(entries) == 2
         assert entries[0].throughput == 0, "old row throughput still 0"
         assert entries[1].throughput == 5, "new row throughput should be 5"
+        assert entries[0].completions == 0, "old row completions still 0"
+        assert entries[1].completions == 7, "new row completions should be 7"
+        assert entries[1].sample_id == "boot-a:1"
 
         store.close()
 
@@ -901,7 +914,7 @@ def test_migration_idempotent_when_tp_already_exists():
         path = os.path.join(tmp, "new_schema.db")
         # Create with the new code (which creates the full schema including tp)
         store1 = SQLiteHistoryStore(path)
-        store1.append(_entry(timestamp=1000.0, throughput=3))
+        store1.append(_entry(timestamp=1000.0, throughput=3, completions=4))
         store1.close()
 
         # Reopen — migration should be a no-op
@@ -910,7 +923,51 @@ def test_migration_idempotent_when_tp_already_exists():
         entries = store2.load_recent(10)
         assert len(entries) == 1
         assert entries[0].throughput == 3
+        assert entries[0].completions == 4
         store2.close()
+
+
+def test_migration_adds_cp_to_legacy_tp_history():
+    """A WI-023-era database with ``tp`` but no ``cp`` gains zero backfill."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "legacy_tp.db")
+        conn = sqlite3.connect(path)
+        conn.execute("""\
+CREATE TABLE history (
+    ts REAL NOT NULL, obs INTEGER, loc INTEGER NOT NULL, ph INTEGER NOT NULL,
+    ep INTEGER NOT NULL, lim INTEGER, hc INTEGER, band TEXT NOT NULL,
+    brk TEXT NOT NULL, pl INTEGER NOT NULL, age REAL NOT NULL,
+    stl INTEGER NOT NULL, r429 INTEGER NOT NULL, t429 INTEGER NOT NULL,
+    rl429 INTEGER NOT NULL DEFAULT 0, t503 INTEGER NOT NULL DEFAULT 0,
+    li INTEGER NOT NULL DEFAULT 0, qd INTEGER NOT NULL, qt INTEGER NOT NULL,
+    err INTEGER NOT NULL, rwin INTEGER, rlim INTEGER, rrem INTEGER,
+    rlw INTEGER, rdelta INTEGER, tp INTEGER NOT NULL DEFAULT 0
+)
+""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)")
+        conn.execute(
+            "INSERT INTO history (ts, obs, loc, ph, ep, lim, hc, band, brk, pl, age, "
+            "stl, r429, t429, rl429, t503, li, qd, qt, err, rwin, rlim, rrem, "
+            "rlw, rdelta, tp) VALUES "
+            "(1000, 1, 0, 0, 3, 4, 8, 'normal', 'closed', 0, 0, 0, 0, 0, "
+            "0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, 9)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = SQLiteHistoryStore(path)
+        entries = store.load_recent(10)
+        assert len(entries) == 1
+        assert entries[0].throughput == 9
+        assert entries[0].completions == 0
+
+        store.append(_entry(timestamp=1001, completions=4, sample_id="boot-b:1"))
+        entries = store.load_recent(10)
+        assert entries[-1].completions == 4
+        assert entries[-1].sample_id == "boot-b:1"
+        store.close()
 
 
 def test_migration_adds_t503_and_li_columns_to_old_db():

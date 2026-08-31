@@ -102,7 +102,7 @@ def test_dashboard_js_is_syntactically_valid() -> None:
 _NODE_RENDER_PREFIX = r"""
 function _escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function _mockEl(id){
-  var _tc='',_ih='',_cn='';
+  var _tc='',_ih='',_cn='',_attrs={};
   return {
     id:id,
     style:{},
@@ -113,8 +113,9 @@ function _mockEl(id){
     set innerHTML(v){_ih=String(v);},
     get className(){return _cn;},
     set className(v){_cn=String(v);},
-    setAttribute:function(){},
-    getAttribute:function(){return null;},
+    setAttribute:function(name,value){_attrs[name]=String(value);},
+    removeAttribute:function(name){delete _attrs[name];},
+    getAttribute:function(name){return _attrs[name]||null;},
     getBoundingClientRect:function(){return{left:0,top:0,width:200,height:120};},
     addEventListener:function(){},
     removeEventListener:function(){},
@@ -391,6 +392,614 @@ def test_dashboard_has_error_banner() -> None:
     assert "hideError()" in html, (
         "hideError must be called in config mutation functions"
     )
+
+
+@pytest.mark.parametrize("viewport", [280, 320, 360, 400, 1280])
+def test_dashboard_responsive_controls_preserve_touch_targets(viewport: int) -> None:
+    """Narrow layouts fit override controls without shrinking tap targets."""
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    assert viewport >= 280
+    assert "@media (max-width:400px)" in html
+    assert ".header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap" in html
+    assert ".controls{display:flex;gap:var(--space-2);align-items:center;flex-wrap:wrap}" in html
+    assert "min-height:44px" in html
+    assert "min-width:min(260px,100%)" in html
+    assert "#config-table{table-layout:fixed}" in html
+    assert "*,*::before,*::after{box-sizing:border-box}" in html
+    assert ".target-control{display:grid;grid-template-columns:44px minmax(1.5em,1fr) 44px" in html
+    assert ".target-control .ov-badge{grid-column:1 / 3;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" in html
+    assert ".target-control .ov-revert{grid-column:3;grid-row:2" in html
+
+
+def test_dashboard_chart_and_event_accessibility_semantics() -> None:
+    """Charts and event history retain names and non-pointer access to values."""
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    for svg_id in ("spark", "qspark", "rspark"):
+        assert f'id="{svg_id}" role="img"' in html
+    assert 'id="spark-summary" class="sr-only"' in html
+    assert 'id="spark-summary" class="sr-only" aria-live=' not in html
+    assert 'id="rspark-summary" class="sr-only"' in html
+    assert 'aria-describedby="rspark-summary"' in html
+    assert 'id="rspark-summary" class="sr-only" aria-live=' not in html
+    assert 'aria-pressed="true" aria-current="true"' in html
+    assert "button.setAttribute('aria-pressed'" in html
+    assert "button.setAttribute('aria-current','true')" in html
+    assert '<caption>Recent state transitions from the last four hours</caption>' in html
+    assert '<th scope="col">Time</th><th scope="col">Event</th>' in html
+    assert '<button type="button" class="ov-revert"' in html
+    assert "<a class=\"ov-revert\"" not in html
+    assert 'aria-label="Decrease target"' in html
+    assert 'aria-label="Increase target"' in html
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_exposes_override_and_reconciliation_summaries() -> None:
+    """Override controls retain button semantics and rspark has a text summary."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+setTimeout(function(){
+  try{
+    _mockStatus.overrides={target:{boot:'long-boot-identifier-1234567890',override:4}};
+    render(_mockStatus);
+    hist=[
+      {ts:1,obs:1,loc:1,ph:0,ep:4,lim:4,hc:8,band:'normal',brk:'closed',stl:false,
+       age:0,qd:0,qt:0,t429:0,t503:0,li:false,rwin:100,rlim:500,rlw:95,rdelta:5,tp:0,cp:0},
+      {ts:2,obs:2,loc:1,ph:0,ep:4,lim:4,hc:8,band:'normal',brk:'closed',stl:false,
+       age:0,qd:0,qt:0,t429:0,t503:0,li:false,rwin:110,rlim:500,rlw:100,rdelta:10,tp:0,cp:0}
+    ];
+    lastD=_mockStatus;
+    renderSparks();
+    var config=_elements['config-table'].innerHTML;
+    console.log(JSON.stringify({
+      error:null,config:config,summary:_elements['rspark-summary'].textContent,
+    }));
+  }catch(e){console.log(JSON.stringify({error:e.message,stack:e.stack}));}
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js accessibility test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert 'type="button"' in output["config"]
+    assert 'aria-label="Decrease target"' in output["config"]
+    assert 'aria-label="Increase target"' in output["config"]
+    assert 'aria-label="Revert target override"' in output["config"]
+    assert "Override active; boot value long-boot-identifier-1234567890" in output["config"]
+    assert output["summary"] == (
+        "Request budget chart: provider count 110; sluice count 100; "
+        "difference 10; provider limit 500."
+    )
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_surfaces_config_failures_and_clears_on_success() -> None:
+    """Config mutation failures are visible, while a later success clears them.
+
+    Exercise both mutation paths with mocked responses.  This guards the
+    operator-facing behavior rather than only checking that the helper names
+    exist in the HTML.
+    """
+    js = _extract_dashboard_js()
+    prefix = _NODE_RENDER_PREFIX + r'''
+var _realFetch=fetch;
+var _postCalls=0;
+var _deleteCalls=0;
+fetch=function(url,opts){
+  if(url.indexOf('/admin/config/target')!==-1&&opts&&opts.method==='DELETE'){
+    _deleteCalls++;
+    return Promise.resolve({
+      ok:false,status:500,
+      json:function(){return Promise.resolve({error:'target revert failed upstream'});},
+      text:function(){return Promise.resolve('target revert failed upstream');},
+      headers:{get:function(){return 'application/json';}},
+    });
+  }
+  if(url.indexOf('/admin/config')!==-1&&opts&&opts.method==='POST'){
+    _postCalls++;
+    if(_postCalls===1){
+      return Promise.resolve({
+        ok:false,status:400,
+        json:function(){return Promise.resolve({error:'target exceeds hard_cap'});},
+        text:function(){return Promise.resolve('target exceeds hard_cap');},
+        headers:{get:function(){return 'application/json';}},
+      });
+    }
+    return Promise.resolve({
+      ok:true,status:200,
+      json:function(){return Promise.resolve({target:5,overridden:true});},
+      text:function(){return Promise.resolve('{}');},
+      headers:{get:function(){return 'application/json';}},
+    });
+  }
+  return _realFetch(url,opts);
+};
+'''
+    suffix = r'''
+setTimeout(function(){
+  (async function(){
+    try{
+      await stepTarget(1);
+      var failedText=_elements['banner-error'].textContent;
+      var failedDisplay=_elements['banner-error'].style.display;
+      await stepTarget(1);
+      var successDisplay=_elements['banner-error'].style.display;
+      await revertTarget();
+      var revertText=_elements['banner-error'].textContent;
+      var revertDisplay=_elements['banner-error'].style.display;
+      console.log(JSON.stringify({
+        error:null,
+        failedText:failedText,
+        failedDisplay:failedDisplay,
+        successDisplay:successDisplay,
+        revertText:revertText,
+        revertDisplay:revertDisplay,
+        postCalls:_postCalls,
+        deleteCalls:_deleteCalls,
+      }));
+    }catch(e){
+      console.log(JSON.stringify({error:e.message,stack:e.stack}));
+    }
+    process.exit(0);
+  })();
+},300);
+'''
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(prefix + "\n" + js + "\n" + suffix)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js config mutation test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert output["failedDisplay"] == "block"
+    assert "target exceeds hard_cap" in output["failedText"]
+    assert output["successDisplay"] == "none"
+    assert output["revertDisplay"] == "block"
+    assert "target revert failed upstream" in output["revertText"]
+    assert output["postCalls"] == 2
+    assert output["deleteCalls"] == 1
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_disables_stepper_at_target_boundaries() -> None:
+    """The target stepper cannot move below one or above hard_cap."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+setTimeout(function(){
+  try{
+    _mockStatus.config.target=1;
+    _mockStatus.target=1;
+    render(_mockStatus);
+    var atMinimum=_elements['config-table'].innerHTML;
+    _mockStatus.config.target=8;
+    _mockStatus.target=8;
+    render(_mockStatus);
+    var atHardCap=_elements['config-table'].innerHTML;
+    console.log(JSON.stringify({error:null,atMinimum:atMinimum,atHardCap:atHardCap}));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack,atMinimum:'',atHardCap:''}));
+  }
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js stepper test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+
+    minimum = output["atMinimum"]
+    assert re.search(r'onclick="stepTarget\(-1\)" disabled', minimum)
+    assert re.search(r'onclick="stepTarget\(1\)">', minimum)
+
+    hard_cap = output["atHardCap"]
+    assert re.search(r'onclick="stepTarget\(-1\)">', hard_cap)
+    assert re.search(r'onclick="stepTarget\(1\)" disabled', hard_cap)
+
+
+# ---------------------------------------------------------------------------
+# JS render test: completion bars (WI-023)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_has_completion_signal_and_background_bars() -> None:
+    """The dashboard maps the compact completion field and draws it as a
+    background layer, while retaining zero for older history payloads."""
+    html = _DASHBOARD.read_text(encoding="utf-8")
+
+    assert "cp:e.cp||0" in html
+    assert "cp:d.completions||0" in html
+    assert "if((s.cp||0)>b.cp)" in html, "completion buckets must use max aggregation"
+    assert "s.obs!=null&&!s.stl" in html
+    assert ".spark-tp" in html
+    assert ".spark-cp" in html
+    assert "throughput max" in html
+    assert "faint bars behind the spark" in html
+
+
+_NODE_COMPLETIONS_SUFFIX = r"""
+function _completionSample(ts,cp,stale,obs,tp){
+  return {ts:ts,obs:obs===undefined?1:obs,loc:0,ph:0,ep:3,lim:4,hc:8,band:'normal',brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,cp:cp,tp:tp||0};
+}
+setTimeout(function(){
+  try{
+    var legacy=fromHistEntry({tp:9});
+    var buckets=bucketize(withIncs([
+      _completionSample(1,1),_completionSample(2,6),_completionSample(3,2)
+    ]),2);
+    var mixedBuckets=bucketize(withIncs([
+      _completionSample(4,1,false,1),
+      _completionSample(5,7,true,null),
+      _completionSample(6,3,false,2)
+    ]),2);
+
+    lastD=_mockStatus;
+    viewRange='5m';
+    hist=[_completionSample(10,0),_completionSample(15,5)];
+    longHist=[];
+    renderSparks();
+    var withTraffic=_elements['spark'].innerHTML;
+    var barAt=withTraffic.indexOf('class="spark-cp"');
+    var lineAt=withTraffic.indexOf('class="spark-obs"');
+
+    hist=[_completionSample(20,0),_completionSample(25,0)];
+    renderSparks();
+    var zeroTraffic=_elements['spark'].innerHTML;
+
+    hist=[_completionSample(30,4,true,null),_completionSample(35,2,true,null)];
+    renderSparks();
+    var staleTraffic=_elements['spark'].innerHTML;
+
+    hist=[_completionSample(40,1,false,1),_completionSample(45,7,true,null),
+          _completionSample(50,3,false,2),_completionSample(55,0,false,3)];
+    renderSparks();
+    var mixedTraffic=_elements['spark'].innerHTML;
+
+    hist=[_completionSample(60,0,false,1,5),_completionSample(65,0,false,2,3)];
+    renderSparks();
+    var tpOnlyTraffic=_elements['spark'].innerHTML;
+
+    hist=[_completionSample(70,4,false,1,0),_completionSample(75,2,false,2,0)];
+    renderSparks();
+    var cpOnlyTraffic=_elements['spark'].innerHTML;
+
+    hist=[_completionSample(80,0,false,1,0),_completionSample(85,6,true,null,5),
+          _completionSample(90,0,false,2,0)];
+    renderSparks();
+    var combinedTraffic=_elements['spark'].innerHTML;
+    var staleX=(combinedTraffic.match(/<line x1="([^"]+)"[^>]+class="tick-stale"/)||[])[1];
+    var tpBar=(combinedTraffic.match(/<rect class="spark-tp" x="([^"]+)"[^>]+width="([^"]+)"/)||[]);
+    var cpBar=(combinedTraffic.match(/<rect class="spark-cp" x="([^"]+)"[^>]+width="([^"]+)"/)||[]);
+
+    var longRaw=[];
+    for(var li=0;li<121;li++)
+      longRaw.push(_completionSample(100+li,li===60?9:0,li===60,li===60?null:1));
+    viewRange='1h';
+    longHist=longRaw;
+    hist=[];
+    renderSparks();
+    var longTraffic=_elements['spark'].innerHTML;
+    console.log(JSON.stringify({
+      error:null,
+      legacyCp:legacy.cp,
+      legacyTp:legacy.tp,
+      bucketCompletions:[buckets[0].cp,buckets[1].cp],
+      barCount:(withTraffic.match(/class="spark-cp"/g)||[]).length,
+      barBeforeLine:barAt>=0&&lineAt>=0&&barAt<lineAt,
+      zeroHasBars:zeroTraffic.indexOf('spark-cp')!==-1,
+      staleHasBars:staleTraffic.indexOf('spark-cp')!==-1,
+      staleHasMainLine:staleTraffic.indexOf('spark-obs')!==-1,
+      mixedLineCount:(mixedTraffic.match(/class="spark-obs"/g)||[]).length,
+      mixedStaleMarker:mixedTraffic.indexOf('class="tick-stale"')!==-1,
+      mixedBucketFresh:mixedBuckets[0].fresh,
+      mixedBucketStale:mixedBuckets[0].stl,
+      mixedBucketObs:mixedBuckets[0].obs,
+      mixedBucketCp:mixedBuckets[0].cp,
+      longHasBars:longTraffic.indexOf('spark-cp')!==-1,
+      longHasStaleMarker:longTraffic.indexOf('class="tick-stale"')!==-1,
+      tpOnlyHasTpBars:tpOnlyTraffic.indexOf('class="spark-tp"')!==-1,
+      tpOnlyHasCpBars:tpOnlyTraffic.indexOf('class="spark-cp"')!==-1,
+      cpOnlyHasTpBars:cpOnlyTraffic.indexOf('class="spark-tp"')!==-1,
+      cpOnlyHasCpBars:cpOnlyTraffic.indexOf('class="spark-cp"')!==-1,
+      combinedHasTpBars:combinedTraffic.indexOf('class="spark-tp"')!==-1,
+      combinedHasCpBars:combinedTraffic.indexOf('class="spark-cp"')!==-1,
+      combinedHasStaleMarker:staleX!==undefined,
+      combinedTpAligned:tpBar.length===3&&(parseFloat(tpBar[1])+parseFloat(tpBar[2])/2).toFixed(1)===staleX,
+      combinedCpAligned:cpBar.length===3&&(parseFloat(cpBar[1])+parseFloat(cpBar[2])/2).toFixed(1)===staleX,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_uses_max_completion_buckets_and_hides_idle_bars() -> None:
+    """Completion bars preserve the bucket maximum and disappear at zero."""
+    js = _extract_dashboard_js()
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + _NODE_COMPLETIONS_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js completion-bar test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert output["legacyCp"] == 0
+    assert output["legacyTp"] == 9
+    assert output["bucketCompletions"] == [6, 2]
+    assert output["barCount"] == 1
+    assert output["barBeforeLine"] is True
+    assert output["zeroHasBars"] is False
+    assert output["staleHasBars"] is True
+    assert output["staleHasMainLine"] is False
+    assert output["mixedLineCount"] == 2
+    assert output["mixedStaleMarker"] is True
+    assert output["mixedBucketFresh"] is False
+    assert output["mixedBucketStale"] is True
+    assert output["mixedBucketObs"] == 1
+    assert output["mixedBucketCp"] == 7
+    assert output["longHasBars"] is True
+    assert output["longHasStaleMarker"] is True
+    assert output["tpOnlyHasTpBars"] is True
+    assert output["tpOnlyHasCpBars"] is False
+    assert output["cpOnlyHasTpBars"] is False
+    assert output["cpOnlyHasCpBars"] is True
+    assert output["combinedHasTpBars"] is True
+    assert output["combinedHasCpBars"] is True
+    assert output["combinedHasStaleMarker"] is True
+    assert output["combinedTpAligned"] is True
+    assert output["combinedCpAligned"] is True
+
+
+# ---------------------------------------------------------------------------
+# JS hover test: stale-gap crosshair selection
+# ---------------------------------------------------------------------------
+
+
+_NODE_HOVER_SUFFIX = r"""
+function _hoverSample(ts,obs,stale){
+  return {ts:ts,obs:obs,loc:0,ph:0,ep:3,lim:4,hc:8,band:'normal',brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,cp:0,tp:0};
+}
+setTimeout(function(){
+  try{
+    lastD=_mockStatus;
+    viewRange='5m';
+    hist=[_hoverSample(1,10,false),_hoverSample(2,null,true),
+          _hoverSample(3,null,true),_hoverSample(4,40,false)];
+    longHist=[];
+    renderSparks();
+
+    var attrs={};
+    var crosshair=document.getElementById('crosshair-main');
+    crosshair.setAttribute=function(name,value){attrs[name]=String(value);};
+    var hoverIndex=2;
+    var hoverX=3+(hoverIndex/59)*(200-6);
+    onSparkHover({currentTarget:_elements['spark'],clientX:hoverX,clientY:10});
+    var selectedX=(3+(3/59)*(200-6)).toFixed(1);
+    console.log(JSON.stringify({
+      error:null,
+      crosshair:attrs.x1,
+      expected:selectedX,
+      selectedObs:_elements['tip-obs'].textContent,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_aligns_hover_crosshair_to_fresh_sample_after_stale_gap() -> None:
+    """The crosshair follows the selected fresh point, not stale-gap pixels."""
+    js = _extract_dashboard_js()
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + _NODE_HOVER_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js hover test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert output["crosshair"] == output["expected"]
+    assert output["selectedObs"] == "40"
+
+
+# ---------------------------------------------------------------------------
+# JS live polling test: one sample per reconciliation tick
+# ---------------------------------------------------------------------------
+
+
+_NODE_LIVE_SAMPLE_SUFFIX = r"""
+function _liveStatus(boot,sequence,tp,cp){
+  var d=Object.assign({},_mockStatus);
+  if(boot!==null)d.sample_id=boot+':'+sequence;
+  d.sample_sequence=sequence;
+  d.throughput=tp;
+  d.completions=cp;
+  return d;
+}
+function _resetLiveState(){
+  hist=[];
+  lastLiveSampleId=null;
+  lastLiveSampleSequence=null;
+  lastLiveBootId=null;
+}
+function _statusResponse(payload){
+  return {ok:true,status:200,json:function(){return Promise.resolve(payload);},
+    text:function(){return Promise.resolve(JSON.stringify(payload));},
+    headers:{get:function(){return 'application/json';}}};
+}
+var _realLiveFetch=fetch;
+var _liveQueue=[];
+var _historyPayload=null;
+fetch=function(url,opts){
+  if(url.indexOf('/status.json')!==-1&&_liveQueue.length)
+    return Promise.resolve(_statusResponse(_liveQueue.shift()));
+  if(url.indexOf('/history.json')!==-1&&_historyPayload!==null)
+    return Promise.resolve(_statusResponse({entries:_historyPayload}));
+  return _realLiveFetch(url,opts);
+};
+setTimeout(function(){
+  (async function(){
+    try{
+      _resetLiveState();
+      _liveQueue=[
+        _liveStatus('boot-a',7,2,1),
+        _liveStatus('boot-a',7,2,1),
+        _liveStatus('boot-a',8,0,3),
+        _liveStatus('boot-b',8,5,4),
+        _liveStatus('boot-b',8,5,4),
+      ];
+      while(_liveQueue.length) await doPoll();
+      var restartSamples=hist.map(function(h){return {tp:h.tp,cp:h.cp,sid:h.sid};});
+
+      _resetLiveState();
+      var legacyOne=_liveStatus(null,1,2,2);
+      var legacyTwo=_liveStatus(null,2,3,3);
+      var oldOne=_liveStatus(null,undefined,9,0);
+      var oldTwo=_liveStatus(null,undefined,9,0);
+      delete legacyOne.sample_id;
+      delete legacyTwo.sample_id;
+      delete oldOne.sample_id;
+      delete oldOne.sample_sequence;
+      delete oldTwo.sample_id;
+      delete oldTwo.sample_sequence;
+      _liveQueue=[
+        _liveStatus('boot-c',1,1,1),
+        legacyOne,
+        legacyTwo,
+        _liveStatus('boot-c',2,4,4),
+        _liveStatus('boot-d',2,5,5),
+        oldOne,
+        oldTwo,
+      ];
+      while(_liveQueue.length) await doPoll();
+      var alternationSamples=hist.map(function(h){return {tp:h.tp,cp:h.cp,sid:h.sid};});
+
+      _resetLiveState();
+      _historyPayload=[{ts:1,obs:1,loc:0,ph:0,ep:3,lim:4,hc:8,band:'normal',brk:'closed',
+        stl:false,age:0,qd:0,qt:0,t429:0,t503:0,li:false,tp:4,cp:6,sid:'boot-h:4'}];
+      await initHistory();
+      var seededCount=hist.length;
+      _liveQueue=[_liveStatus('boot-h',4,4,6),_liveStatus('boot-h',5,0,2)];
+      while(_liveQueue.length) await doPoll();
+      var historySamples=hist.map(function(h){return {tp:h.tp,cp:h.cp,sid:h.sid};});
+      console.log(JSON.stringify({
+        error:null,
+        restartSamples:restartSamples,
+        alternationSamples:alternationSamples,
+        seededCount:seededCount,
+        historySamples:historySamples,
+      }));
+    }catch(e){
+      console.log(JSON.stringify({error:e.message,stack:e.stack}));
+    }
+    process.exit(0);
+  })();
+},300);
+"""
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_deduplicates_restart_safe_live_samples_and_seeds_history() -> None:
+    """Live polling handles repeated ticks, restarts, legacy payloads, and warm history."""
+    js = _extract_dashboard_js()
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + _NODE_LIVE_SAMPLE_SUFFIX
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js live-sample test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert output["restartSamples"] == [
+        {"tp": 2, "cp": 1, "sid": "boot-a:7"},
+        {"tp": 0, "cp": 3, "sid": "boot-a:8"},
+        {"tp": 5, "cp": 4, "sid": "boot-b:8"},
+    ]
+    assert output["alternationSamples"] == [
+        {"tp": 1, "cp": 1, "sid": "boot-c:1"},
+        {"tp": 3, "cp": 3, "sid": None},
+        {"tp": 5, "cp": 5, "sid": "boot-d:2"},
+        {"tp": 9, "cp": 0, "sid": None},
+        {"tp": 9, "cp": 0, "sid": None},
+    ]
+    assert output["seededCount"] == 1
+    assert output["historySamples"] == [
+        {"tp": 4, "cp": 6, "sid": "boot-h:4"},
+        {"tp": 0, "cp": 2, "sid": "boot-h:5"},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +1394,480 @@ def test_dashboard_js_skips_tokens_24h_fetch_during_penalty() -> None:
         "tokens_24h row must not render during a penalty (fetch skipped, "
         "penalty card already polls the endpoint)"
     )
+
+
+# ---------------------------------------------------------------------------
+# JS config-error handling regressions (WI-026)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_shows_plain_text_and_alternate_json_errors() -> None:
+    """Failed mutations surface text bodies and non-error JSON keys."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+var _realDashboardFetch=fetch;
+var _mutationCalls=0;
+fetch=function(url,opts){
+  if(url.indexOf('/admin/config')!==-1&&opts&&opts.method==='POST'){
+    _mutationCalls++;
+    if(_mutationCalls===1){
+      return Promise.resolve({
+        ok:false,status:502,
+        text:function(){return Promise.resolve('upstream plain-text failure');},
+        json:function(){return Promise.reject(new Error('not json'));},
+      });
+    }
+    return Promise.resolve({
+      ok:false,status:400,
+      text:function(){return Promise.resolve(JSON.stringify({detail:'alternate detail'}));},
+      json:function(){return Promise.resolve({detail:'alternate detail'});},
+    });
+  }
+  return _realDashboardFetch(url,opts);
+};
+setTimeout(function(){
+  (async function(){
+    try{
+      await stepTarget(1);
+      var plain=_elements['banner-error'].textContent;
+      await stepTarget(1);
+      var alternate=_elements['banner-error'].textContent;
+      console.log(JSON.stringify({
+        error:null,plain:plain,alternate:alternate,
+        saving:configSaving,calls:_mutationCalls,
+      }));
+    }catch(e){
+      console.log(JSON.stringify({error:e.message,stack:e.stack}));
+    }
+    process.exit(0);
+  })();
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js config-error test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert output["plain"] == "upstream plain-text failure"
+    assert output["alternate"] == "alternate detail"
+    assert output["saving"] is False
+    assert output["calls"] == 2
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_missing_config_does_not_stick_config_saving() -> None:
+    """A status payload without config fails cleanly and unlocks the stepper."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+setTimeout(function(){
+  (async function(){
+    try{
+      delete _mockStatus.config;
+      delete _mockStatus.target;
+      lastD=_mockStatus;
+      await stepTarget(1);
+      console.log(JSON.stringify({
+        error:null,
+        text:_elements['banner-error'].textContent,
+        display:_elements['banner-error'].style.display,
+        saving:configSaving,
+      }));
+    }catch(e){
+      console.log(JSON.stringify({error:e.message,stack:e.stack}));
+    }
+    process.exit(0);
+  })();
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js missing-config test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, (
+        f"Dashboard JS runtime error: {output['error']}\n{output.get('stack','')}"
+    )
+    assert "current target unavailable" in output["text"]
+    assert output["display"] == "block"
+    assert output["saving"] is False
+
+
+# ---------------------------------------------------------------------------
+# JS dashboard follow-ups: events, stale request telemetry, adaptive truth
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_events_and_provider_telemetry_are_truthful() -> None:
+    """Recent events are bounded, stale budget gaps do not bridge, and AIMD
+    providers do not present LimitState defaults as concurrency truth."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+function _dashboardSample(ts,band,stale){
+  return {ts:ts,obs:2,loc:1,ph:0,ep:3,lim:4,hc:8,band:band,brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,
+    rwin:10+ts,rlim:100,rrem:90,rlw:8+ts,rdelta:2,tp:0,cp:0};
+}
+setTimeout(function(){
+  try{
+    lastD=_mockStatus;
+    viewRange='5m'; longHist=[]; hist=[];
+    for(var i=0;i<25;i++){
+      var sample=_dashboardSample(i+1,i%2?'low':'normal',i===20);
+      sample.brk=i===8?'open':'closed';
+      sample.t429=i===12?1:0;
+      sample.qt=i===16?1:0;
+      hist.push(sample);
+    }
+    renderSparks();
+    var events=_elements['recent-events'].innerHTML;
+    var eventBody=(events.match(/<tbody>([\s\S]*)<\/tbody>/)||[])[1]||'';
+    var eventRows=(eventBody.match(/<tr/g)||[]).length;
+
+    hist=[_dashboardSample(30,'normal',false),_dashboardSample(31,'normal',true),
+          _dashboardSample(32,'normal',false)];
+    renderSparks();
+    var budgetSpark=_elements['rspark'].innerHTML;
+
+    _mockStatus.config.controller='adaptive';
+    _mockStatus.concurrent_sessions=0;
+    _mockStatus.limit=4;
+    _mockStatus.hard_cap=8;
+    render(_mockStatus);
+    renderSparks();
+    console.log(JSON.stringify({
+      error:null,eventRows:eventRows,has429:events.indexOf('429 +1')!==-1,
+      hasTimeout:events.indexOf('queue timeout +1')!==-1,
+      hasStale:events.indexOf('usage became stale')!==-1,
+      providerSegments:(budgetSpark.match(/class="spark-rwin"/g)||[]).length,
+      localSegments:(budgetSpark.match(/class="spark-rlw"/g)||[]).length,
+      gauge:_elements['gauge'].innerHTML,stats:_elements['stats'].innerHTML,
+      spark:_elements['spark'].innerHTML,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js dashboard follow-up test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert output["eventRows"] == 20
+    assert output["has429"] and output["hasTimeout"] and output["hasStale"]
+    assert output["providerSegments"] == 2
+    assert output["localSegments"] == 2
+    assert "concurrency unavailable" in output["gauge"]
+    assert ">unavailable<" in output["stats"]
+    assert "class=\"spark-obs\"" not in output["spark"]
+    assert "spark-lim" not in output["spark"]
+
+
+# ---------------------------------------------------------------------------
+# JS dashboard regressions: range ownership, stale buckets, event severity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_keeps_latest_range_and_does_not_draw_mixed_stale_buckets() -> None:
+    """A delayed old range cannot replace the selected one, and a bucket with
+    any stale input remains a gap rather than a misleading joined line."""
+    js = _extract_dashboard_js()
+    prefix = _NODE_RENDER_PREFIX + r'''
+var _baseFetch=fetch;
+var _historyMode='initial';
+var _historyRequests=[];
+var _initialHistoryUrl=null;
+function _response(entries){
+  return {ok:true,status:200,json:function(){return Promise.resolve({entries:entries});},
+    text:function(){return Promise.resolve('{}');},headers:{get:function(){return '';}}};
+}
+fetch=function(url,opts){
+  if(url.indexOf('/history.json')!==-1){
+    if(_historyMode==='initial'){
+      _initialHistoryUrl=url;
+      return Promise.resolve(_response([]));
+    }
+    return new Promise(function(resolve){
+      _historyRequests.push({url:url,opts:opts,resolve:resolve});
+    });
+  }
+  return _baseFetch(url,opts);
+};
+'''
+    suffix = r'''
+function _sample(ts,band,stale){
+  return {ts:ts,obs:1,loc:0,ph:0,ep:2,lim:4,hc:8,band:band,brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,tp:0,cp:0};
+}
+setTimeout(function(){
+  (async function(){
+    try{
+      _historyMode='deferred';
+      setRange('1h');
+      setRange('4h');
+      var first=_historyRequests[0],second=_historyRequests[1];
+      second.resolve(_response([_sample(400,'normal',false)]));
+      await Promise.resolve(); await Promise.resolve();
+      first.resolve(_response([_sample(100,'normal',false)]));
+      await Promise.resolve(); await Promise.resolve();
+      var rangeAfterResponses=viewRange;
+      var latestTimestamp=longHist[0]&&longHist[0].ts;
+
+      var mixed=bucketize(withIncs([
+        _sample(1,'normal',false),_sample(2,'normal',true),_sample(3,'normal',false)
+      ]),2);
+      lastD=_mockStatus; viewRange='5m'; longHist=[];
+      hist=[_sample(10,'normal',false),_sample(11,'reject',false),
+            _sample(12,'normal',false),_sample(13,'low',false)];
+      renderSparks();
+      var events=_elements['recent-events'].innerHTML;
+      console.log(JSON.stringify({
+        error:null, initialHistoryUrl:_initialHistoryUrl,
+        requestUrls:_historyRequests.map(function(r){return r.url;}),
+        firstAborted:!!(first.opts&&first.opts.signal&&first.opts.signal.aborted),
+        rangeAfterResponses:rangeAfterResponses, latestTimestamp:latestTimestamp,
+        mixedFresh:mixed[0].fresh, mixedStale:mixed[0].stl,
+        criticalTransitions:(events.match(/row-crit/g)||[]).length,
+        warningTransitions:(events.match(/row-warn/g)||[]).length,
+      }));
+    }catch(e){
+      console.log(JSON.stringify({error:e.message,stack:e.stack}));
+    }
+    process.exit(0);
+  })();
+},300);
+'''
+    script = prefix + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js range ownership test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert output["initialHistoryUrl"].endswith("limit=2880")
+    assert output["requestUrls"] == ["/history.json?limit=720", "/history.json?limit=2880"]
+    assert output["firstAborted"] is True
+    assert output["rangeAfterResponses"] == "4h"
+    assert output["latestTimestamp"] == 400
+    assert output["mixedFresh"] is False
+    assert output["mixedStale"] is True
+    assert output["criticalTransitions"] == 2
+    assert output["warningTransitions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# JS dashboard regressions: independent event horizon and stale reset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_keeps_four_hour_events_when_chart_range_changes() -> None:
+    """Chart requests must not replace the dedicated four-hour event source."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+function _eventSample(ts,band,stale){
+  return {ts:ts,obs:2,loc:1,ph:0,ep:3,lim:4,hc:8,band:band,brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,
+    rwin:10,rlim:100,rrem:90,rlw:8,rdelta:2,tp:0,cp:0};
+}
+setTimeout(function(){
+  try{
+    lastD=_mockStatus;
+    eventHist=[_eventSample(1,'normal',false),_eventSample(2,'low',false)];
+    hist=[];
+    viewRange='1h';
+    longHist=[_eventSample(100,'normal',false),_eventSample(101,'normal',false)];
+    renderSparks();
+    var firstEvents=_elements['recent-events'].innerHTML;
+
+    viewRange='5m';
+    hist=[_eventSample(200,'normal',false),_eventSample(201,'normal',false)];
+    renderSparks();
+    var secondEvents=_elements['recent-events'].innerHTML;
+    setRange('1h');
+    console.log(JSON.stringify({
+      error:null,
+      eventCount:eventHist.length,
+      chartCount:longHist.length,
+      firstHasTransition:firstEvents.indexOf('band normal → low')!==-1,
+      secondHasTransition:secondEvents.indexOf('band normal → low')!==-1,
+      selectedPressed:_elements['r-1h'].getAttribute('aria-pressed'),
+      selectedCurrent:_elements['r-1h'].getAttribute('aria-current'),
+      unselectedPressed:_elements['r-5m'].getAttribute('aria-pressed'),
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js event history test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert output["eventCount"] == 2
+    assert output["chartCount"] == 2
+    assert output["firstHasTransition"] and output["secondHasTransition"]
+    assert output["selectedPressed"] == "true"
+    assert output["selectedCurrent"] == "true"
+    assert output["unselectedPressed"] == "false"
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_all_stale_redraw_clears_hover_and_reconciliation() -> None:
+    """An all-stale redraw cannot leave a tooltip or stale reconciliation text."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+function _staleSample(ts,stale){
+  return {ts:ts,obs:2,loc:1,ph:0,ep:3,lim:4,hc:8,band:'normal',brk:'closed',
+    stl:!!stale,age:0,qd:0,qt:0,t429:0,t503:0,li:false,
+    rwin:10,rlim:100,rrem:90,rlw:8,rdelta:2,tp:0,cp:0};
+}
+setTimeout(function(){
+  try{
+    lastD=_mockStatus; viewRange='5m'; eventHist=[];
+    hist=[_staleSample(1,false),_staleSample(2,false)];
+    renderSparks();
+    onSparkHover({currentTarget:_elements['spark'],clientX:10,clientY:10});
+    var shown=_elements['spark-tip'].style.display;
+    viewRange='1h';
+    longHist=[_staleSample(3,true),_staleSample(4,true)];
+    renderSparks();
+    console.log(JSON.stringify({
+      error:null,shown:shown,hidden:_elements['spark-tip'].style.display,
+      info:_elements['spark-info'].textContent,
+      reconciliation:_elements['rspark-info'].textContent,
+      delta:_elements['rdelta-text'].textContent,
+      summary:_elements['spark-summary'].textContent,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js stale reset test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert output["shown"] == "block"
+    assert output["hidden"] == "none"
+    assert output["info"] == "No fresh chart data"
+    assert output["reconciliation"] == ""
+    assert output["delta"] == ""
+    assert "No fresh chart data" in output["summary"]
+
+
+@pytest.mark.skipif(not _NODE, reason="node not available")
+def test_dashboard_js_skips_restart_events_and_clamps_narrow_tooltips() -> None:
+    """Known boot changes do not manufacture events; tooltips stay on-card."""
+    js = _extract_dashboard_js()
+    suffix = r'''
+function _restartSample(ts,band,sid){
+  return {ts:ts,obs:2,loc:1,ph:0,ep:3,lim:4,hc:8,band:band,brk:'closed',
+    stl:false,age:0,qd:0,qt:0,t429:0,t503:0,li:false,tp:0,cp:0,sid:sid};
+}
+setTimeout(function(){
+  try{
+    lastD=_mockStatus;
+    eventHist=[_restartSample(1,'normal','boot-a:4'),_restartSample(2,'low','boot-b:1')];
+    hist=[];
+    renderSparks();
+    var events=_elements['recent-events'].innerHTML;
+
+    viewRange='5m'; eventHist=[];
+    hist=[_restartSample(3,'normal','boot-c:1'),_restartSample(4,'normal','boot-c:2')];
+    var card=document.getElementById('spark-card');
+    var tip=document.getElementById('spark-tip');
+    card.getBoundingClientRect=function(){return{left:0,top:0,width:10,height:10};};
+    tip.offsetWidth=100;
+    tip.offsetHeight=20;
+    renderSparks();
+    onSparkHover({currentTarget:_elements['spark'],clientX:100,clientY:100});
+    console.log(JSON.stringify({
+      error:null,
+      restartTransition:events.indexOf('band normal → low')!==-1,
+      left:tip.style.left,
+      top:tip.style.top,
+    }));
+  }catch(e){
+    console.log(JSON.stringify({error:e.message,stack:e.stack}));
+  }
+  process.exit(0);
+},300);
+'''
+    script = _NODE_RENDER_PREFIX + "\n" + js + "\n" + suffix
+    with tempfile.NamedTemporaryFile(suffix=".js", mode="w", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        result = subprocess.run(
+            [_NODE, path], capture_output=True, text=True, timeout=15
+        )
+    finally:
+        os.unlink(path)
+    assert result.returncode == 0, f"Node.js dashboard regression test failed:\n{result.stderr}"
+    output = json.loads(result.stdout)
+    assert output["error"] is None, output.get("stack", "")
+    assert output["restartTransition"] is False
+    assert output["left"] == "0px"
+    assert output["top"] == "0px"

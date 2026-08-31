@@ -17,8 +17,11 @@ On shutdown (graceful drain):
   * Wait for in-flight requests to complete (``gate.held → 0``), bounded
     by ``drain_timeout`` (default 25 s — fits within uvicorn's
     ``timeout_graceful_shutdown=30`` and k8s' ``terminationGracePeriodSeconds=120``).
-  * Close the upstream httpx client — now safe because no streaming
-    connections remain.
+  * If the bounded abort still leaves a proxy task or permit behind, report
+    ``lifespan.shutdown.failed`` rather than claiming cleanup completed.
+  * Close the upstream httpx client after the bounded abort attempt.  A failed
+    shutdown may still have a task using it, but cannot leave the server
+    waiting indefinitely.
   * Release the lease (if held) and stop the renewer.
 """
 
@@ -152,6 +155,7 @@ class LifecycleManager:
                 self._register_sighup()
                 await send({"type": "lifespan.startup.complete"})
             elif event["type"] == "lifespan.shutdown":
+                shutdown_ok = True
                 try:
                     if self._retry_task is not None:
                         self._retry_task.cancel()
@@ -166,7 +170,10 @@ class LifecycleManager:
                     # This prevents severing active streaming connections
                     # mid-response.
                     self._draining = True
-                    await self._reconcile.stop()
+                    # Stop polling and close the truth source, but keep the
+                    # telemetry store open until the drain has sampled the
+                    # releases from admitted requests.
+                    await self._reconcile.stop(close_history_store=False)
 
                     in_flight = self._gate.held
                     if in_flight > 0 and self._drain_timeout > 0:
@@ -190,17 +197,59 @@ class LifecycleManager:
                 finally:
                     # Guarantee cleanup even if the drain is interrupted
                     # (e.g. CancelledError from uvicorn shutdown timeout).
-                    if self._guard is not None:
-                        await self._guard.stop_renewer()
-                        if self._acquired:
-                            await self._guard.release()
-                        # Close guard-owned resources (e.g. the kube client)
-                        # even when the singleton was never acquired —
-                        # release() skips cleanup when the claim wasn't held.
-                        await self._guard.close()
-                    if self._owns_client:
-                        await self._client.aclose()
-                    await send({"type": "lifespan.shutdown.complete"})
+                    try:
+                        if self._guard is not None:
+                            await self._guard.stop_renewer()
+                            if self._acquired:
+                                await self._guard.release()
+                            # Close guard-owned resources (e.g. the kube client)
+                            # even when the singleton was never acquired —
+                            # release() skips cleanup when the claim wasn't held.
+                            await self._guard.close()
+                    finally:
+                        try:
+                            app = self._app_ref
+                            cancel_proxy_tasks = getattr(app, "cancel_proxy_tasks", None)
+                            if cancel_proxy_tasks is not None:
+                                try:
+                                    proxy_tasks_quiesced = await cancel_proxy_tasks()
+                                    if proxy_tasks_quiesced is False:
+                                        shutdown_ok = False
+                                        log.error(
+                                            "shutdown: proxy task(s) remain after bounded cancellation"
+                                        )
+                                except Exception:
+                                    shutdown_ok = False
+                                    log.warning(
+                                        "shutdown: proxy task cancellation failed",
+                                        exc_info=True,
+                                    )
+                            if self._gate.held > 0:
+                                shutdown_ok = False
+                                log.error(
+                                    "shutdown: %d permit(s) remain held after bounded cancellation",
+                                    self._gate.held,
+                                )
+                            if self._owns_client:
+                                await self._client.aclose()
+                            # Let cancellation/finally blocks in an upstream
+                            # request run once after client close before the
+                            # final release delta is captured.  If a task
+                            # resisted cancellation, the resulting snapshot
+                            # remains truthful and shutdown is reported failed.
+                            await asyncio.sleep(0)
+                        finally:
+                            self._reconcile.flush_shutdown_history()
+                            self._reconcile.close_history_store()
+                            if shutdown_ok:
+                                await send({"type": "lifespan.shutdown.complete"})
+                            else:
+                                await send(
+                                    {
+                                        "type": "lifespan.shutdown.failed",
+                                        "message": "proxy tasks did not quiesce before shutdown deadline",
+                                    }
+                                )
                     return  # noqa: B012 (intentional: swallow CancelledError during shutdown)
 
     async def _retry_acquire(self) -> None:

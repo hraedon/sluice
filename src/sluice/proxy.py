@@ -81,6 +81,18 @@ async def _cancel_task(task: asyncio.Future[Any]) -> None:
     except (asyncio.CancelledError, Exception):
         pass
 
+
+async def _cancel_tasks(*tasks: asyncio.Future[Any]) -> None:
+    """Cancel and await a group of sibling tasks in deterministic order."""
+    # Send cancellation to every sibling before awaiting any one of them.  A
+    # cancellation-resistant upstream task must not prevent an Event.wait
+    # sibling from being cancelled as well.
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    for task in tasks:
+        await _cancel_task(task)
+
 # RFC 7230 hop-by-hop headers — never forwarded in either direction.
 _HOP_BY_HOP = frozenset(
     {
@@ -265,6 +277,11 @@ class ProxyApp:
         self._usage_auth_header = usage_auth_header
         self._config_path: str | None = None  # set by CLI for SIGHUP reload
         self._client_metrics = ClientMetrics()
+        # ASGI request tasks that can still own a permit.  Lifecycle shutdown
+        # aborts and awaits these after a drain timeout so their ``finally``
+        # release paths complete before telemetry is flushed and closed.
+        self._proxy_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown_event = asyncio.Event()
         self._lifecycle = LifecycleManager(
             guard=guard,
             reconcile=reconcile,
@@ -399,12 +416,56 @@ class ProxyApp:
                 )
                 return
 
-        await self._proxy_request(scope, receive, send)
+        task = asyncio.current_task()
+        if task is None:
+            await self._proxy_request(scope, receive, send)
+            return
+        self._proxy_tasks.add(task)
+        try:
+            await self._proxy_request(scope, receive, send)
+        finally:
+            self._proxy_tasks.discard(task)
 
     @property
     def client_metrics(self) -> ClientMetrics:
         """Per-client metrics for /status.json and /metrics (WI-023)."""
         return self._client_metrics
+
+    async def cancel_proxy_tasks(self) -> bool:
+        """Abort request tasks and report whether they all quiesced.
+
+        The shutdown signal is handled inside the streaming races so upstream
+        reads are cancelled without relying on cancellation propagation through
+        an ASGI server's request task.  A short fallback cancellation keeps a
+        malformed or blocked request from extending shutdown indefinitely.
+        ``False`` means the bounded abort expired with at least one request
+        task still pending; the lifespan manager must not report shutdown as
+        complete in that case.
+        """
+        self._shutdown_event.set()
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._proxy_tasks
+            if task is not current and not task.done()
+        ]
+        if not tasks:
+            return True
+
+        _done, pending = await asyncio.wait(tasks, timeout=1.0)
+        if pending:
+            log.warning(
+                "shutdown: %d proxy task(s) did not quiesce after abort signal — cancelling",
+                len(pending),
+            )
+            for task in pending:
+                task.cancel()
+            # Keep the fallback bounded as well.  Normal streaming requests
+            # should have completed from the abort signal above.
+            await asyncio.wait(pending, timeout=1.0)
+        return not any(
+            task is not current and not task.done() for task in self._proxy_tasks
+        )
 
     def reload_config(self, **kwargs: Any) -> dict[str, str]:
         """Apply runtime-safe config changes without restart.
@@ -734,61 +795,81 @@ class ProxyApp:
                 method, url, headers=headers, content=body_stream()
             )
 
-            # WI-014: Race stream entry against client disconnect.  If the
-            # client disconnects while we're waiting for response headers or
-            # during body upload, cancel the upstream request instead of
-            # letting it run to completion as a phantom.
+            # WI-014: Race stream entry against client disconnect, shutdown,
+            # and body overflow.  If any of these occurs while we're waiting
+            # for response headers or during body upload, cancel the upstream
+            # request instead of letting it run to completion as a phantom.
             entry_task = asyncio.ensure_future(stream_cm.__aenter__())
             disconnect_task = asyncio.ensure_future(disconnect.wait())
-            await asyncio.wait(
-                [entry_task, disconnect_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            if disconnect_task.done() and not entry_task.done():
-                # Client disconnected — cancel entry to abort the upstream
-                # request.  __aenter__ cancellation closes the connection.
-                entry_task.cancel()
+            shutdown_task = asyncio.ensure_future(self._shutdown_event.wait())
+            body_overflow_task = asyncio.ensure_future(body_overflow.wait())
+            try:
                 try:
-                    await entry_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                finally:
+                    await asyncio.wait(
+                        [entry_task, disconnect_task, shutdown_task, body_overflow_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    # asyncio.wait leaves children pending when its parent is
+                    # cancelled; the enclosing finally below tears down the
+                    # whole race before the permit-release path runs.
+                    raise
+
+                if disconnect_task.done() and not entry_task.done():
+                    # Client disconnected — cancel entry to abort the
+                    # upstream request.  __aenter__ cancellation closes the
+                    # connection.
+                    await _cancel_tasks(entry_task, disconnect_task, shutdown_task)
                     try:
                         await stream_cm.__aexit__(None, None, None)
                     except Exception:
                         pass
-                return
+                    return
 
-            # WI-028 finding 3: if the body-size counter tripped during upload,
-            # cancel the upstream request and send a 413 to the client.  The
-            # entry race above may have completed (upstream accepted the partial
-            # body) — close the stream context and respond.
-            if body_overflow.is_set() and not response_started:
-                if not entry_task.done():
-                    entry_task.cancel()
+                if shutdown_task.done() and not entry_task.done():
+                    # Shutdown is a controlled abort rather than a downstream
+                    # disconnect: complete the ASGI response so the
+                    # server-side request task can finish after the upstream
+                    # is torn down.
+                    await _cancel_tasks(entry_task, disconnect_task, shutdown_task)
                     try:
-                        await entry_task
-                    except (asyncio.CancelledError, Exception):
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
                         pass
-                try:
-                    await stream_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                await send_json(send, 413, {"error": "request body too large"})
-                return
+                    await send_json(
+                        send, 503,
+                        {"error": "draining", "reason": "draining", "retry_after": RETRY_AFTER_SHORT},
+                        retry_after=RETRY_AFTER_SHORT,
+                    )
+                    return
 
-            # Entry completed (or raised) — cancel the disconnect wait.
-            if not disconnect_task.done():
-                disconnect_task.cancel()
-                try:
-                    await disconnect_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                # WI-028 finding 3: if the body-size counter tripped during
+                # upload, cancel the upstream request and send a 413 to the
+                # client.  The entry race above may have completed (upstream
+                # accepted the partial body) — close the stream context and
+                # respond.
+                if body_overflow.is_set() and not response_started:
+                    await _cancel_tasks(
+                        entry_task, disconnect_task, shutdown_task, body_overflow_task
+                    )
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    await send_json(send, 413, {"error": "request body too large"})
+                    return
 
-            # __aenter__ may have raised httpx.RequestError — let it
-            # propagate to the handler below.
-            response = entry_task.result()
+                # __aenter__ may have raised httpx.RequestError — let it
+                # propagate to the handler below.
+                response = entry_task.result()
+            finally:
+                # Every entry outcome, including shutdown-before-headers and
+                # an exception from __aenter__, must consume all Event.wait
+                # siblings.  In particular, disconnect_task is still pending
+                # when shutdown_task wins this race.
+                await _cancel_tasks(
+                    entry_task, disconnect_task, shutdown_task, body_overflow_task
+                )
 
             try:
                 # 429 and rate-limit headers must be recorded before the
@@ -920,7 +1001,8 @@ class ProxyApp:
                 idle = self._upstream_idle_timeout
                 chunk_iter = response.aiter_raw()
                 upstream_idle = False
-                # Race each upstream read against the client-disconnect event.
+                # Race each upstream read against client disconnect and the
+                # shutdown abort signal.
                 #
                 # A bare ``disconnect.is_set()`` check only fires *between*
                 # chunks, so a client that vanishes mid-stream while the
@@ -935,31 +1017,48 @@ class ProxyApp:
                 # that signal the instant it arrives instead of waiting for the
                 # next upstream chunk that may never come.
                 disc_wait = asyncio.ensure_future(disconnect.wait())
+                shutdown_wait = asyncio.ensure_future(self._shutdown_event.wait())
+                shutdown_aborted = False
+                read_task: asyncio.Future[Any] | None = None
                 try:
                     while True:
                         if disconnect.is_set():
                             break
                         read_task = asyncio.ensure_future(chunk_iter.__anext__())
-                        done, _pending = await asyncio.wait(
-                            {read_task, disc_wait},
-                            timeout=idle,  # None → block until read or disconnect
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
+                        try:
+                            done, _pending = await asyncio.wait(
+                                {read_task, disc_wait, shutdown_wait},
+                                timeout=idle,  # None → block until read, disconnect, or shutdown
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        except asyncio.CancelledError:
+                            # asyncio.wait leaves child tasks pending when its
+                            # parent is cancelled; cancel the upstream read so
+                            # stream_cm.__aexit__ and the gate release can run.
+                            await _cancel_tasks(read_task, disc_wait, shutdown_wait)
+                            raise
                         if not done:
                             # Idle timeout: no chunk *and* no disconnect within
                             # `idle` seconds — the upstream went silent.
-                            await _cancel_task(read_task)
+                            await _cancel_tasks(read_task, disc_wait, shutdown_wait)
                             log.warning(
                                 "upstream idle timeout (%.1fs) — aborting stream", idle,
                             )
                             upstream_idle = True
+                            break
+                        if shutdown_wait in done:
+                            # A controlled shutdown aborts the upstream but
+                            # still emits an empty final ASGI body below so a
+                            # server-side request task is not left hanging.
+                            shutdown_aborted = True
+                            await _cancel_tasks(read_task, disc_wait, shutdown_wait)
                             break
                         if read_task not in done:
                             # Client disconnected while awaiting the next chunk.
                             # Cancel the pending read; the stream context is
                             # closed in the finally below, terminating the
                             # upstream request (phantom prevention).
-                            await _cancel_task(read_task)
+                            await _cancel_tasks(read_task, disc_wait, shutdown_wait)
                             break
                         try:
                             chunk = read_task.result()
@@ -981,7 +1080,10 @@ class ProxyApp:
                             disconnect.set()
                             break
                 finally:
-                    await _cancel_task(disc_wait)
+                    if read_task is not None:
+                        await _cancel_tasks(read_task, disc_wait, shutdown_wait)
+                    else:
+                        await _cancel_tasks(disc_wait, shutdown_wait)
 
                 # Close the response body.  When the upstream went idle (not a
                 # client disconnect) the client is still connected and needs a
@@ -995,7 +1097,7 @@ class ProxyApp:
                     # a client disconnect or an upstream idle timeout — an
                     # idle-aborted stream is a degraded result, not a clean
                     # success (the breaker should not see it as healthy).
-                    if 200 <= response.status_code < 400 and not upstream_idle:
+                    if 200 <= response.status_code < 400 and not upstream_idle and not shutdown_aborted:
                         self._reconcile.record_success()
                         self._client_metrics.record_success(client_label)
             finally:
@@ -1017,12 +1119,7 @@ class ProxyApp:
                 except Exception:
                     pass
         finally:
-            if not watcher_task.done():
-                watcher_task.cancel()
-                try:
-                    await watcher_task
-                except asyncio.CancelledError:
-                    pass
+            await _cancel_task(watcher_task)
 
     def _build_url(self, scope: Scope) -> str:
         path: str = scope["path"]

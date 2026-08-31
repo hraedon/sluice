@@ -16,7 +16,10 @@ from sluice.control import (
     UsageReading,
 )
 from sluice.gate import PermitGate
+from sluice.history import History
+from sluice.history_store import SQLiteHistoryStore
 from sluice.reconcile import ReconciliationLoop
+from sluice.status import snapshot
 from sluice.usage import CachedReading
 
 CFG = ControllerConfig(target=3, min_floor=1, usage_fresh_ttl=15.0, stale_penalty=1, low_penalty=1, phantom_window=3)
@@ -1549,6 +1552,230 @@ async def test_throughput_counts_forwarded_requests():
     assert loop.last_throughput == 0
 
 
+async def test_throughput_counts_actual_delta_on_stale_tick():
+    """A stale but completed poll keeps the real interval traffic delta."""
+    loop, client, _, m, _ = _make_loop(_reading(concurrent_sessions=0))
+    history = History(maxlen=10)
+    loop._history = history
+    await loop.tick()
+
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+    client.set_fail(True)
+    m[0] += 100.0
+    await loop.tick()
+
+    assert loop.last_throughput == 2
+    stale = history.entries()[-1]
+    assert stale.stale is True
+    assert stale.throughput == 2
+
+    await loop.tick()
+    assert loop.last_throughput == 0
+    assert history.entries()[-1].throughput == 0
+
+
+async def test_failed_tick_zeros_throughput_and_consumes_interval(tmp_path):
+    """A fail-safe row does not republish the prior successful tp delta."""
+    loop, client, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    history = History(maxlen=10)
+    store = SQLiteHistoryStore(str(tmp_path / "failed-interval.db"))
+    loop._history = history
+    loop._history_store = store
+    await loop.tick()
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+
+    class FailingUsageClient(FakeUsageClient):
+        async def fetch(self, *, now_monotonic: float) -> CachedReading:
+            raise RuntimeError("failed interval")
+
+    loop._truth = FailingUsageClient(_reading(concurrent_sessions=0))
+    with pytest.raises(RuntimeError, match="failed interval"):
+        await loop.tick()
+    loop._record_failed_tick()
+
+    assert loop.last_throughput == 0
+    assert history.entries()[-1].throughput == 0
+    persisted_failed = store.load_recent(1)[-1]
+    assert persisted_failed.tick_failed is True
+    assert persisted_failed.stale is True
+    assert persisted_failed.throughput == 0
+    failed_status = snapshot(loop).to_dict()
+    assert failed_status["stale"] is True
+    assert failed_status["tick_failed"] is True
+    assert failed_status["nonleader"] is False
+
+    loop._truth = client
+    await loop.tick()
+    assert loop.last_throughput == 0
+    store.close()
+
+
+async def test_nonleader_tick_zeros_throughput_and_consumes_interval(tmp_path):
+    """Non-leader samples cannot reuse the prior leader's traffic delta."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    history = History(maxlen=10)
+    store = SQLiteHistoryStore(str(tmp_path / "nonleader-interval.db"))
+    loop._history = history
+    loop._history_store = store
+    await loop.tick()
+    loop.record_request_forwarded()
+    loop.record_request_forwarded()
+    await loop.tick()
+    assert loop.last_throughput == 2
+
+    class NotLeader:
+        def is_held(self) -> bool:
+            return False
+
+    loop._guard = NotLeader()  # type: ignore[assignment]
+    await loop.tick()
+    assert loop.last_throughput == 0
+    nonleader = history.entries()[-1]
+    assert nonleader.nonleader is True
+    assert nonleader.stale is True
+    assert nonleader.tick_failed is False
+    assert nonleader.throughput == 0
+    assert nonleader.completions == 0
+    nonleader_status = snapshot(loop).to_dict()
+    assert nonleader_status["stale"] is True
+    assert nonleader_status["tick_failed"] is False
+    assert nonleader_status["nonleader"] is True
+    assert nonleader_status["effective_permits"] == 0
+    assert nonleader_status["throughput"] == 0
+    assert nonleader_status["completions"] == 0
+    persisted_nonleader = store.load_recent(1)[-1]
+    assert persisted_nonleader.nonleader is True
+    assert persisted_nonleader.stale is True
+    assert persisted_nonleader.throughput == 0
+    assert persisted_nonleader.completions == 0
+
+    loop._guard = None
+    await loop.tick()
+    assert loop.last_throughput == 0
+    store.close()
+
+
+async def test_sample_identity_is_boot_qualified_and_persisted_in_history():
+    """Each sample has a unique boot-qualified ID, including after restart."""
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    history = History(maxlen=10)
+    loop._history = history
+    await loop.tick()
+    first = history.entries()[-1].sample_id
+    await loop.tick()
+    second = history.entries()[-1].sample_id
+    assert first is not None and second is not None
+    assert first != second
+    assert first.rsplit(":", 1)[-1] == "1"
+    assert second.rsplit(":", 1)[-1] == "2"
+
+    restarted, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    restarted_history = History(maxlen=10)
+    restarted._history = restarted_history
+    await restarted.tick()
+    restarted_id = restarted_history.entries()[-1].sample_id
+    assert restarted_id is not None
+    assert restarted_id != first
+    assert restarted_id.rsplit(":", 1)[-1] == "1"
+
+
+async def test_completions_first_sample_and_zero_traffic():
+    """The first release-counter sample is a baseline; idle ticks stay zero."""
+    loop, _, gate, _, _ = _make_loop(_reading(concurrent_sessions=0))
+
+    # Releases before the first tick are not attributed to an unknown interval.
+    assert await gate.acquire(timeout=0.1)
+    await gate.release()
+    await loop.tick()
+    assert loop.last_completions == 0
+
+    assert await gate.acquire(timeout=0.1)
+    await gate.release()
+    assert await gate.acquire(timeout=0.1)
+    await gate.release()
+    await loop.tick()
+    assert loop.last_completions == 2
+
+    await loop.tick()
+    assert loop.last_completions == 0
+
+
+async def test_completions_counter_reset_is_not_a_spike():
+    """A reset/decreasing gate counter produces zero, then re-baselines."""
+    loop, _, gate, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+
+    for _ in range(3):
+        assert await gate.acquire(timeout=0.1)
+        await gate.release()
+    await loop.tick()
+    assert loop.last_completions == 3
+
+    # Simulate a process-local counter reset without changing the loop object.
+    gate._total_releases = 0
+    await loop.tick()
+    assert loop.last_completions == 0
+
+    assert await gate.acquire(timeout=0.1)
+    await gate.release()
+    await loop.tick()
+    assert loop.last_completions == 1
+
+
+async def test_completions_rebaseline_when_gate_is_replaced():
+    """Replacing the gate starts a new counter baseline, even if it is nonzero."""
+    loop, _, old_gate, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+
+    replacement = PermitGate(initial_capacity=3)
+    for _ in range(2):
+        assert await replacement.acquire(timeout=0.1)
+        await replacement.release()
+    loop._gate = replacement
+
+    await loop.tick()
+    assert loop.last_completions == 0
+
+    assert await replacement.acquire(timeout=0.1)
+    await replacement.release()
+    await loop.tick()
+    assert loop.last_completions == 1
+    assert old_gate.total_releases == 0
+
+
+async def test_failed_tick_records_releases_in_the_failed_interval():
+    """A failing poll advances the release baseline and stamps its failed row."""
+    loop, client, gate, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    history = History(maxlen=10)
+    loop._history = history
+    await loop.tick()  # establish the initial release-counter baseline
+
+    assert await gate.acquire(timeout=0.1)
+
+    class FailingAfterRelease(FakeUsageClient):
+        async def fetch(self, *, now_monotonic: float) -> CachedReading:
+            await gate.release()
+            raise RuntimeError("simulated failed poll")
+
+    loop._truth = FailingAfterRelease(_reading(concurrent_sessions=0))
+    with pytest.raises(RuntimeError, match="simulated failed poll"):
+        await loop.tick()
+
+    # This is what run() records after catching the failed tick.
+    loop._record_failed_tick()
+    failed = history.entries()[-1]
+    assert failed.tick_failed is True
+    assert failed.completions == 1
+
+    # The release was attributed to the failed interval, not moved to the
+    # following successful interval.
+    loop._truth = client
+    await loop.tick()
+    assert loop.last_completions == 0
+
+
 # --- WI-022: integration test for run() loop with idle backoff (M-2) --------
 
 
@@ -1607,6 +1834,47 @@ async def test_run_loop_idle_backoff_wakes_on_activity():
             await task
         except _aio.CancelledError:
             pass
+
+
+async def test_failed_tick_clears_idle_and_retries_at_fast_interval():
+    """A failed tick must not schedule the next retry at the idle interval."""
+    class FailingOnceUsageClient(FakeUsageClient):
+        def __init__(self, reading: UsageReading) -> None:
+            super().__init__(reading)
+            self.fail_next = False
+            self.failure_seen = asyncio.Event()
+            self.retry_seen = asyncio.Event()
+
+        async def fetch(self, *, now_monotonic: float) -> CachedReading:
+            if self.fail_next:
+                self.fail_next = False
+                self.failure_seen.set()
+                raise RuntimeError("transient usage failure")
+            result = await super().fetch(now_monotonic=now_monotonic)
+            if self.failure_seen.is_set():
+                self.retry_seen.set()
+            return result
+
+    loop, _, _, _, _ = _make_loop(_reading(concurrent_sessions=0))
+    await loop.tick()
+    assert loop.is_idle
+
+    failing_client = FailingOnceUsageClient(_reading(concurrent_sessions=0))
+    failing_client.fail_next = True
+    loop._truth = failing_client
+    loop._poll_interval = 0.01
+    loop._poll_interval_idle_cfg = 1.0
+
+    task = asyncio.create_task(loop.run())
+    try:
+        await asyncio.wait_for(failing_client.failure_seen.wait(), timeout=1.0)
+        assert not loop.is_idle
+        assert loop._effective_poll_interval() == 0.01
+        await asyncio.wait_for(failing_client.retry_seen.wait(), timeout=0.5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 async def test_run_loop_fast_interval_when_active():
